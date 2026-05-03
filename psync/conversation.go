@@ -150,11 +150,17 @@ type maskRequest struct {
 	ctx     context.Context
 }
 type replayLogRequest struct{}
+type waveCompleteRequest struct{ wave uint64 }
+type messagesInWaveRequest struct{ wave uint64 }
+type stableMessageIDsRequest struct{}
 
-func (sendRequest) isRequest()      {}
-func (incomingRequest) isRequest()  {}
-func (maskRequest) isRequest()      {}
-func (replayLogRequest) isRequest() {}
+func (sendRequest) isRequest()             {}
+func (incomingRequest) isRequest()         {}
+func (maskRequest) isRequest()             {}
+func (replayLogRequest) isRequest()        {}
+func (waveCompleteRequest) isRequest()     {}
+func (messagesInWaveRequest) isRequest()   {}
+func (stableMessageIDsRequest) isRequest() {}
 
 type response interface{ isResponse() }
 
@@ -167,12 +173,22 @@ type replayLogResponse struct {
 	inserted int
 	err      error
 }
+type waveCompleteResponse struct{ complete bool }
+type messagesInWaveResponse struct {
+	envelopes []*pb.Envelope
+}
+type stableMessageIDsResponse struct {
+	ids []*pb.MessageID
+}
 type emptyResponse struct{}
 
-func (sendResponse) isResponse()      {}
-func (maskResponse) isResponse()      {}
-func (replayLogResponse) isResponse() {}
-func (emptyResponse) isResponse()     {}
+func (sendResponse) isResponse()             {}
+func (maskResponse) isResponse()             {}
+func (replayLogResponse) isResponse()        {}
+func (waveCompleteResponse) isResponse()     {}
+func (messagesInWaveResponse) isResponse()   {}
+func (stableMessageIDsResponse) isResponse() {}
+func (emptyResponse) isResponse()            {}
 
 // serverImpl is the immutable handler that implements
 // genserver.Server. It owns no mutable state — everything runtime
@@ -224,6 +240,24 @@ func (s *serverImpl) HandleCall(req request, st *state) (response, *state) {
 	case replayLogRequest:
 		n, err := s.handleReplay(st)
 		return replayLogResponse{inserted: n, err: err}, st
+	case waveCompleteRequest:
+		return waveCompleteResponse{
+			complete: WaveComplete(st.graph, r.wave, StandardChecker{}),
+		}, st
+	case messagesInWaveRequest:
+		nodes := st.graph.MessagesInWave(r.wave)
+		envs := make([]*pb.Envelope, 0, len(nodes))
+		for _, n := range nodes {
+			envs = append(envs, proto.Clone(n.Envelope).(*pb.Envelope))
+		}
+		return messagesInWaveResponse{envelopes: envs}, st
+	case stableMessageIDsRequest:
+		stable := StableNodes(st.graph, StandardChecker{})
+		ids := make([]*pb.MessageID, 0, len(stable))
+		for _, n := range stable {
+			ids = append(ids, proto.Clone(n.Envelope.GetId()).(*pb.MessageID))
+		}
+		return stableMessageIDsResponse{ids: ids}, st
 	default:
 		return emptyResponse{}, st
 	}
@@ -385,6 +419,40 @@ func (c *Conversation) Maskout(ctx context.Context, replica *pb.ReplicaID) error
 func (c *Conversation) Maskin(ctx context.Context, replica *pb.ReplicaID) error {
 	resp := c.srv.Call(maskRequest{in: true, replica: replica, ctx: ctx})
 	return resp.(maskResponse).err
+}
+
+// Membership returns this conversation's sorted membership view.
+// Phase 1 assumes static membership; the returned object reflects
+// the (immutable) Members from Config.
+func (c *Conversation) Membership() *Membership {
+	return NewMembership(c.cfg.Members)
+}
+
+// WaveComplete reports whether wave w meets the standard wave-
+// completion condition (paper §2.3): some message in wave w is
+// stable. Order layers (Phase 2) use this to decide when a wave's
+// messages can be applied as a group.
+//
+// Note PLAN's stability §2.10 caveat: this uses the standard
+// stability rule; Membership-protocol-specific stability (§4.2.2)
+// is a separate concern handled in Phase 3.
+func (c *Conversation) WaveComplete(w uint64) bool {
+	resp := c.srv.Call(waveCompleteRequest{wave: w})
+	return resp.(waveCompleteResponse).complete
+}
+
+// MessagesInWave returns clones of every envelope in wave w.
+// Useful to Order layers iterating wave-at-a-time.
+func (c *Conversation) MessagesInWave(w uint64) []*pb.Envelope {
+	resp := c.srv.Call(messagesInWaveRequest{wave: w})
+	return resp.(messagesInWaveResponse).envelopes
+}
+
+// StableMessageIDs returns the IDs of every currently-stable node
+// in the local graph. Used by Phase 4's trim watermark protocol.
+func (c *Conversation) StableMessageIDs() []*pb.MessageID {
+	resp := c.srv.Call(stableMessageIDsRequest{})
+	return resp.(stableMessageIDsResponse).ids
 }
 
 // Close stops the conversation. Idempotent.
