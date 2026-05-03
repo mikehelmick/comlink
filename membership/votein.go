@@ -1,0 +1,322 @@
+// Copyright 2026 the comlink authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package membership
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"sync"
+
+	"github.com/mikehelmick/comlink/frame"
+	pb "github.com/mikehelmick/comlink/internal/pb/comlink/v1"
+	"google.golang.org/protobuf/proto"
+)
+
+// Errors returned by VoteIn.
+var (
+	// ErrVoteInTargetIsSelf rejects voting yourself in.
+	ErrVoteInTargetIsSelf = errors.New("membership: VoteIn target is self")
+	// ErrVoteInTargetAlreadyMember means target is already in ML.
+	ErrVoteInTargetAlreadyMember = errors.New("membership: VoteIn target already in membership list")
+	// ErrVoteInNacked means a peer disagreed with the addition.
+	ErrVoteInNacked = errors.New("membership: VoteIn rejected by Nack")
+	// ErrVoteInTimeout means the vote timed out before quorum.
+	ErrVoteInTimeout = errors.New("membership: VoteIn timed out before quorum")
+	// ErrVoteInInProgress means a VoteIn for this target is already in flight.
+	ErrVoteInInProgress = errors.New("membership: VoteIn already in progress for target")
+)
+
+// voteInSession tracks an in-flight VoteIn.
+type voteInSession struct {
+	target         *pb.ReplicaID
+	addr           string
+	membersAtStart []*pb.ReplicaID
+	ackedBy        map[string]struct{}
+	nackedBy       map[string]struct{}
+	done           sync.Once
+	err            error
+	completed      chan struct{}
+	mu             sync.Mutex
+}
+
+// VoteIn initiates the permanent addition of target to the
+// conversation's membership list. addr is the network address
+// peers should use to reach target (e.g. "host:port" for the gRPC
+// transport).
+//
+// Decision rule: any VoteInNack aborts; strict majority of voters
+// must Ack to accept.
+//
+// On accepted: every replica adds target to its local ML and
+// emits a MembershipEvent on its events channel. Wiring up the
+// transport routing for target, growing psync's vector-clock
+// shape, and onboarding target itself (which involves target
+// running its own Manager.New + Restart against the leaf set)
+// are out of scope for this commit — see PLAN §2.10.1 and the
+// Phase 5 composition layer.
+//
+// This call blocks until the vote completes.
+func (m *Manager) VoteIn(ctx context.Context, target *pb.ReplicaID, addr string) error {
+	if bytes.Equal(target.GetValue(), m.cfg.Self.GetValue()) {
+		return ErrVoteInTargetIsSelf
+	}
+	m.mu.Lock()
+	if m.isMemberLocked(target) {
+		m.mu.Unlock()
+		return ErrVoteInTargetAlreadyMember
+	}
+	if _, exists := m.voteInSessions[string(target.GetValue())]; exists {
+		m.mu.Unlock()
+		return ErrVoteInInProgress
+	}
+	session := newVoteInSession(target, addr, m.membershipList)
+	// Initiator implicitly Acks.
+	session.ackedBy[string(m.cfg.Self.GetValue())] = struct{}{}
+	m.voteInSessions[string(target.GetValue())] = session
+	m.mu.Unlock()
+
+	if err := m.broadcastVoteIn(target, addr); err != nil {
+		m.cancelVoteInSession(target, fmt.Errorf("broadcast VoteIn: %w", err))
+		<-session.completed
+		return session.err
+	}
+
+	m.checkVoteInDecision(session)
+
+	timer := m.clk().NewTimer(DefaultVoteTimeout)
+	defer timer.Stop()
+	select {
+	case <-session.completed:
+		return session.err
+	case <-ctx.Done():
+		m.cancelVoteInSession(target, ctx.Err())
+		<-session.completed
+		return session.err
+	case <-timer.C():
+		m.cancelVoteInSession(target, ErrVoteInTimeout)
+		<-session.completed
+		return session.err
+	}
+}
+
+func newVoteInSession(target *pb.ReplicaID, addr string, members []*pb.ReplicaID) *voteInSession {
+	clones := make([]*pb.ReplicaID, len(members))
+	for i, r := range members {
+		clones[i] = proto.Clone(r).(*pb.ReplicaID)
+	}
+	return &voteInSession{
+		target:         proto.Clone(target).(*pb.ReplicaID),
+		addr:           addr,
+		membersAtStart: clones,
+		ackedBy:        make(map[string]struct{}),
+		nackedBy:       make(map[string]struct{}),
+		completed:      make(chan struct{}),
+	}
+}
+
+func (m *Manager) broadcastVoteIn(target *pb.ReplicaID, addr string) error {
+	bs, err := frame.MarshalVoteIn(target, addr)
+	if err != nil {
+		return err
+	}
+	if _, err := m.conv.Send(bs); err != nil {
+		return err
+	}
+	m.fd.NoteSent()
+	return nil
+}
+
+func (m *Manager) cancelVoteInSession(target *pb.ReplicaID, err error) {
+	m.mu.Lock()
+	session, ok := m.voteInSessions[string(target.GetValue())]
+	if ok {
+		delete(m.voteInSessions, string(target.GetValue()))
+	}
+	m.mu.Unlock()
+	if !ok {
+		return
+	}
+	session.done.Do(func() {
+		session.err = err
+		close(session.completed)
+	})
+}
+
+// checkVoteInDecision evaluates session and acts if a decision
+// can be made.
+func (m *Manager) checkVoteInDecision(session *voteInSession) {
+	session.mu.Lock()
+	if len(session.nackedBy) > 0 {
+		session.mu.Unlock()
+		m.cancelVoteInSession(session.target, ErrVoteInNacked)
+		return
+	}
+	// Voter set is membersAtStart (target was NOT in ML at session
+	// creation, so all current members are voters).
+	voterCount := len(session.membersAtStart)
+	needed := voterCount/2 + 1
+	if needed < 1 {
+		needed = 1
+	}
+	ackCount := len(session.ackedBy)
+	session.mu.Unlock()
+	if ackCount < needed {
+		return
+	}
+
+	// Decision: accepted. Apply addition locally.
+	m.mu.Lock()
+	delete(m.voteInSessions, string(session.target.GetValue()))
+	m.addToMLLocked(session.target)
+	m.mu.Unlock()
+
+	// Notify FailureDetector to start tracking target. The
+	// Detector exposes RemoveMember; we'd want a symmetric AddMember
+	// to add it back. Phase 3(f) note: not yet implemented in
+	// failure.Detector — sketched here so callers can opt in via
+	// a separate Detector AddMember call when that lands.
+	m.notifyAdded(session.target, session.addr)
+
+	session.done.Do(func() {
+		session.err = nil
+		close(session.completed)
+	})
+}
+
+// addToMLLocked inserts target into membershipList at its sorted
+// position. Caller must hold m.mu. The list stays sorted by
+// ReplicaID byte order to match psync.Membership ordering.
+func (m *Manager) addToMLLocked(target *pb.ReplicaID) {
+	out := append([]*pb.ReplicaID{}, m.membershipList...)
+	out = append(out, proto.Clone(target).(*pb.ReplicaID))
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i].GetValue(), out[j].GetValue()) < 0
+	})
+	m.membershipList = out
+}
+
+// notifyAdded emits an Added event for downstream layers to wire
+// up transport routing, etc. Phase 3(f) just logs; Phase 5
+// composition layer wires this into the transport.
+func (m *Manager) notifyAdded(target *pb.ReplicaID, addr string) {
+	m.logger.Info("membership: replica added",
+		"target", fmt.Sprintf("%x", target.GetValue()),
+		"addr", addr)
+}
+
+// ─── receive-side handlers ────────────────────────────────────────
+
+// handleVoteIn responds to a peer's VoteIn proposal. Default
+// policy: Ack iff target is not already in our ML. Application-
+// specific policy hooks can come in a later commit.
+func (m *Manager) handleVoteIn(req *pb.VoteIn, sender *pb.ReplicaID) {
+	target := req.GetTarget()
+	if target == nil {
+		return
+	}
+	if bytes.Equal(sender.GetValue(), m.cfg.Self.GetValue()) {
+		// Self-delivery of our own VoteIn — initiator's implicit
+		// Ack is already in the session.
+		return
+	}
+	if bytes.Equal(target.GetValue(), m.cfg.Self.GetValue()) {
+		// Someone is voting US in. We're already a member; this
+		// is contradictory. Ignore.
+		return
+	}
+
+	m.mu.Lock()
+	alreadyMember := m.isMemberLocked(target)
+	if alreadyMember {
+		m.mu.Unlock()
+		// Already a member; the addition is a no-op. Acknowledge
+		// so the vote can proceed (and the initiator can clean up).
+		m.sendVoteInAck(target)
+		return
+	}
+	session, exists := m.voteInSessions[string(target.GetValue())]
+	if !exists {
+		session = newVoteInSession(target, req.GetAddr(), m.membershipList)
+		m.voteInSessions[string(target.GetValue())] = session
+	}
+	session.mu.Lock()
+	session.ackedBy[string(sender.GetValue())] = struct{}{}
+	// Default policy: Ack.
+	session.ackedBy[string(m.cfg.Self.GetValue())] = struct{}{}
+	session.mu.Unlock()
+	m.mu.Unlock()
+
+	m.sendVoteInAck(target)
+	m.checkVoteInDecision(session)
+}
+
+func (m *Manager) handleVoteInAck(ack *pb.VoteInAck, sender *pb.ReplicaID) {
+	target := ack.GetTarget()
+	if target == nil {
+		return
+	}
+	m.mu.Lock()
+	session, exists := m.voteInSessions[string(target.GetValue())]
+	m.mu.Unlock()
+	if !exists {
+		return
+	}
+	session.mu.Lock()
+	session.ackedBy[string(sender.GetValue())] = struct{}{}
+	session.mu.Unlock()
+	m.checkVoteInDecision(session)
+}
+
+func (m *Manager) handleVoteInNack(nack *pb.VoteInNack, sender *pb.ReplicaID) {
+	target := nack.GetTarget()
+	if target == nil {
+		return
+	}
+	m.mu.Lock()
+	session, exists := m.voteInSessions[string(target.GetValue())]
+	m.mu.Unlock()
+	if !exists {
+		return
+	}
+	session.mu.Lock()
+	session.nackedBy[string(sender.GetValue())] = struct{}{}
+	session.mu.Unlock()
+	m.checkVoteInDecision(session)
+}
+
+func (m *Manager) sendVoteInAck(target *pb.ReplicaID) {
+	bs, err := frame.MarshalVoteInAck(target)
+	if err != nil {
+		m.logger.Warn("membership: marshal VoteInAck", "err", err)
+		return
+	}
+	go m.asyncSend(bs, "VoteInAck")
+}
+
+func (m *Manager) sendVoteInNack(target *pb.ReplicaID) {
+	bs, err := frame.MarshalVoteInNack(target)
+	if err != nil {
+		m.logger.Warn("membership: marshal VoteInNack", "err", err)
+		return
+	}
+	go m.asyncSend(bs, "VoteInNack")
+}
+
+// _ keeps sendVoteInNack referenced; future commits will use it
+// when an application policy hook says to Nack.
+var _ = (*Manager)(nil).sendVoteInNack

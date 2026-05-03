@@ -101,10 +101,11 @@ type Manager struct {
 	// implies a corresponding Maskout is in place on the
 	// underlying conversation.
 	suspectDownList map[string]struct{}
-	// voteOutSessions tracks in-flight VoteOut votes keyed by
-	// target ReplicaID bytes. One session per target at a time
-	// (Phase 3(e)).
+	// voteOutSessions / voteInSessions track in-flight votes
+	// keyed by target ReplicaID bytes. One session per target
+	// per kind at a time.
 	voteOutSessions map[string]*voteOutSession
+	voteInSessions  map[string]*voteInSession
 
 	closeOnce sync.Once
 	stopped   chan struct{}
@@ -143,6 +144,7 @@ func New(cfg Config) (*Manager, error) {
 		pumpDone:        make(chan struct{}),
 		suspectDownList: make(map[string]struct{}),
 		voteOutSessions: make(map[string]*voteOutSession),
+		voteInSessions:  make(map[string]*voteInSession),
 	}
 	m.membershipList = make([]*pb.ReplicaID, len(cfg.Members))
 	for i, r := range cfg.Members {
@@ -421,8 +423,4 @@ func (m *Manager) handleSuspectDown(susp *pb.SuspectDown, sender *pb.ReplicaID) 
 func (m *Manager) handleRecovering(_ *pb.Recovering, _ *pb.ReplicaID)   {}
 func (m *Manager) handleRecoveryAck(_ *pb.RecoveryAck, _ *pb.ReplicaID) {}
 
-// VoteOut/VoteIn handlers — VoteOut handlers live in voteout.go;
-// VoteIn handlers come in Phase 3(f).
-func (m *Manager) handleVoteIn(_ *pb.VoteIn, _ *pb.ReplicaID)         {}
-func (m *Manager) handleVoteInAck(_ *pb.VoteInAck, _ *pb.ReplicaID)   {}
-func (m *Manager) handleVoteInNack(_ *pb.VoteInNack, _ *pb.ReplicaID) {}
+// VoteOut/VoteIn handlers live in voteout.go and votein.go.
