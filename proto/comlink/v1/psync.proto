@@ -1,0 +1,35 @@
+// Copyright 2026 the comlink authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+// Psync-internal types: state persisted via stable.Storage and
+// wire-level control messages exchanged between Psync instances
+// (lost-message requests, restart messages, etc.). Application
+// payloads ride inside Envelope.payload from comlink.proto and do
+// not appear here.
+package comlink.v1;
+
+option go_package = "github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1";
+
+// MaskState is the persisted form of a Psync replica's mask
+// (paper §2.3, PLAN §5.2). Persisting on every change keeps the
+// recovery path simple in Phase 4 — there's no special "checkpoint
+// the mask" step to coordinate, the latest persisted MaskState IS
+// the recovery state.
+message MaskState {
+  // Each entry is the bytes of a ReplicaID currently masked out at
+  // this replica.
+  repeated bytes masked_replicas = 1;
+}
