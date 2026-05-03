@@ -1,0 +1,549 @@
+// Copyright 2026 the comlink authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package psync
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+
+	"github.com/mikehelmick/go-functional/genserver"
+
+	pb "github.com/mikehelmick/comlink/internal/pb/comlink/v1"
+	clog "github.com/mikehelmick/comlink/log"
+	"github.com/mikehelmick/comlink/stable"
+	"github.com/mikehelmick/comlink/transport"
+	"google.golang.org/protobuf/proto"
+)
+
+// Delivery is the unit handed to the application's Recv channel
+// when Psync delivers an envelope. Node is included for callers
+// that want to inspect graph context (parents, wave) without a
+// separate lookup.
+type Delivery struct {
+	Envelope *pb.Envelope
+	Node     *Node
+}
+
+// Config configures a Conversation. All fields are required unless
+// noted otherwise.
+type Config struct {
+	// Conversation identity (PLAN §2.10).
+	ConversationID *pb.ConversationID
+	// This replica's ID; must appear in Members.
+	Self *pb.ReplicaID
+	// The full participant set. Phase 1 assumes static membership;
+	// reshape comes in Phase 3.
+	Members []*pb.ReplicaID
+
+	// Transport.
+	Network transport.Network
+	// Durable message log; the Conversation is bound to its
+	// ConversationID() at construction.
+	Log clog.MessageLog
+	// Stable storage for non-message persistent state (mask, etc.).
+	Storage stable.Storage
+
+	// Capacity of the application-facing delivery channel. If the
+	// application doesn't drain promptly, the conversation
+	// backpressures up through the network input pump.
+	// Default 256.
+	DeliveryBufSize int
+
+	// Optional logger. If nil, slog.Default() is used.
+	Logger *slog.Logger
+}
+
+// Conversation is one replica's view of a Psync conversation.
+//
+// PLAN §2.2: each protocol layer is a per-replica GenServer. We use
+// github.com/mikehelmick/go-functional/genserver: the Server
+// implementation lives in serverImpl (immutable handler), and the
+// mutable state (graph, deferred queue, etc.) is the generic state
+// type the genserver carries between callbacks.
+//
+// Public methods (Send, Maskin, Maskout) marshal a Request onto the
+// genserver via Call; the network input pump goroutine forwards
+// inbound transport frames via Cast.
+type Conversation struct {
+	srv      *genserver.GenServer[*state, request, response]
+	cfg      Config
+	logger   *slog.Logger
+	deliver  chan Delivery
+	pumpDone chan struct{}
+	closeMu  sync.Mutex
+	closed   bool
+}
+
+// state is the mutable per-conversation data the genserver carries
+// across callbacks.
+type state struct {
+	graph *Graph
+	// Deferred envelopes — keyed by (sender, seq) of the deferred
+	// message itself.
+	deferred map[indexKey]*pendingEnvelope
+	// Index for "what was waiting on this parent?" lookups.
+	deferredByNeed map[indexKey]map[indexKey]struct{}
+	// Outstanding lost-message requests we've sent — used to
+	// suppress duplicate requests for the same parent.
+	outstanding map[indexKey]struct{}
+}
+
+type pendingEnvelope struct {
+	env  *pb.Envelope
+	from *pb.ReplicaID
+	// waiting: (sender, seq) tuples this envelope still needs.
+	waiting map[indexKey]struct{}
+}
+
+type indexKey struct {
+	sender string
+	seq    uint64
+}
+
+func makeKey(sender []byte, seq uint64) indexKey {
+	return indexKey{sender: string(sender), seq: seq}
+}
+
+// ─── request / response types (genserver Req / Resp) ──────────────
+//
+// Cast-only requests deliver no reply (their "response" is empty).
+// Call requests carry their reply payload in their Response variant.
+
+type request interface{ isRequest() }
+
+type sendRequest struct{ payload []byte }
+type incomingRequest struct {
+	from *pb.ReplicaID
+	data []byte
+}
+type maskRequest struct {
+	in      bool
+	replica *pb.ReplicaID
+	ctx     context.Context
+}
+
+func (sendRequest) isRequest()     {}
+func (incomingRequest) isRequest() {}
+func (maskRequest) isRequest()     {}
+
+type response interface{ isResponse() }
+
+type sendResponse struct {
+	id  *pb.MessageID
+	err error
+}
+type maskResponse struct{ err error }
+type emptyResponse struct{}
+
+func (sendResponse) isResponse()  {}
+func (maskResponse) isResponse()  {}
+func (emptyResponse) isResponse() {}
+
+// serverImpl is the immutable handler that implements
+// genserver.Server. It owns no mutable state — everything runtime
+// lives in `*state` carried across callbacks. References here are
+// for the network/log/storage/etc. handles that don't mutate after
+// construction.
+type serverImpl struct {
+	convID     *pb.ConversationID
+	self       *pb.ReplicaID
+	selfSlot   int
+	membership *Membership
+	log        clog.MessageLog
+	storage    stable.Storage
+	network    transport.Network
+	mask       *Mask
+	deliver    chan<- Delivery
+	logger     *slog.Logger
+}
+
+// Init creates the initial mutable state.
+func (s *serverImpl) Init() *state {
+	return &state{
+		graph:          NewGraph(s.membership),
+		deferred:       make(map[indexKey]*pendingEnvelope),
+		deferredByNeed: make(map[indexKey]map[indexKey]struct{}),
+		outstanding:    make(map[indexKey]struct{}),
+	}
+}
+
+// HandleCall processes synchronous requests.
+func (s *serverImpl) HandleCall(req request, st *state) (response, *state) {
+	switch r := req.(type) {
+	case sendRequest:
+		id, err := s.handleSend(st, r.payload)
+		return sendResponse{id: id, err: err}, st
+	case maskRequest:
+		var err error
+		if r.in {
+			err = s.mask.Maskin(r.ctx, r.replica)
+		} else {
+			err = s.mask.Maskout(r.ctx, r.replica)
+		}
+		return maskResponse{err: err}, st
+	default:
+		return emptyResponse{}, st
+	}
+}
+
+// HandleCast processes asynchronous notifications.
+func (s *serverImpl) HandleCast(msg request, st *state) *state {
+	if r, ok := msg.(incomingRequest); ok {
+		s.handleIncoming(st, r.from, r.data)
+	}
+	return st
+}
+
+// ─── construction & lifecycle ─────────────────────────────────────
+
+// New constructs a Conversation. Self must be a member of cfg.Members.
+// The Log must be bound to cfg.ConversationID; the Mask is loaded
+// from cfg.Storage.
+func New(ctx context.Context, cfg Config) (*Conversation, error) {
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if !proto.Equal(cfg.Log.ConversationID(), cfg.ConversationID) {
+		return nil, fmt.Errorf("psync: log is bound to a different ConversationID")
+	}
+	mask, err := LoadMask(ctx, cfg.Storage, MaskStorageKey)
+	if err != nil {
+		return nil, fmt.Errorf("psync: load mask: %w", err)
+	}
+	membership := NewMembership(cfg.Members)
+	selfSlot := membership.SlotOf(cfg.Self)
+	if selfSlot < 0 {
+		return nil, fmt.Errorf("psync: Self %x not in Members", cfg.Self.GetValue())
+	}
+	bufSize := cfg.DeliveryBufSize
+	if bufSize <= 0 {
+		bufSize = 256
+	}
+	deliver := make(chan Delivery, bufSize)
+
+	impl := &serverImpl{
+		convID:     proto.Clone(cfg.ConversationID).(*pb.ConversationID),
+		self:       proto.Clone(cfg.Self).(*pb.ReplicaID),
+		selfSlot:   selfSlot,
+		membership: membership,
+		log:        cfg.Log,
+		storage:    cfg.Storage,
+		network:    cfg.Network,
+		mask:       mask,
+		deliver:    deliver,
+		logger:     logger,
+	}
+	srv := genserver.Start[*state, request, response](impl)
+
+	c := &Conversation{
+		srv:      srv,
+		cfg:      cfg,
+		logger:   logger,
+		deliver:  deliver,
+		pumpDone: make(chan struct{}),
+	}
+	go c.pumpInput(ctx)
+	return c, nil
+}
+
+func validateConfig(cfg Config) error {
+	if cfg.ConversationID == nil {
+		return errors.New("psync: Config.ConversationID is required")
+	}
+	if cfg.Self == nil {
+		return errors.New("psync: Config.Self is required")
+	}
+	if len(cfg.Members) == 0 {
+		return errors.New("psync: Config.Members must be non-empty")
+	}
+	if cfg.Network == nil {
+		return errors.New("psync: Config.Network is required")
+	}
+	if cfg.Log == nil {
+		return errors.New("psync: Config.Log is required")
+	}
+	if cfg.Storage == nil {
+		return errors.New("psync: Config.Storage is required")
+	}
+	return nil
+}
+
+// pumpInput reads from the network and casts incomingRequest into
+// the genserver. Exits when the network's Recv channel closes or
+// ctx is done.
+func (c *Conversation) pumpInput(ctx context.Context) {
+	defer close(c.pumpDone)
+	for {
+		select {
+		case in, ok := <-c.cfg.Network.Recv():
+			if !ok {
+				return
+			}
+			c.srv.Cast(incomingRequest{from: in.From, data: in.Payload})
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// ─── public API ───────────────────────────────────────────────────
+
+// Send durably appends payload to the local log and multicasts it
+// to every other active member. Self-delivers to this replica's
+// Recv channel as well.
+func (c *Conversation) Send(payload []byte) (*pb.MessageID, error) {
+	resp := c.srv.Call(sendRequest{payload: payload})
+	r := resp.(sendResponse)
+	return r.id, r.err
+}
+
+// Recv returns the application-facing delivery channel. Closed
+// after Close.
+func (c *Conversation) Recv() <-chan Delivery {
+	return c.deliver
+}
+
+// Maskout marks replica as masked.
+func (c *Conversation) Maskout(ctx context.Context, replica *pb.ReplicaID) error {
+	resp := c.srv.Call(maskRequest{in: false, replica: replica, ctx: ctx})
+	return resp.(maskResponse).err
+}
+
+// Maskin removes replica from the mask.
+func (c *Conversation) Maskin(ctx context.Context, replica *pb.ReplicaID) error {
+	resp := c.srv.Call(maskRequest{in: true, replica: replica, ctx: ctx})
+	return resp.(maskResponse).err
+}
+
+// Close stops the conversation. Idempotent.
+func (c *Conversation) Close() error {
+	c.closeMu.Lock()
+	if c.closed {
+		c.closeMu.Unlock()
+		return nil
+	}
+	c.closed = true
+	c.closeMu.Unlock()
+
+	c.srv.Stop()
+	close(c.deliver)
+	return nil
+}
+
+// ─── handlers (run inside the genserver goroutine) ────────────────
+
+func (s *serverImpl) handleSend(st *state, payload []byte) (*pb.MessageID, error) {
+	view := currentView(st.graph, s.membership)
+	newVec := Increment(view, s.selfSlot)
+	id := &pb.MessageID{
+		ConversationId: proto.Clone(s.convID).(*pb.ConversationID),
+		Sender:         proto.Clone(s.self).(*pb.ReplicaID),
+		VectorClock:    []uint64(newVec),
+	}
+	env := &pb.Envelope{Id: id, Payload: bytes.Clone(payload)}
+	senderSeq := newVec[s.selfSlot]
+
+	if _, err := s.log.Append(context.Background(), env, senderSeq); err != nil {
+		return nil, fmt.Errorf("psync: log.Append on Send: %w", err)
+	}
+	node, missing, err := st.graph.Insert(env)
+	if err != nil || missing != nil {
+		return nil, fmt.Errorf("psync: graph.Insert on Send: %w (missing=%v)", err, missing)
+	}
+	s.deliver <- Delivery{Envelope: env, Node: node}
+
+	wireBytes, err := MarshalEnvelope(env)
+	if err != nil {
+		return nil, err
+	}
+	for _, peer := range s.membership.Replicas() {
+		if bytes.Equal(peer.GetValue(), s.self.GetValue()) {
+			continue
+		}
+		if err := s.network.Send(context.Background(), peer, wireBytes); err != nil {
+			s.logger.Warn("psync: send to peer failed",
+				"peer", fmt.Sprintf("%x", peer.GetValue()),
+				"err", err)
+		}
+	}
+	return id, nil
+}
+
+func (s *serverImpl) handleIncoming(st *state, from *pb.ReplicaID, data []byte) {
+	env, lostReq, err := UnmarshalWire(data)
+	if err != nil {
+		s.logger.Warn("psync: unmarshal wire", "err", err)
+		return
+	}
+	switch {
+	case env != nil:
+		s.handleEnvelope(st, env, from)
+	case lostReq != nil:
+		s.handleLostRequest(st, lostReq, from)
+	}
+}
+
+func (s *serverImpl) handleEnvelope(st *state, env *pb.Envelope, from *pb.ReplicaID) {
+	if !proto.Equal(env.GetId().GetConversationId(), s.convID) {
+		return
+	}
+	if env.GetId().GetSender() == nil {
+		return
+	}
+	if s.membership.SlotOf(env.GetId().GetSender()) < 0 {
+		s.logger.Debug("psync: envelope from unknown sender", "sender", fmt.Sprintf("%x", env.GetId().GetSender().GetValue()))
+		return
+	}
+	if s.mask.IsMasked(env.GetId().GetSender()) {
+		return
+	}
+	senderSeq, err := s.membership.SenderSeq(env.GetId())
+	if err != nil {
+		s.logger.Warn("psync: malformed vector_clock", "err", err)
+		return
+	}
+	senderBytes := env.GetId().GetSender().GetValue()
+	if st.graph.Has(senderBytes, senderSeq) {
+		return
+	}
+	_, missing, err := st.graph.Insert(env)
+	switch {
+	case errors.Is(err, ErrAlreadyPresent):
+		return
+	case errors.Is(err, ErrMissingParents):
+		s.deferEnvelope(st, env, missing, from)
+		return
+	case err != nil:
+		s.logger.Warn("psync: graph.Insert error", "err", err)
+		return
+	}
+	if _, err := s.log.Append(context.Background(), env, senderSeq); err != nil {
+		s.logger.Error("psync: log.Append failed; the message is in-memory but not durable", "err", err)
+	}
+	node := st.graph.Lookup(senderBytes, senderSeq)
+	s.deliver <- Delivery{Envelope: env, Node: node}
+	s.processNewlyAvailable(st, senderBytes, senderSeq)
+}
+
+func (s *serverImpl) handleLostRequest(st *state, req *pb.LostMessageRequest, from *pb.ReplicaID) {
+	missingSender := req.GetMissingSender().GetValue()
+	missingSeq := req.GetMissingSeq()
+	entry, err := s.log.LookupBySender(context.Background(), missingSender, missingSeq)
+	if err != nil {
+		return
+	}
+	wireBytes, err := MarshalEnvelope(entry.Envelope)
+	if err != nil {
+		s.logger.Warn("psync: marshal envelope for retransmit", "err", err)
+		return
+	}
+	if err := s.network.Send(context.Background(), from, wireBytes); err != nil {
+		s.logger.Warn("psync: retransmit to requester failed", "err", err)
+	}
+}
+
+func (s *serverImpl) deferEnvelope(st *state, env *pb.Envelope, missing []MissingParent, from *pb.ReplicaID) {
+	senderSeq, err := s.membership.SenderSeq(env.GetId())
+	if err != nil {
+		return
+	}
+	envKey := makeKey(env.GetId().GetSender().GetValue(), senderSeq)
+	if _, already := st.deferred[envKey]; already {
+		return
+	}
+	pe := &pendingEnvelope{
+		env:     env,
+		from:    proto.Clone(from).(*pb.ReplicaID),
+		waiting: make(map[indexKey]struct{}, len(missing)),
+	}
+	for _, m := range missing {
+		pkey := makeKey(m.Sender.GetValue(), m.Seq)
+		pe.waiting[pkey] = struct{}{}
+		set, ok := st.deferredByNeed[pkey]
+		if !ok {
+			set = make(map[indexKey]struct{})
+			st.deferredByNeed[pkey] = set
+		}
+		set[envKey] = struct{}{}
+
+		if _, sent := st.outstanding[pkey]; !sent {
+			st.outstanding[pkey] = struct{}{}
+			s.sendLostMessageRequest(m.Sender, m.Seq, from)
+		}
+	}
+	st.deferred[envKey] = pe
+}
+
+func (s *serverImpl) sendLostMessageRequest(missingSender *pb.ReplicaID, missingSeq uint64, askPeer *pb.ReplicaID) {
+	wireBytes, err := MarshalLostMessageRequest(missingSender, missingSeq)
+	if err != nil {
+		s.logger.Warn("psync: marshal LostMessageRequest", "err", err)
+		return
+	}
+	if err := s.network.Send(context.Background(), askPeer, wireBytes); err != nil {
+		s.logger.Warn("psync: send LostMessageRequest", "err", err)
+	}
+}
+
+func (s *serverImpl) processNewlyAvailable(st *state, senderBytes []byte, seq uint64) {
+	pkey := makeKey(senderBytes, seq)
+	delete(st.outstanding, pkey)
+	dependents, ok := st.deferredByNeed[pkey]
+	if !ok {
+		return
+	}
+	delete(st.deferredByNeed, pkey)
+
+	keys := make([]indexKey, 0, len(dependents))
+	for k := range dependents {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		pe, exists := st.deferred[k]
+		if !exists {
+			continue
+		}
+		delete(pe.waiting, pkey)
+		if len(pe.waiting) == 0 {
+			delete(st.deferred, k)
+			s.handleEnvelope(st, pe.env, pe.from)
+		}
+	}
+}
+
+// currentView returns the conversation-wide vector clock from this
+// replica's perspective: the elementwise max over the latest message
+// from each participant.
+func currentView(g *Graph, m *Membership) Vector {
+	out := make(Vector, m.Len())
+	for slot := 0; slot < m.Len(); slot++ {
+		r := m.Replica(slot)
+		latestSeq := g.LatestSeq(r.GetValue())
+		if latestSeq == 0 {
+			continue
+		}
+		n := g.Lookup(r.GetValue(), latestSeq)
+		out = Max(out, Vector(n.Envelope.GetId().GetVectorClock()))
+	}
+	return out
+}
