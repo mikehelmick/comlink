@@ -21,6 +21,11 @@
 // transparently. FailureDetection emits ConvFrame.heartbeat;
 // Membership emits ConvFrame.membership.<event>. All flow through
 // the same psync conversation as ordinary Envelope sends.
+//
+// Membership-event split (PLAN §2.13): SuspectDown / Recovering
+// are informational and have no Ack/Nack. VoteOut / VoteIn are
+// the explicit ML-mutation mechanisms and have paired Ack/Nack
+// responses.
 package frame
 
 import (
@@ -47,7 +52,8 @@ func MarshalHeartbeat() ([]byte, error) {
 	return proto.Marshal(&pb.ConvFrame{Body: &pb.ConvFrame_Heartbeat{Heartbeat: &pb.Heartbeat{}}})
 }
 
-// MarshalSuspectDown wraps a SuspectDown event for `suspect`.
+// MarshalSuspectDown wraps a SuspectDown event for `suspect`. This
+// is informational — no Ack/Nack response is expected.
 func MarshalSuspectDown(suspect *pb.ReplicaID) ([]byte, error) {
 	return marshalMembership(&pb.MembershipEvent{
 		Event: &pb.MembershipEvent_SuspectDown{
@@ -56,25 +62,7 @@ func MarshalSuspectDown(suspect *pb.ReplicaID) ([]byte, error) {
 	})
 }
 
-// MarshalSuspectAck wraps an Ack-of-suspect event for `suspect`.
-func MarshalSuspectAck(suspect *pb.ReplicaID) ([]byte, error) {
-	return marshalMembership(&pb.MembershipEvent{
-		Event: &pb.MembershipEvent_SuspectAck{
-			SuspectAck: &pb.SuspectAck{Suspect: suspect},
-		},
-	})
-}
-
-// MarshalSuspectNack wraps a Nack-of-suspect event for `suspect`.
-func MarshalSuspectNack(suspect *pb.ReplicaID) ([]byte, error) {
-	return marshalMembership(&pb.MembershipEvent{
-		Event: &pb.MembershipEvent_SuspectNack{
-			SuspectNack: &pb.SuspectNack{Suspect: suspect},
-		},
-	})
-}
-
-// MarshalRecovering wraps a (p is up) event announcing `who` has
+// MarshalRecovering wraps a Recovering event announcing `who` has
 // restarted.
 func MarshalRecovering(who *pb.ReplicaID) ([]byte, error) {
 	return marshalMembership(&pb.MembershipEvent{
@@ -84,12 +72,67 @@ func MarshalRecovering(who *pb.ReplicaID) ([]byte, error) {
 	})
 }
 
-// MarshalRecoveryAck wraps an (Ack, p is up) event acknowledging
+// MarshalRecoveryAck wraps a RecoveryAck event acknowledging
 // `who`'s incorporation.
 func MarshalRecoveryAck(who *pb.ReplicaID) ([]byte, error) {
 	return marshalMembership(&pb.MembershipEvent{
 		Event: &pb.MembershipEvent_RecoveryAck{
 			RecoveryAck: &pb.RecoveryAck{Who: who},
+		},
+	})
+}
+
+// MarshalVoteOut proposes permanent removal of `target` from ML.
+func MarshalVoteOut(target *pb.ReplicaID) ([]byte, error) {
+	return marshalMembership(&pb.MembershipEvent{
+		Event: &pb.MembershipEvent_VoteOut{
+			VoteOut: &pb.VoteOut{Target: target},
+		},
+	})
+}
+
+// MarshalVoteOutAck votes "Ack" — yes, remove `target`.
+func MarshalVoteOutAck(target *pb.ReplicaID) ([]byte, error) {
+	return marshalMembership(&pb.MembershipEvent{
+		Event: &pb.MembershipEvent_VoteOutAck{
+			VoteOutAck: &pb.VoteOutAck{Target: target},
+		},
+	})
+}
+
+// MarshalVoteOutNack votes "Nack" — no, do not remove `target`.
+func MarshalVoteOutNack(target *pb.ReplicaID) ([]byte, error) {
+	return marshalMembership(&pb.MembershipEvent{
+		Event: &pb.MembershipEvent_VoteOutNack{
+			VoteOutNack: &pb.VoteOutNack{Target: target},
+		},
+	})
+}
+
+// MarshalVoteIn proposes adding `target` (reachable at `addr`) to
+// ML.
+func MarshalVoteIn(target *pb.ReplicaID, addr string) ([]byte, error) {
+	return marshalMembership(&pb.MembershipEvent{
+		Event: &pb.MembershipEvent_VoteIn{
+			VoteIn: &pb.VoteIn{Target: target, Addr: addr},
+		},
+	})
+}
+
+// MarshalVoteInAck votes "Ack" — yes, add `target`.
+func MarshalVoteInAck(target *pb.ReplicaID) ([]byte, error) {
+	return marshalMembership(&pb.MembershipEvent{
+		Event: &pb.MembershipEvent_VoteInAck{
+			VoteInAck: &pb.VoteInAck{Target: target},
+		},
+	})
+}
+
+// MarshalVoteInNack votes "Nack" — no, do not add `target`.
+func MarshalVoteInNack(target *pb.ReplicaID) ([]byte, error) {
+	return marshalMembership(&pb.MembershipEvent{
+		Event: &pb.MembershipEvent_VoteInNack{
+			VoteInNack: &pb.VoteInNack{Target: target},
 		},
 	})
 }
@@ -101,26 +144,30 @@ func marshalMembership(ev *pb.MembershipEvent) ([]byte, error) {
 }
 
 // Decoded is the union of all possible decoded ConvFrame bodies.
-// Exactly one field group is populated on a successful Unmarshal:
-// either App, Heartbeat, or one of the Suspect*/Recover* events.
+// Exactly one field group is populated on a successful Unmarshal.
 type Decoded struct {
-	App          []byte // populated for ConvFrame.app
-	Heartbeat    bool   // true for ConvFrame.heartbeat
-	SuspectDown  *pb.SuspectDown
-	SuspectAck   *pb.SuspectAck
-	SuspectNack  *pb.SuspectNack
-	Recovering   *pb.Recovering
-	RecoveryAck  *pb.RecoveryAck
+	App         []byte // populated for ConvFrame.app
+	Heartbeat   bool   // true for ConvFrame.heartbeat
+	SuspectDown *pb.SuspectDown
+	Recovering  *pb.Recovering
+	RecoveryAck *pb.RecoveryAck
+	VoteOut     *pb.VoteOut
+	VoteOutAck  *pb.VoteOutAck
+	VoteOutNack *pb.VoteOutNack
+	VoteIn      *pb.VoteIn
+	VoteInAck   *pb.VoteInAck
+	VoteInNack  *pb.VoteInNack
+}
+
+// HasMembership reports whether any membership event variant is set.
+func (d Decoded) HasMembership() bool {
+	return d.SuspectDown != nil || d.Recovering != nil || d.RecoveryAck != nil ||
+		d.VoteOut != nil || d.VoteOutAck != nil || d.VoteOutNack != nil ||
+		d.VoteIn != nil || d.VoteInAck != nil || d.VoteInNack != nil
 }
 
 // IsApp reports whether the decoded frame carries application data.
 func (d Decoded) IsApp() bool { return d.App != nil || (!d.Heartbeat && !d.HasMembership()) }
-
-// HasMembership reports whether any membership event variant is set.
-func (d Decoded) HasMembership() bool {
-	return d.SuspectDown != nil || d.SuspectAck != nil || d.SuspectNack != nil ||
-		d.Recovering != nil || d.RecoveryAck != nil
-}
 
 // Unmarshal decodes a ConvFrame from data. The returned Decoded
 // has exactly one variant populated.
@@ -142,22 +189,33 @@ func Unmarshal(data []byte) (Decoded, error) {
 	case *pb.ConvFrame_Heartbeat:
 		return Decoded{Heartbeat: true}, nil
 	case *pb.ConvFrame_Membership:
-		ev := body.Membership
-		switch e := ev.GetEvent().(type) {
-		case *pb.MembershipEvent_SuspectDown:
-			return Decoded{SuspectDown: e.SuspectDown}, nil
-		case *pb.MembershipEvent_SuspectAck:
-			return Decoded{SuspectAck: e.SuspectAck}, nil
-		case *pb.MembershipEvent_SuspectNack:
-			return Decoded{SuspectNack: e.SuspectNack}, nil
-		case *pb.MembershipEvent_Recovering:
-			return Decoded{Recovering: e.Recovering}, nil
-		case *pb.MembershipEvent_RecoveryAck:
-			return Decoded{RecoveryAck: e.RecoveryAck}, nil
-		default:
-			return Decoded{}, ErrEmptyFrame
-		}
+		return decodeMembership(body.Membership), nil
 	default:
 		return Decoded{}, ErrEmptyFrame
+	}
+}
+
+func decodeMembership(ev *pb.MembershipEvent) Decoded {
+	switch e := ev.GetEvent().(type) {
+	case *pb.MembershipEvent_SuspectDown:
+		return Decoded{SuspectDown: e.SuspectDown}
+	case *pb.MembershipEvent_Recovering:
+		return Decoded{Recovering: e.Recovering}
+	case *pb.MembershipEvent_RecoveryAck:
+		return Decoded{RecoveryAck: e.RecoveryAck}
+	case *pb.MembershipEvent_VoteOut:
+		return Decoded{VoteOut: e.VoteOut}
+	case *pb.MembershipEvent_VoteOutAck:
+		return Decoded{VoteOutAck: e.VoteOutAck}
+	case *pb.MembershipEvent_VoteOutNack:
+		return Decoded{VoteOutNack: e.VoteOutNack}
+	case *pb.MembershipEvent_VoteIn:
+		return Decoded{VoteIn: e.VoteIn}
+	case *pb.MembershipEvent_VoteInAck:
+		return Decoded{VoteInAck: e.VoteInAck}
+	case *pb.MembershipEvent_VoteInNack:
+		return Decoded{VoteInNack: e.VoteInNack}
+	default:
+		return Decoded{}
 	}
 }

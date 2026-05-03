@@ -84,24 +84,6 @@ func TestRoundtripMembershipEvents(t *testing.T) {
 			},
 		},
 		{
-			"SuspectAck",
-			func() ([]byte, error) { return frame.MarshalSuspectAck(r("bob")) },
-			func(t *testing.T, got frame.Decoded) {
-				if got.SuspectAck == nil {
-					t.Fatal("SuspectAck not set")
-				}
-			},
-		},
-		{
-			"SuspectNack",
-			func() ([]byte, error) { return frame.MarshalSuspectNack(r("bob")) },
-			func(t *testing.T, got frame.Decoded) {
-				if got.SuspectNack == nil {
-					t.Fatal("SuspectNack not set")
-				}
-			},
-		},
-		{
 			"Recovering",
 			func() ([]byte, error) { return frame.MarshalRecovering(r("carol")) },
 			func(t *testing.T, got frame.Decoded) {
@@ -116,6 +98,66 @@ func TestRoundtripMembershipEvents(t *testing.T) {
 			func(t *testing.T, got frame.Decoded) {
 				if got.RecoveryAck == nil {
 					t.Fatal("RecoveryAck not set")
+				}
+			},
+		},
+		{
+			"VoteOut",
+			func() ([]byte, error) { return frame.MarshalVoteOut(r("bob")) },
+			func(t *testing.T, got frame.Decoded) {
+				if got.VoteOut == nil {
+					t.Fatal("VoteOut not set")
+				}
+				if !bytes.Equal(got.VoteOut.GetTarget().GetValue(), r("bob").GetValue()) {
+					t.Fatalf("VoteOut.Target mismatch")
+				}
+			},
+		},
+		{
+			"VoteOutAck",
+			func() ([]byte, error) { return frame.MarshalVoteOutAck(r("bob")) },
+			func(t *testing.T, got frame.Decoded) {
+				if got.VoteOutAck == nil {
+					t.Fatal("VoteOutAck not set")
+				}
+			},
+		},
+		{
+			"VoteOutNack",
+			func() ([]byte, error) { return frame.MarshalVoteOutNack(r("bob")) },
+			func(t *testing.T, got frame.Decoded) {
+				if got.VoteOutNack == nil {
+					t.Fatal("VoteOutNack not set")
+				}
+			},
+		},
+		{
+			"VoteIn",
+			func() ([]byte, error) { return frame.MarshalVoteIn(r("dave"), "127.0.0.1:9000") },
+			func(t *testing.T, got frame.Decoded) {
+				if got.VoteIn == nil {
+					t.Fatal("VoteIn not set")
+				}
+				if got.VoteIn.GetAddr() != "127.0.0.1:9000" {
+					t.Fatalf("VoteIn.Addr = %q", got.VoteIn.GetAddr())
+				}
+			},
+		},
+		{
+			"VoteInAck",
+			func() ([]byte, error) { return frame.MarshalVoteInAck(r("dave")) },
+			func(t *testing.T, got frame.Decoded) {
+				if got.VoteInAck == nil {
+					t.Fatal("VoteInAck not set")
+				}
+			},
+		},
+		{
+			"VoteInNack",
+			func() ([]byte, error) { return frame.MarshalVoteInNack(r("dave")) },
+			func(t *testing.T, got frame.Decoded) {
+				if got.VoteInNack == nil {
+					t.Fatal("VoteInNack not set")
 				}
 			},
 		},

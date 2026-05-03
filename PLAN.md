@@ -141,7 +141,27 @@ The paper notes (§4.1) that quorum-restricted partition handling "is feasible i
 - Note the asymmetry: this only protects *application command* progress in the majority. The membership protocol itself can still proceed in either side; that's fine because membership is reconciled at heal time.
 - Detail to design in Phase 3: how a replica decides it's in a partition (vs just slow / individual peers down) — likely a count-based heuristic on top of FailureDetection.
 
-### 2.12 (Re)Start dissolves under static composition
+### 2.13 Membership protocol — split-suspicion-and-voting design (divergence from paper §4.2)
+
+The paper conflates "I think p is silent right now" with "let's permanently remove p from the conversation" into a single protocol — `(p is down)` is both an observation AND a removal vote. We deliberately split these into two layers because failure is transient (a "downed" replica may simply come back) and we want routine churn to self-heal without permanent ML mutation.
+
+- **Soft suspicion** is informational and recoverable:
+  - When `failure.Detector` fires for `p`, the local Manager broadcasts `SuspectDown(p)` and locally `Maskout(p)` (stops accepting `p`'s messages).
+  - Receivers add `p` to their `SuspectDownList` and likewise `Maskout(p)`. They DO NOT respond with Ack/Nack — `SuspectDown` is FYI, not a vote.
+  - Recovery is implicit: when any replica subsequently receives a message from `p`, they clear `p` from `SuspectDownList` and `Maskin(p)`. No ML mutation occurred; the conversation continues as if `p` was briefly slow.
+- **Hard removal** (permanent, deliberate) is the explicit `VoteOut(p)` operation:
+  - `Manager.VoteOut(p)` broadcasts a `VoteOut(p)` event into the conversation.
+  - Each peer responds with `VoteOutAck(p)` (I haven't received from `p` recently) or `VoteOutNack(p)` (I have evidence `p` is alive).
+  - On quorum Ack with no Nack: `p` is removed from `ML` permanently; vectors freeze `p`'s slot per §2.10.1.
+  - On any Nack: the VoteOut is aborted.
+  - sf-groups (paper §4.2.1) apply: concurrent VoteOuts at the same logical time are merged so they're handled atomically.
+  - A voted-out replica cannot auto-readmit; rejoining requires explicit `VoteIn`.
+- **Hard addition** is the symmetric `VoteIn(p, addr)` operation:
+  - `Manager.VoteIn(p, addr)` broadcasts a `VoteIn(p)` event.
+  - Each peer responds `VoteInAck(p)` or `VoteInNack(p)` (Nack reasons: conflict, policy violation; in the simple case, peers just Ack).
+  - On quorum Ack: `p` is inserted into `ML` at its sorted-by-ReplicaID position; vectors gain a new slot per §2.10.1; routing tables are updated to reach `p`.
+
+**Why this split.** It cleanly separates "policy" (when to remove a member) from "mechanism" (how the conversation reaches consensus on member changes). The routine `Detector` → `SuspectDown` → mask-in/out flow handles transient failures with no protocol gymnastics. The `VoteOut`/`VoteIn` mechanism is mechanism-only — no auto-trigger; the application (or a Phase 5+ auto-eviction policy component) decides when to invoke it. The §4.1 correctness conditions still apply, just at the VoteOut/VoteIn layer rather than at SuspectDown.
 Paper §5.1 says "(Re)Start in particular—save information to recreate the proper connections among various protocols used in Consul following a crash." Because our composition layer (`stack/`, Phase 5) is *static Go code* — not a runtime-configured protocol graph like the x-kernel — there are no "connections" to persist. (Re)Start's persistence concern collapses to: open the same binary; the wiring is the same. We document this so a paper reader doesn't go looking for our equivalent.
 
 ---

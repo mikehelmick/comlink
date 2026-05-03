@@ -242,14 +242,22 @@ func (m *Manager) dispatch(d psync.Delivery, dec frame.Decoded, sender *pb.Repli
 		// Liveness signal only; NoteReceived already credited.
 	case dec.SuspectDown != nil:
 		m.handleSuspectDown(dec.SuspectDown, sender)
-	case dec.SuspectAck != nil:
-		m.handleSuspectAck(dec.SuspectAck, sender)
-	case dec.SuspectNack != nil:
-		m.handleSuspectNack(dec.SuspectNack, sender)
 	case dec.Recovering != nil:
 		m.handleRecovering(dec.Recovering, sender)
 	case dec.RecoveryAck != nil:
 		m.handleRecoveryAck(dec.RecoveryAck, sender)
+	case dec.VoteOut != nil:
+		m.handleVoteOut(dec.VoteOut, sender)
+	case dec.VoteOutAck != nil:
+		m.handleVoteOutAck(dec.VoteOutAck, sender)
+	case dec.VoteOutNack != nil:
+		m.handleVoteOutNack(dec.VoteOutNack, sender)
+	case dec.VoteIn != nil:
+		m.handleVoteIn(dec.VoteIn, sender)
+	case dec.VoteInAck != nil:
+		m.handleVoteInAck(dec.VoteInAck, sender)
+	case dec.VoteInNack != nil:
+		m.handleVoteInNack(dec.VoteInNack, sender)
 	}
 }
 
@@ -301,11 +309,21 @@ func (m *Manager) isClosed() bool {
 
 // ─── membership-event handlers (stubs for Phase 3(d+)) ────────────
 
-// handleSuspectDown is the receiver-side of (p is down). Phase
-// 3(d) will run the ack/nack heuristic from §4.2 here.
+// handleSuspectDown is the receiver-side of the informational
+// SuspectDown notification. PLAN §2.13: peers add `suspect` to
+// SuspectDownList and Maskout(suspect); recovery happens implicitly
+// when subsequent traffic arrives from suspect. Phase 3(d) wires
+// this in.
 func (m *Manager) handleSuspectDown(_ *pb.SuspectDown, _ *pb.ReplicaID) {}
 
-func (m *Manager) handleSuspectAck(_ *pb.SuspectAck, _ *pb.ReplicaID)   {}
-func (m *Manager) handleSuspectNack(_ *pb.SuspectNack, _ *pb.ReplicaID) {}
 func (m *Manager) handleRecovering(_ *pb.Recovering, _ *pb.ReplicaID)   {}
 func (m *Manager) handleRecoveryAck(_ *pb.RecoveryAck, _ *pb.ReplicaID) {}
+
+// VoteOut/VoteIn handlers — Phase 3(e) implements the explicit
+// ML-mutation protocols.
+func (m *Manager) handleVoteOut(_ *pb.VoteOut, _ *pb.ReplicaID)         {}
+func (m *Manager) handleVoteOutAck(_ *pb.VoteOutAck, _ *pb.ReplicaID)   {}
+func (m *Manager) handleVoteOutNack(_ *pb.VoteOutNack, _ *pb.ReplicaID) {}
+func (m *Manager) handleVoteIn(_ *pb.VoteIn, _ *pb.ReplicaID)           {}
+func (m *Manager) handleVoteInAck(_ *pb.VoteInAck, _ *pb.ReplicaID)     {}
+func (m *Manager) handleVoteInNack(_ *pb.VoteInNack, _ *pb.ReplicaID)   {}

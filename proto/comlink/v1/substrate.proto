@@ -27,6 +27,11 @@ syntax = "proto3";
 // app bytes; the Manager wraps/unwraps ConvFrame transparently.
 // FailureDetection / Membership emit their own ConvFrame variants
 // directly and rely on the Manager's frame routing on receive.
+//
+// Membership protocol design split (PLAN §2.13): SuspectDown is
+// informational (FYI / mask trigger), and VoteOut/VoteIn are the
+// explicit mechanisms for permanent ML mutation. SuspectDown does
+// NOT carry an ack/nack response; only VoteOut and VoteIn do.
 package comlink.v1;
 
 import "comlink/v1/comlink.proto";
@@ -50,54 +55,84 @@ message ConvFrame {
 // advances stability detection for messages it depends on).
 message Heartbeat {}
 
-// MembershipEvent carries one of the five membership-protocol
-// control messages from paper §4.2:
-//   suspect_down  = (p is down) — FailureDetection suspects p
-//   suspect_ack   = (Ack, p is down) — confirms p has stopped
-//   suspect_nack  = (Nack, p is down) — refutes the suspicion
-//   recovering    = (p is up) — p has restarted and is rejoining
-//   recovery_ack  = (Ack, p is up) — confirms incorporation
+// MembershipEvent carries one of the membership-protocol control
+// messages.
+//
+// SuspectDown / Recovering are informational: peers update their
+// SuspectDownList state and mask in/out, but do NOT respond.
+//
+// VoteOut / VoteIn are the explicit mechanisms for permanent ML
+// mutation; peers respond with VoteOutAck/Nack or VoteInAck/Nack.
 message MembershipEvent {
   oneof event {
     SuspectDown suspect_down = 1;
-    SuspectAck suspect_ack = 2;
-    SuspectNack suspect_nack = 3;
-    Recovering recovering = 4;
-    RecoveryAck recovery_ack = 5;
+    Recovering recovering = 2;
+    VoteOut vote_out = 3;
+    VoteOutAck vote_out_ack = 4;
+    VoteOutNack vote_out_nack = 5;
+    VoteIn vote_in = 6;
+    VoteInAck vote_in_ack = 7;
+    VoteInNack vote_in_nack = 8;
+    RecoveryAck recovery_ack = 9;
   }
 }
 
-// SuspectDown announces the sender suspects `suspect` has failed.
-// Paper §4.2: emitted by FailureDetection when no message has been
-// received from the suspect within the suspicion interval.
+// SuspectDown is informational: the sender's FailureDetector has
+// flagged `suspect` as silent. Receivers update their
+// SuspectDownList and Maskout(suspect); recovery happens implicitly
+// when a subsequent message arrives from suspect (paper §4.2's
+// (p is down), reframed per PLAN §2.13).
 message SuspectDown {
   ReplicaID suspect = 1;
 }
 
-// SuspectAck confirms the sender has not received any message from
-// `suspect` at the same logical time as the (p is down) message
-// for `suspect`. Paper §4.2.3.
-message SuspectAck {
-  ReplicaID suspect = 1;
-}
-
-// SuspectNack refutes the suspicion: the sender HAS received a
-// message from `suspect` at the same logical time as the
-// (p is down) message — evidence the suspect is still alive.
-// Paper §4.2.3.
-message SuspectNack {
-  ReplicaID suspect = 1;
-}
-
-// Recovering announces that the sender (`who`) has restarted and is
-// rejoining the conversation. Paper §5.2.
+// Recovering announces that the sender (`who`) has restarted and
+// is rejoining the conversation. Paper §5.2's (p is up).
 message Recovering {
   ReplicaID who = 1;
 }
 
-// RecoveryAck confirms incorporation of `who` back into the
-// membership list. Paper §4.2.3, §5.2: every alive process sends
-// (Ack, p is up) before incorporating the recovering process.
+// RecoveryAck confirms `who`'s incorporation back into the
+// membership list. Paper §4.2.3.
 message RecoveryAck {
   ReplicaID who = 1;
+}
+
+// VoteOut proposes the permanent removal of `target` from the
+// membership list. Paper §4.2 / PLAN §2.13.
+message VoteOut {
+  ReplicaID target = 1;
+}
+
+// VoteOutAck signals the sender agrees with removing `target`:
+// they have not received any message from target at or after the
+// VoteOut's logical time.
+message VoteOutAck {
+  ReplicaID target = 1;
+}
+
+// VoteOutNack signals the sender disagrees with removing `target`:
+// they have evidence target is alive.
+message VoteOutNack {
+  ReplicaID target = 1;
+}
+
+// VoteIn proposes the permanent addition of `target` to the
+// membership list. addr is the network address peers should use to
+// reach target (the gRPC transport, for example, needs this to
+// open a connection).
+message VoteIn {
+  ReplicaID target = 1;
+  string addr = 2;
+}
+
+// VoteInAck signals the sender agrees with adding `target`.
+message VoteInAck {
+  ReplicaID target = 1;
+}
+
+// VoteInNack signals the sender disagrees with adding `target`
+// (e.g. policy violation, conflict).
+message VoteInNack {
+  ReplicaID target = 1;
 }
