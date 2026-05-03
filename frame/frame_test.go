@@ -84,24 +84,6 @@ func TestRoundtripMembershipEvents(t *testing.T) {
 			},
 		},
 		{
-			"Recovering",
-			func() ([]byte, error) { return frame.MarshalRecovering(r("carol")) },
-			func(t *testing.T, got frame.Decoded) {
-				if got.Recovering == nil {
-					t.Fatal("Recovering not set")
-				}
-			},
-		},
-		{
-			"RecoveryAck",
-			func() ([]byte, error) { return frame.MarshalRecoveryAck(r("carol")) },
-			func(t *testing.T, got frame.Decoded) {
-				if got.RecoveryAck == nil {
-					t.Fatal("RecoveryAck not set")
-				}
-			},
-		},
-		{
 			"VoteOut",
 			func() ([]byte, error) { return frame.MarshalVoteOut(r("bob")) },
 			func(t *testing.T, got frame.Decoded) {

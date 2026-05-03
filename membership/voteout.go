@@ -49,6 +49,10 @@ var (
 	// ErrVoteOutInProgress means another VoteOut for the same
 	// target is already in flight; only one at a time per target.
 	ErrVoteOutInProgress = errors.New("membership: VoteOut already in progress for target")
+	// ErrPartitionMinority means this replica is in the minority
+	// partition (PLAN §2.11) and refuses to initiate ML-mutating
+	// operations until quorum is restored.
+	ErrPartitionMinority = errors.New("membership: refusing operation in minority partition")
 )
 
 // voteOutSession tracks an in-flight VoteOut. Sessions are keyed
@@ -99,6 +103,10 @@ func (m *Manager) VoteOut(ctx context.Context, target *pb.ReplicaID) error {
 	if !m.isMemberLocked(target) {
 		m.mu.Unlock()
 		return ErrVoteOutTargetNotMember
+	}
+	if !m.inMajorityLocked() {
+		m.mu.Unlock()
+		return ErrPartitionMinority
 	}
 	if _, exists := m.voteOutSessions[string(target.GetValue())]; exists {
 		m.mu.Unlock()
@@ -161,6 +169,12 @@ func (m *Manager) isMemberLocked(replica *pb.ReplicaID) bool {
 		}
 	}
 	return false
+}
+
+// inMajorityLocked reports whether this replica is in the majority
+// partition (PLAN §2.11). Caller must hold m.mu.
+func (m *Manager) inMajorityLocked() bool {
+	return len(m.membershipList)*2 > m.cfg.InitialGroupSize
 }
 
 // broadcastVoteOut sends VoteOut(target) into the conversation.

@@ -80,6 +80,10 @@ func (m *Manager) VoteIn(ctx context.Context, target *pb.ReplicaID, addr string)
 		m.mu.Unlock()
 		return ErrVoteInTargetAlreadyMember
 	}
+	if !m.inMajorityLocked() {
+		m.mu.Unlock()
+		return ErrPartitionMinority
+	}
 	if _, exists := m.voteInSessions[string(target.GetValue())]; exists {
 		m.mu.Unlock()
 		return ErrVoteInInProgress

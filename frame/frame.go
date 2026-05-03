@@ -62,26 +62,6 @@ func MarshalSuspectDown(suspect *pb.ReplicaID) ([]byte, error) {
 	})
 }
 
-// MarshalRecovering wraps a Recovering event announcing `who` has
-// restarted.
-func MarshalRecovering(who *pb.ReplicaID) ([]byte, error) {
-	return marshalMembership(&pb.MembershipEvent{
-		Event: &pb.MembershipEvent_Recovering{
-			Recovering: &pb.Recovering{Who: who},
-		},
-	})
-}
-
-// MarshalRecoveryAck wraps a RecoveryAck event acknowledging
-// `who`'s incorporation.
-func MarshalRecoveryAck(who *pb.ReplicaID) ([]byte, error) {
-	return marshalMembership(&pb.MembershipEvent{
-		Event: &pb.MembershipEvent_RecoveryAck{
-			RecoveryAck: &pb.RecoveryAck{Who: who},
-		},
-	})
-}
-
 // MarshalVoteOut proposes permanent removal of `target` from ML.
 func MarshalVoteOut(target *pb.ReplicaID) ([]byte, error) {
 	return marshalMembership(&pb.MembershipEvent{
@@ -149,8 +129,6 @@ type Decoded struct {
 	App         []byte // populated for ConvFrame.app
 	Heartbeat   bool   // true for ConvFrame.heartbeat
 	SuspectDown *pb.SuspectDown
-	Recovering  *pb.Recovering
-	RecoveryAck *pb.RecoveryAck
 	VoteOut     *pb.VoteOut
 	VoteOutAck  *pb.VoteOutAck
 	VoteOutNack *pb.VoteOutNack
@@ -161,7 +139,7 @@ type Decoded struct {
 
 // HasMembership reports whether any membership event variant is set.
 func (d Decoded) HasMembership() bool {
-	return d.SuspectDown != nil || d.Recovering != nil || d.RecoveryAck != nil ||
+	return d.SuspectDown != nil ||
 		d.VoteOut != nil || d.VoteOutAck != nil || d.VoteOutNack != nil ||
 		d.VoteIn != nil || d.VoteInAck != nil || d.VoteInNack != nil
 }
@@ -199,10 +177,6 @@ func decodeMembership(ev *pb.MembershipEvent) Decoded {
 	switch e := ev.GetEvent().(type) {
 	case *pb.MembershipEvent_SuspectDown:
 		return Decoded{SuspectDown: e.SuspectDown}
-	case *pb.MembershipEvent_Recovering:
-		return Decoded{Recovering: e.Recovering}
-	case *pb.MembershipEvent_RecoveryAck:
-		return Decoded{RecoveryAck: e.RecoveryAck}
 	case *pb.MembershipEvent_VoteOut:
 		return Decoded{VoteOut: e.VoteOut}
 	case *pb.MembershipEvent_VoteOutAck:

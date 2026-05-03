@@ -75,6 +75,20 @@ type Config struct {
 	// AppBufSize is the buffer of the application Recv channel.
 	// Default 256.
 	AppBufSize int
+
+	// InitialGroupSize is N from PLAN §2.11 — the original
+	// participant count used for quorum decisions on VoteOut /
+	// VoteIn. If zero, defaults to len(Members) (i.e. assumes the
+	// Manager is constructed at conversation creation time and
+	// the initial Members list IS the full original group).
+	//
+	// A replica is considered "in the majority partition" iff
+	// len(currentML) > InitialGroupSize / 2. Minority replicas
+	// refuse to initiate VoteOut / VoteIn (ErrPartitionMinority);
+	// they still process incoming events, ack/nack, and apply
+	// accepted decisions when those reach them via the
+	// conversation.
+	InitialGroupSize int
 }
 
 // AppMessage is the unit handed to applications via Manager.Recv.
@@ -133,6 +147,9 @@ func New(cfg Config) (*Manager, error) {
 	bufSize := cfg.AppBufSize
 	if bufSize <= 0 {
 		bufSize = 256
+	}
+	if cfg.InitialGroupSize <= 0 {
+		cfg.InitialGroupSize = len(cfg.Members)
 	}
 
 	m := &Manager{
@@ -218,6 +235,16 @@ func (m *Manager) SuspectedReplicas() []*pb.ReplicaID {
 	return out
 }
 
+// InMajorityPartition reports whether this replica believes it is
+// in the majority partition (PLAN §2.11): len(currentML) >
+// InitialGroupSize/2. Strict majority — a tied split (|ML| ==
+// N/2) is treated as minority to avoid split-brain.
+func (m *Manager) InMajorityPartition() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.membershipList)*2 > m.cfg.InitialGroupSize
+}
+
 // Close stops the Manager. The underlying Conversation is NOT
 // closed; the caller owns it. Close is independent of Conversation
 // lifecycle — Manager.Close exits cleanly whether or not the
@@ -281,10 +308,6 @@ func (m *Manager) dispatch(d psync.Delivery, dec frame.Decoded, sender *pb.Repli
 		// Liveness signal only; NoteReceived already credited.
 	case dec.SuspectDown != nil:
 		m.handleSuspectDown(dec.SuspectDown, sender)
-	case dec.Recovering != nil:
-		m.handleRecovering(dec.Recovering, sender)
-	case dec.RecoveryAck != nil:
-		m.handleRecoveryAck(dec.RecoveryAck, sender)
 	case dec.VoteOut != nil:
 		m.handleVoteOut(dec.VoteOut, sender)
 	case dec.VoteOutAck != nil:
@@ -394,9 +417,9 @@ func (m *Manager) isClosed() bool {
 
 // handleSuspectDown is the receiver-side of the informational
 // SuspectDown notification. PLAN §2.13: add `suspect` to local
-// SuspectDownList and Maskout(suspect). Recovery happens implicitly
-// when subsequent traffic arrives from suspect (handled by the
-// pump's clearSuspicion call).
+// SuspectDownList. Recovery happens implicitly when subsequent
+// traffic arrives from suspect (handled by the pump's
+// clearSuspicion call).
 //
 // Self-suspicion (someone announcing they suspect themselves) and
 // suspicion-of-the-sender (the SuspectDown's sender naming itself
@@ -419,8 +442,5 @@ func (m *Manager) handleSuspectDown(susp *pb.SuspectDown, sender *pb.ReplicaID) 
 	}
 	m.markSuspected(target)
 }
-
-func (m *Manager) handleRecovering(_ *pb.Recovering, _ *pb.ReplicaID)   {}
-func (m *Manager) handleRecoveryAck(_ *pb.RecoveryAck, _ *pb.ReplicaID) {}
 
 // VoteOut/VoteIn handlers live in voteout.go and votein.go.

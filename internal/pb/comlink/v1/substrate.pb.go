@@ -198,24 +198,31 @@ func (*Heartbeat) Descriptor() ([]byte, []int) {
 // MembershipEvent carries one of the membership-protocol control
 // messages.
 //
-// SuspectDown / Recovering are informational: peers update their
-// SuspectDownList state and mask in/out, but do NOT respond.
+// SuspectDown is informational: receivers update their
+// SuspectDownList state but do NOT respond.
 //
 // VoteOut / VoteIn are the explicit mechanisms for permanent ML
 // mutation; peers respond with VoteOutAck/Nack or VoteInAck/Nack.
+//
+// Note on missing (p is up) / (Ack, p is up) per PLAN §2.13:
+// recovery is implicit in our split-suspicion-and-voting design.
+// A previously-silent replica that resumes sending is auto-cleared
+// from peers' SuspectDownList by the pump's clearSuspicion path
+// (Phase 3(d)). Heartbeats plus psync.Restart cover the
+// crashed-and-restarted catch-up case. Field numbers 2 and 9 are
+// reserved to leave room for re-adding (p is up) semantics if a
+// future use case demands explicit recovery announcement.
 type MembershipEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Event:
 	//
 	//	*MembershipEvent_SuspectDown
-	//	*MembershipEvent_Recovering
 	//	*MembershipEvent_VoteOut
 	//	*MembershipEvent_VoteOutAck
 	//	*MembershipEvent_VoteOutNack
 	//	*MembershipEvent_VoteIn
 	//	*MembershipEvent_VoteInAck
 	//	*MembershipEvent_VoteInNack
-	//	*MembershipEvent_RecoveryAck
 	Event         isMembershipEvent_Event `protobuf_oneof:"event"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -262,15 +269,6 @@ func (x *MembershipEvent) GetSuspectDown() *SuspectDown {
 	if x != nil {
 		if x, ok := x.Event.(*MembershipEvent_SuspectDown); ok {
 			return x.SuspectDown
-		}
-	}
-	return nil
-}
-
-func (x *MembershipEvent) GetRecovering() *Recovering {
-	if x != nil {
-		if x, ok := x.Event.(*MembershipEvent_Recovering); ok {
-			return x.Recovering
 		}
 	}
 	return nil
@@ -330,25 +328,12 @@ func (x *MembershipEvent) GetVoteInNack() *VoteInNack {
 	return nil
 }
 
-func (x *MembershipEvent) GetRecoveryAck() *RecoveryAck {
-	if x != nil {
-		if x, ok := x.Event.(*MembershipEvent_RecoveryAck); ok {
-			return x.RecoveryAck
-		}
-	}
-	return nil
-}
-
 type isMembershipEvent_Event interface {
 	isMembershipEvent_Event()
 }
 
 type MembershipEvent_SuspectDown struct {
 	SuspectDown *SuspectDown `protobuf:"bytes,1,opt,name=suspect_down,json=suspectDown,proto3,oneof"`
-}
-
-type MembershipEvent_Recovering struct {
-	Recovering *Recovering `protobuf:"bytes,2,opt,name=recovering,proto3,oneof"`
 }
 
 type MembershipEvent_VoteOut struct {
@@ -375,13 +360,7 @@ type MembershipEvent_VoteInNack struct {
 	VoteInNack *VoteInNack `protobuf:"bytes,8,opt,name=vote_in_nack,json=voteInNack,proto3,oneof"`
 }
 
-type MembershipEvent_RecoveryAck struct {
-	RecoveryAck *RecoveryAck `protobuf:"bytes,9,opt,name=recovery_ack,json=recoveryAck,proto3,oneof"`
-}
-
 func (*MembershipEvent_SuspectDown) isMembershipEvent_Event() {}
-
-func (*MembershipEvent_Recovering) isMembershipEvent_Event() {}
 
 func (*MembershipEvent_VoteOut) isMembershipEvent_Event() {}
 
@@ -395,13 +374,10 @@ func (*MembershipEvent_VoteInAck) isMembershipEvent_Event() {}
 
 func (*MembershipEvent_VoteInNack) isMembershipEvent_Event() {}
 
-func (*MembershipEvent_RecoveryAck) isMembershipEvent_Event() {}
-
 // SuspectDown is informational: the sender's FailureDetector has
-// flagged `suspect` as silent. Receivers update their
-// SuspectDownList and Maskout(suspect); recovery happens implicitly
-// when a subsequent message arrives from suspect (paper §4.2's
-// (p is down), reframed per PLAN §2.13).
+// flagged `suspect` as silent. Receivers update their local
+// SuspectDownList only; recovery happens implicitly when a
+// subsequent message arrives from suspect (PLAN §2.13).
 type SuspectDown struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Suspect       *ReplicaID             `protobuf:"bytes,1,opt,name=suspect,proto3" json:"suspect,omitempty"`
@@ -446,98 +422,6 @@ func (x *SuspectDown) GetSuspect() *ReplicaID {
 	return nil
 }
 
-// Recovering announces that the sender (`who`) has restarted and
-// is rejoining the conversation. Paper §5.2's (p is up).
-type Recovering struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Who           *ReplicaID             `protobuf:"bytes,1,opt,name=who,proto3" json:"who,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *Recovering) Reset() {
-	*x = Recovering{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[4]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *Recovering) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*Recovering) ProtoMessage() {}
-
-func (x *Recovering) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[4]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use Recovering.ProtoReflect.Descriptor instead.
-func (*Recovering) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{4}
-}
-
-func (x *Recovering) GetWho() *ReplicaID {
-	if x != nil {
-		return x.Who
-	}
-	return nil
-}
-
-// RecoveryAck confirms `who`'s incorporation back into the
-// membership list. Paper §4.2.3.
-type RecoveryAck struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Who           *ReplicaID             `protobuf:"bytes,1,opt,name=who,proto3" json:"who,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *RecoveryAck) Reset() {
-	*x = RecoveryAck{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[5]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *RecoveryAck) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*RecoveryAck) ProtoMessage() {}
-
-func (x *RecoveryAck) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[5]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use RecoveryAck.ProtoReflect.Descriptor instead.
-func (*RecoveryAck) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{5}
-}
-
-func (x *RecoveryAck) GetWho() *ReplicaID {
-	if x != nil {
-		return x.Who
-	}
-	return nil
-}
-
 // VoteOut proposes the permanent removal of `target` from the
 // membership list. Paper §4.2 / PLAN §2.13.
 type VoteOut struct {
@@ -549,7 +433,7 @@ type VoteOut struct {
 
 func (x *VoteOut) Reset() {
 	*x = VoteOut{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[6]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -561,7 +445,7 @@ func (x *VoteOut) String() string {
 func (*VoteOut) ProtoMessage() {}
 
 func (x *VoteOut) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[6]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -574,7 +458,7 @@ func (x *VoteOut) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteOut.ProtoReflect.Descriptor instead.
 func (*VoteOut) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{6}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *VoteOut) GetTarget() *ReplicaID {
@@ -596,7 +480,7 @@ type VoteOutAck struct {
 
 func (x *VoteOutAck) Reset() {
 	*x = VoteOutAck{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[7]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -608,7 +492,7 @@ func (x *VoteOutAck) String() string {
 func (*VoteOutAck) ProtoMessage() {}
 
 func (x *VoteOutAck) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[7]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -621,7 +505,7 @@ func (x *VoteOutAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteOutAck.ProtoReflect.Descriptor instead.
 func (*VoteOutAck) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{7}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *VoteOutAck) GetTarget() *ReplicaID {
@@ -642,7 +526,7 @@ type VoteOutNack struct {
 
 func (x *VoteOutNack) Reset() {
 	*x = VoteOutNack{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[8]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -654,7 +538,7 @@ func (x *VoteOutNack) String() string {
 func (*VoteOutNack) ProtoMessage() {}
 
 func (x *VoteOutNack) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[8]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -667,7 +551,7 @@ func (x *VoteOutNack) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteOutNack.ProtoReflect.Descriptor instead.
 func (*VoteOutNack) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{8}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *VoteOutNack) GetTarget() *ReplicaID {
@@ -691,7 +575,7 @@ type VoteIn struct {
 
 func (x *VoteIn) Reset() {
 	*x = VoteIn{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[9]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -703,7 +587,7 @@ func (x *VoteIn) String() string {
 func (*VoteIn) ProtoMessage() {}
 
 func (x *VoteIn) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[9]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -716,7 +600,7 @@ func (x *VoteIn) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteIn.ProtoReflect.Descriptor instead.
 func (*VoteIn) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{9}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *VoteIn) GetTarget() *ReplicaID {
@@ -743,7 +627,7 @@ type VoteInAck struct {
 
 func (x *VoteInAck) Reset() {
 	*x = VoteInAck{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[10]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -755,7 +639,7 @@ func (x *VoteInAck) String() string {
 func (*VoteInAck) ProtoMessage() {}
 
 func (x *VoteInAck) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[10]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -768,7 +652,7 @@ func (x *VoteInAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteInAck.ProtoReflect.Descriptor instead.
 func (*VoteInAck) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{10}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *VoteInAck) GetTarget() *ReplicaID {
@@ -789,7 +673,7 @@ type VoteInNack struct {
 
 func (x *VoteInNack) Reset() {
 	*x = VoteInNack{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[11]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -801,7 +685,7 @@ func (x *VoteInNack) String() string {
 func (*VoteInNack) ProtoMessage() {}
 
 func (x *VoteInNack) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[11]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -814,7 +698,7 @@ func (x *VoteInNack) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteInNack.ProtoReflect.Descriptor instead.
 func (*VoteInNack) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{11}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *VoteInNack) GetTarget() *ReplicaID {
@@ -837,12 +721,9 @@ const file_comlink_v1_substrate_proto_rawDesc = "" +
 	"membership\x18\x03 \x01(\v2\x1b.comlink.v1.MembershipEventH\x00R\n" +
 	"membershipB\x06\n" +
 	"\x04body\"\v\n" +
-	"\tHeartbeat\"\xa1\x04\n" +
+	"\tHeartbeat\"\xb5\x03\n" +
 	"\x0fMembershipEvent\x12<\n" +
-	"\fsuspect_down\x18\x01 \x01(\v2\x17.comlink.v1.SuspectDownH\x00R\vsuspectDown\x128\n" +
-	"\n" +
-	"recovering\x18\x02 \x01(\v2\x16.comlink.v1.RecoveringH\x00R\n" +
-	"recovering\x120\n" +
+	"\fsuspect_down\x18\x01 \x01(\v2\x17.comlink.v1.SuspectDownH\x00R\vsuspectDown\x120\n" +
 	"\bvote_out\x18\x03 \x01(\v2\x13.comlink.v1.VoteOutH\x00R\avoteOut\x12:\n" +
 	"\fvote_out_ack\x18\x04 \x01(\v2\x16.comlink.v1.VoteOutAckH\x00R\n" +
 	"voteOutAck\x12=\n" +
@@ -850,16 +731,11 @@ const file_comlink_v1_substrate_proto_rawDesc = "" +
 	"\avote_in\x18\x06 \x01(\v2\x12.comlink.v1.VoteInH\x00R\x06voteIn\x127\n" +
 	"\vvote_in_ack\x18\a \x01(\v2\x15.comlink.v1.VoteInAckH\x00R\tvoteInAck\x12:\n" +
 	"\fvote_in_nack\x18\b \x01(\v2\x16.comlink.v1.VoteInNackH\x00R\n" +
-	"voteInNack\x12<\n" +
-	"\frecovery_ack\x18\t \x01(\v2\x17.comlink.v1.RecoveryAckH\x00R\vrecoveryAckB\a\n" +
-	"\x05event\">\n" +
+	"voteInNackB\a\n" +
+	"\x05eventJ\x04\b\x02\x10\x03J\x04\b\t\x10\n" +
+	"\">\n" +
 	"\vSuspectDown\x12/\n" +
-	"\asuspect\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\asuspect\"5\n" +
-	"\n" +
-	"Recovering\x12'\n" +
-	"\x03who\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\x03who\"6\n" +
-	"\vRecoveryAck\x12'\n" +
-	"\x03who\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\x03who\"8\n" +
+	"\asuspect\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\asuspect\"8\n" +
 	"\aVoteOut\x12-\n" +
 	"\x06target\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\x06target\";\n" +
 	"\n" +
@@ -888,48 +764,42 @@ func file_comlink_v1_substrate_proto_rawDescGZIP() []byte {
 	return file_comlink_v1_substrate_proto_rawDescData
 }
 
-var file_comlink_v1_substrate_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_comlink_v1_substrate_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_comlink_v1_substrate_proto_goTypes = []any{
 	(*ConvFrame)(nil),       // 0: comlink.v1.ConvFrame
 	(*Heartbeat)(nil),       // 1: comlink.v1.Heartbeat
 	(*MembershipEvent)(nil), // 2: comlink.v1.MembershipEvent
 	(*SuspectDown)(nil),     // 3: comlink.v1.SuspectDown
-	(*Recovering)(nil),      // 4: comlink.v1.Recovering
-	(*RecoveryAck)(nil),     // 5: comlink.v1.RecoveryAck
-	(*VoteOut)(nil),         // 6: comlink.v1.VoteOut
-	(*VoteOutAck)(nil),      // 7: comlink.v1.VoteOutAck
-	(*VoteOutNack)(nil),     // 8: comlink.v1.VoteOutNack
-	(*VoteIn)(nil),          // 9: comlink.v1.VoteIn
-	(*VoteInAck)(nil),       // 10: comlink.v1.VoteInAck
-	(*VoteInNack)(nil),      // 11: comlink.v1.VoteInNack
-	(*ReplicaID)(nil),       // 12: comlink.v1.ReplicaID
+	(*VoteOut)(nil),         // 4: comlink.v1.VoteOut
+	(*VoteOutAck)(nil),      // 5: comlink.v1.VoteOutAck
+	(*VoteOutNack)(nil),     // 6: comlink.v1.VoteOutNack
+	(*VoteIn)(nil),          // 7: comlink.v1.VoteIn
+	(*VoteInAck)(nil),       // 8: comlink.v1.VoteInAck
+	(*VoteInNack)(nil),      // 9: comlink.v1.VoteInNack
+	(*ReplicaID)(nil),       // 10: comlink.v1.ReplicaID
 }
 var file_comlink_v1_substrate_proto_depIdxs = []int32{
 	1,  // 0: comlink.v1.ConvFrame.heartbeat:type_name -> comlink.v1.Heartbeat
 	2,  // 1: comlink.v1.ConvFrame.membership:type_name -> comlink.v1.MembershipEvent
 	3,  // 2: comlink.v1.MembershipEvent.suspect_down:type_name -> comlink.v1.SuspectDown
-	4,  // 3: comlink.v1.MembershipEvent.recovering:type_name -> comlink.v1.Recovering
-	6,  // 4: comlink.v1.MembershipEvent.vote_out:type_name -> comlink.v1.VoteOut
-	7,  // 5: comlink.v1.MembershipEvent.vote_out_ack:type_name -> comlink.v1.VoteOutAck
-	8,  // 6: comlink.v1.MembershipEvent.vote_out_nack:type_name -> comlink.v1.VoteOutNack
-	9,  // 7: comlink.v1.MembershipEvent.vote_in:type_name -> comlink.v1.VoteIn
-	10, // 8: comlink.v1.MembershipEvent.vote_in_ack:type_name -> comlink.v1.VoteInAck
-	11, // 9: comlink.v1.MembershipEvent.vote_in_nack:type_name -> comlink.v1.VoteInNack
-	5,  // 10: comlink.v1.MembershipEvent.recovery_ack:type_name -> comlink.v1.RecoveryAck
-	12, // 11: comlink.v1.SuspectDown.suspect:type_name -> comlink.v1.ReplicaID
-	12, // 12: comlink.v1.Recovering.who:type_name -> comlink.v1.ReplicaID
-	12, // 13: comlink.v1.RecoveryAck.who:type_name -> comlink.v1.ReplicaID
-	12, // 14: comlink.v1.VoteOut.target:type_name -> comlink.v1.ReplicaID
-	12, // 15: comlink.v1.VoteOutAck.target:type_name -> comlink.v1.ReplicaID
-	12, // 16: comlink.v1.VoteOutNack.target:type_name -> comlink.v1.ReplicaID
-	12, // 17: comlink.v1.VoteIn.target:type_name -> comlink.v1.ReplicaID
-	12, // 18: comlink.v1.VoteInAck.target:type_name -> comlink.v1.ReplicaID
-	12, // 19: comlink.v1.VoteInNack.target:type_name -> comlink.v1.ReplicaID
-	20, // [20:20] is the sub-list for method output_type
-	20, // [20:20] is the sub-list for method input_type
-	20, // [20:20] is the sub-list for extension type_name
-	20, // [20:20] is the sub-list for extension extendee
-	0,  // [0:20] is the sub-list for field type_name
+	4,  // 3: comlink.v1.MembershipEvent.vote_out:type_name -> comlink.v1.VoteOut
+	5,  // 4: comlink.v1.MembershipEvent.vote_out_ack:type_name -> comlink.v1.VoteOutAck
+	6,  // 5: comlink.v1.MembershipEvent.vote_out_nack:type_name -> comlink.v1.VoteOutNack
+	7,  // 6: comlink.v1.MembershipEvent.vote_in:type_name -> comlink.v1.VoteIn
+	8,  // 7: comlink.v1.MembershipEvent.vote_in_ack:type_name -> comlink.v1.VoteInAck
+	9,  // 8: comlink.v1.MembershipEvent.vote_in_nack:type_name -> comlink.v1.VoteInNack
+	10, // 9: comlink.v1.SuspectDown.suspect:type_name -> comlink.v1.ReplicaID
+	10, // 10: comlink.v1.VoteOut.target:type_name -> comlink.v1.ReplicaID
+	10, // 11: comlink.v1.VoteOutAck.target:type_name -> comlink.v1.ReplicaID
+	10, // 12: comlink.v1.VoteOutNack.target:type_name -> comlink.v1.ReplicaID
+	10, // 13: comlink.v1.VoteIn.target:type_name -> comlink.v1.ReplicaID
+	10, // 14: comlink.v1.VoteInAck.target:type_name -> comlink.v1.ReplicaID
+	10, // 15: comlink.v1.VoteInNack.target:type_name -> comlink.v1.ReplicaID
+	16, // [16:16] is the sub-list for method output_type
+	16, // [16:16] is the sub-list for method input_type
+	16, // [16:16] is the sub-list for extension type_name
+	16, // [16:16] is the sub-list for extension extendee
+	0,  // [0:16] is the sub-list for field type_name
 }
 
 func init() { file_comlink_v1_substrate_proto_init() }
@@ -945,14 +815,12 @@ func file_comlink_v1_substrate_proto_init() {
 	}
 	file_comlink_v1_substrate_proto_msgTypes[2].OneofWrappers = []any{
 		(*MembershipEvent_SuspectDown)(nil),
-		(*MembershipEvent_Recovering)(nil),
 		(*MembershipEvent_VoteOut)(nil),
 		(*MembershipEvent_VoteOutAck)(nil),
 		(*MembershipEvent_VoteOutNack)(nil),
 		(*MembershipEvent_VoteIn)(nil),
 		(*MembershipEvent_VoteInAck)(nil),
 		(*MembershipEvent_VoteInNack)(nil),
-		(*MembershipEvent_RecoveryAck)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -960,7 +828,7 @@ func file_comlink_v1_substrate_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_comlink_v1_substrate_proto_rawDesc), len(file_comlink_v1_substrate_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   12,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

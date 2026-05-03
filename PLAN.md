@@ -162,6 +162,14 @@ The paper conflates "I think p is silent right now" with "let's permanently remo
   - On quorum Ack: `p` is inserted into `ML` at its sorted-by-ReplicaID position; vectors gain a new slot per §2.10.1; routing tables are updated to reach `p`.
 
 **Why this split.** It cleanly separates "policy" (when to remove a member) from "mechanism" (how the conversation reaches consensus on member changes). The routine `Detector` → `SuspectDown` → mask-in/out flow handles transient failures with no protocol gymnastics. The `VoteOut`/`VoteIn` mechanism is mechanism-only — no auto-trigger; the application (or a Phase 5+ auto-eviction policy component) decides when to invoke it. The §4.1 correctness conditions still apply, just at the VoteOut/VoteIn layer rather than at SuspectDown.
+
+**Recovery is implicit, not explicit.** Failure is *always* assumed transient unless an administrative action (VoteOut) explicitly removes the member. A replica that goes silent and later resumes sending is automatically welcomed back — receivers' SuspectDownList entries clear when they see the replica's traffic (Phase 3(d)), and the replica's own bookkeeping catches up via heartbeats and the standard psync lost-message protocol. The paper's `(p is up)` / `(Ack, p is up)` exchange is therefore not implemented; in our split design it would be redundant with heartbeats + psync.Restart.
+
+**Deferred from Phase 3 (carried into Phase 5 composition layer):**
+
+- **Vector-clock reshape on VoteIn (§2.10.1 promise not yet realized).** When a VoteIn is accepted, the new replica is added to `Manager.membershipList` but psync's `Membership` is *not* yet grown. To finish the story, every replica must on accept: (a) insert a new slot at the new replica's sorted position in psync.Membership; (b) pad in-graph node vectors with 0 at the new slot, OR have the comparison/stability code handle variable-length vectors gracefully; (c) recognize old-shape messages still in flight and either pad-then-process or defer until catch-up. The new replica itself also needs a complete bootstrap path (its own Manager + Conversation + Restart against the existing leaf set).
+- **Time-bounded or log-volume-bounded auto-VoteOut.** The base policy is "failure is transient; only admin VoteOut removes." Future enhancement: an optional auto-eviction policy that triggers VoteOut after sustained silence (e.g., 10× the suspicion interval) or excessive log-volume cost (a replica we can't trim past because it never acks). Defaults stay conservative (no auto-eviction) so applications opt in.
+- **Membership-only stability function (paper §4.2.2).** The original protocol used wave-driven Ack collection where membership-only stability let progress continue with some replicas silent. Our session-based VoteOut/VoteIn doesn't need it for protocol decisions, but Phase 4's trim watermark will likely want a similar "stability w.r.t. currently-trusted replicas" mode. Plumb when Phase 4 surfaces the need.
 Paper §5.1 says "(Re)Start in particular—save information to recreate the proper connections among various protocols used in Consul following a crash." Because our composition layer (`stack/`, Phase 5) is *static Go code* — not a runtime-configured protocol graph like the x-kernel — there are no "connections" to persist. (Re)Start's persistence concern collapses to: open the same binary; the wiring is the same. We document this so a paper reader doesn't go looking for our equivalent.
 
 ---
@@ -361,7 +369,7 @@ Plus the additional scenario tests:
 | 0 — Foundation                             | done        |
 | 1 — Psync                                  | done        |
 | 2 — Order (PartialOrder, Total, SemOrder)  | done        |
-| 3 — FailureDetection + Membership          | not started |
+| 3 — FailureDetection + Membership          | done (v1)   |
 | 4 — Recovery + Trim (HWM)                  | not started |
 | 5 — Composition / public API               | not started |
 | 6 — Demo apps                              | not started |

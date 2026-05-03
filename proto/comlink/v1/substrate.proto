@@ -58,44 +58,39 @@ message Heartbeat {}
 // MembershipEvent carries one of the membership-protocol control
 // messages.
 //
-// SuspectDown / Recovering are informational: peers update their
-// SuspectDownList state and mask in/out, but do NOT respond.
+// SuspectDown is informational: receivers update their
+// SuspectDownList state but do NOT respond.
 //
 // VoteOut / VoteIn are the explicit mechanisms for permanent ML
 // mutation; peers respond with VoteOutAck/Nack or VoteInAck/Nack.
+//
+// Note on missing (p is up) / (Ack, p is up) per PLAN §2.13:
+// recovery is implicit in our split-suspicion-and-voting design.
+// A previously-silent replica that resumes sending is auto-cleared
+// from peers' SuspectDownList by the pump's clearSuspicion path
+// (Phase 3(d)). Heartbeats plus psync.Restart cover the
+// crashed-and-restarted catch-up case. Field numbers 2 and 9 are
+// reserved to leave room for re-adding (p is up) semantics if a
+// future use case demands explicit recovery announcement.
 message MembershipEvent {
+  reserved 2, 9;
   oneof event {
     SuspectDown suspect_down = 1;
-    Recovering recovering = 2;
     VoteOut vote_out = 3;
     VoteOutAck vote_out_ack = 4;
     VoteOutNack vote_out_nack = 5;
     VoteIn vote_in = 6;
     VoteInAck vote_in_ack = 7;
     VoteInNack vote_in_nack = 8;
-    RecoveryAck recovery_ack = 9;
   }
 }
 
 // SuspectDown is informational: the sender's FailureDetector has
-// flagged `suspect` as silent. Receivers update their
-// SuspectDownList and Maskout(suspect); recovery happens implicitly
-// when a subsequent message arrives from suspect (paper §4.2's
-// (p is down), reframed per PLAN §2.13).
+// flagged `suspect` as silent. Receivers update their local
+// SuspectDownList only; recovery happens implicitly when a
+// subsequent message arrives from suspect (PLAN §2.13).
 message SuspectDown {
   ReplicaID suspect = 1;
-}
-
-// Recovering announces that the sender (`who`) has restarted and
-// is rejoining the conversation. Paper §5.2's (p is up).
-message Recovering {
-  ReplicaID who = 1;
-}
-
-// RecoveryAck confirms `who`'s incorporation back into the
-// membership list. Paper §4.2.3.
-message RecoveryAck {
-  ReplicaID who = 1;
 }
 
 // VoteOut proposes the permanent removal of `target` from the
