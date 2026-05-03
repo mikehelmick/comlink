@@ -1,0 +1,68 @@
+// Copyright 2026 the comlink authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+// Package comlink.v1 defines the wire and on-disk format for the comlink
+// substrate. Identity types (ConversationID, ReplicaID, MessageID) are
+// fixed in Phase 0 and used unchanged across all later phases. The
+// Envelope is the framing for any message that flows on the network or
+// is stored in the message log; protocol-specific types (e.g. Psync
+// payloads in Phase 1) are serialized into Envelope.payload.
+package comlink.v1;
+
+option go_package = "github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1";
+
+// ConversationID uniquely identifies a Psync conversation. Generated when
+// the conversation is first opened and persisted to stable storage so it
+// survives restart. Encoded as 16 random bytes (UUID-like) but the format
+// is opaque to consumers.
+message ConversationID {
+  bytes value = 1;
+}
+
+// ReplicaID uniquely identifies a participant (process / replica) in a
+// conversation. Stable across restarts of the same logical replica.
+message ReplicaID {
+  bytes value = 1;
+}
+
+// MessageID is globally unique without coordination: the (replica_id,
+// sequence_number) pair is monotonic per replica per conversation, so
+// (conversation_id, replica_id, sequence_number) is unique across the
+// system.
+message MessageID {
+  ConversationID conversation_id = 1;
+  ReplicaID replica_id = 2;
+  uint64 sequence_number = 3;
+}
+
+// Envelope is the framing for any message that flows on the network or
+// is stored in the local MessageLog.
+//
+// In Phase 0 only the round-trip Hello uses this; predecessors is empty.
+// In Phase 1 (Psync), predecessors lists the message IDs that this
+// message causally follows (the parents of this node in the context
+// graph).
+message Envelope {
+  MessageID id = 1;
+  repeated MessageID predecessors = 2;
+  bytes payload = 3;
+}
+
+// Hello is the Phase 0 round-trip placeholder. Marshaled into
+// Envelope.payload for transport tests.
+message Hello {
+  string text = 1;
+}
