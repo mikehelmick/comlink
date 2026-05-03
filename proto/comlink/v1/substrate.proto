@@ -1,0 +1,103 @@
+// Copyright 2026 the comlink authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+// Substrate-level wire types: the per-message wrapper that Phase 3+
+// puts inside Envelope.payload to multiplex application data with
+// failure-detection and membership-protocol control events.
+//
+// Layering:
+//   PsyncMessage { Envelope | LostMessageRequest | Restart* }   <- transport wrapper
+//     Envelope.payload -> ConvFrame                             <- this file
+//                         ConvFrame.body { app | heartbeat | membership }
+//
+// Apps that use the membership.Manager API see only the unwrapped
+// app bytes; the Manager wraps/unwraps ConvFrame transparently.
+// FailureDetection / Membership emit their own ConvFrame variants
+// directly and rely on the Manager's frame routing on receive.
+package comlink.v1;
+
+import "comlink/v1/comlink.proto";
+
+option go_package = "github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1";
+
+// ConvFrame is the per-Envelope payload discriminator that
+// distinguishes application data from substrate control messages.
+message ConvFrame {
+  oneof body {
+    bytes app = 1;
+    Heartbeat heartbeat = 2;
+    MembershipEvent membership = 3;
+  }
+}
+
+// Heartbeat is a content-free dummy message emitted by
+// FailureDetection when the conversation has been quiet for the
+// failure-detection interval. Per paper §4 it serves a dual
+// purpose: liveness signal AND ack acceleration (its vector clock
+// advances stability detection for messages it depends on).
+message Heartbeat {}
+
+// MembershipEvent carries one of the five membership-protocol
+// control messages from paper §4.2:
+//   suspect_down  = (p is down) — FailureDetection suspects p
+//   suspect_ack   = (Ack, p is down) — confirms p has stopped
+//   suspect_nack  = (Nack, p is down) — refutes the suspicion
+//   recovering    = (p is up) — p has restarted and is rejoining
+//   recovery_ack  = (Ack, p is up) — confirms incorporation
+message MembershipEvent {
+  oneof event {
+    SuspectDown suspect_down = 1;
+    SuspectAck suspect_ack = 2;
+    SuspectNack suspect_nack = 3;
+    Recovering recovering = 4;
+    RecoveryAck recovery_ack = 5;
+  }
+}
+
+// SuspectDown announces the sender suspects `suspect` has failed.
+// Paper §4.2: emitted by FailureDetection when no message has been
+// received from the suspect within the suspicion interval.
+message SuspectDown {
+  ReplicaID suspect = 1;
+}
+
+// SuspectAck confirms the sender has not received any message from
+// `suspect` at the same logical time as the (p is down) message
+// for `suspect`. Paper §4.2.3.
+message SuspectAck {
+  ReplicaID suspect = 1;
+}
+
+// SuspectNack refutes the suspicion: the sender HAS received a
+// message from `suspect` at the same logical time as the
+// (p is down) message — evidence the suspect is still alive.
+// Paper §4.2.3.
+message SuspectNack {
+  ReplicaID suspect = 1;
+}
+
+// Recovering announces that the sender (`who`) has restarted and is
+// rejoining the conversation. Paper §5.2.
+message Recovering {
+  ReplicaID who = 1;
+}
+
+// RecoveryAck confirms incorporation of `who` back into the
+// membership list. Paper §4.2.3, §5.2: every alive process sends
+// (Ack, p is up) before incorporating the recovering process.
+message RecoveryAck {
+  ReplicaID who = 1;
+}
