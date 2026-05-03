@@ -34,6 +34,7 @@
 package membership
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -91,11 +92,15 @@ type Manager struct {
 	logger *slog.Logger
 	appCh  chan AppMessage
 
-	// Mutable membership-protocol state will land in 3(d). For
-	// now Manager just holds the original Members; ML-mutation
-	// methods (Remove / Incorporate) are placeholders.
+	// membershipList is the active ML view. Phase 3(d) does not
+	// mutate it; Phase 3(e)'s VoteOut/VoteIn protocols will.
 	mu             sync.Mutex
 	membershipList []*pb.ReplicaID
+	// suspectDownList tracks replicas this Manager currently
+	// considers suspected (PLAN §2.13). Membership in the set
+	// implies a corresponding Maskout is in place on the
+	// underlying conversation.
+	suspectDownList map[string]struct{}
 
 	closeOnce sync.Once
 	stopped   chan struct{}
@@ -126,12 +131,13 @@ func New(cfg Config) (*Manager, error) {
 	}
 
 	m := &Manager{
-		cfg:      cfg,
-		conv:     cfg.Conversation,
-		logger:   logger,
-		appCh:    make(chan AppMessage, bufSize),
-		stopped:  make(chan struct{}),
-		pumpDone: make(chan struct{}),
+		cfg:             cfg,
+		conv:            cfg.Conversation,
+		logger:          logger,
+		appCh:           make(chan AppMessage, bufSize),
+		stopped:         make(chan struct{}),
+		pumpDone:        make(chan struct{}),
+		suspectDownList: make(map[string]struct{}),
 	}
 	m.membershipList = make([]*pb.ReplicaID, len(cfg.Members))
 	for i, r := range cfg.Members {
@@ -184,6 +190,27 @@ func (m *Manager) Members() []*pb.ReplicaID {
 	return out
 }
 
+// IsSuspected reports whether replica is currently in this
+// Manager's local SuspectDownList (PLAN §2.13).
+func (m *Manager) IsSuspected(replica *pb.ReplicaID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.suspectDownList[string(replica.GetValue())]
+	return ok
+}
+
+// SuspectedReplicas returns clones of every currently-suspected
+// replica in arbitrary order. Useful for tests and observability.
+func (m *Manager) SuspectedReplicas() []*pb.ReplicaID {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*pb.ReplicaID, 0, len(m.suspectDownList))
+	for k := range m.suspectDownList {
+		out = append(out, &pb.ReplicaID{Value: []byte(k)})
+	}
+	return out
+}
+
 // Close stops the Manager. The underlying Conversation is NOT
 // closed; the caller owns it. Close is independent of Conversation
 // lifecycle — Manager.Close exits cleanly whether or not the
@@ -213,8 +240,13 @@ func (m *Manager) pump() {
 				return
 			}
 			sender := d.Envelope.GetId().GetSender()
-			// Treat any incoming envelope as proof-of-life from sender.
+			// Treat any incoming envelope as proof-of-life from
+			// sender. This includes implicit recovery from soft
+			// suspicion (PLAN §2.13): if we'd previously masked
+			// sender out, the act of receiving from them clears
+			// the suspicion and unmasks them.
 			m.fd.NoteReceived(sender)
+			m.clearSuspicion(sender)
 
 			dec, err := frame.Unmarshal(d.Envelope.GetPayload())
 			if err != nil {
@@ -282,13 +314,16 @@ func (m *Manager) sendHeartbeat() {
 }
 
 // onSuspect is called by the FailureDetector once per "alive ->
-// suspected" transition. Phase 3(c) just emits a SuspectDown
-// message into the conversation; Phase 3(d) will run the full
-// sf-group + ack/nack flow off this signal.
+// suspected" transition. PLAN §2.13: SuspectDown is informational;
+// we mark replica as suspected locally (Maskout via psync) and
+// broadcast SuspectDown(replica) so peers can do the same. No
+// Ack/Nack response is expected. Recovery happens implicitly when
+// a subsequent message arrives from the suspect (clearSuspicion).
 func (m *Manager) onSuspect(replica *pb.ReplicaID) {
 	if m.isClosed() {
 		return
 	}
+	m.markSuspected(replica)
 	bs, err := frame.MarshalSuspectDown(replica)
 	if err != nil {
 		m.logger.Warn("membership: marshal SuspectDown", "err", err)
@@ -301,6 +336,31 @@ func (m *Manager) onSuspect(replica *pb.ReplicaID) {
 	m.fd.NoteSent()
 }
 
+// markSuspected adds replica to the local SuspectDownList. PLAN
+// §2.13: soft suspicion is informational and does NOT call
+// psync.Maskout — masking would prevent the very recovery message
+// that should clear the suspicion from reaching us. Maskout is
+// reserved for the hard-removal path (VoteOut, Phase 3(e)).
+//
+// Idempotent.
+func (m *Manager) markSuspected(replica *pb.ReplicaID) {
+	if bytes.Equal(replica.GetValue(), m.cfg.Self.GetValue()) {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.suspectDownList[string(replica.GetValue())] = struct{}{}
+}
+
+// clearSuspicion removes replica from the local SuspectDownList
+// (if present). Called when a message arrives from replica —
+// implicit recovery from soft suspicion (PLAN §2.13).
+func (m *Manager) clearSuspicion(replica *pb.ReplicaID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.suspectDownList, string(replica.GetValue()))
+}
+
 func (m *Manager) isClosed() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -310,11 +370,32 @@ func (m *Manager) isClosed() bool {
 // ─── membership-event handlers (stubs for Phase 3(d+)) ────────────
 
 // handleSuspectDown is the receiver-side of the informational
-// SuspectDown notification. PLAN §2.13: peers add `suspect` to
-// SuspectDownList and Maskout(suspect); recovery happens implicitly
-// when subsequent traffic arrives from suspect. Phase 3(d) wires
-// this in.
-func (m *Manager) handleSuspectDown(_ *pb.SuspectDown, _ *pb.ReplicaID) {}
+// SuspectDown notification. PLAN §2.13: add `suspect` to local
+// SuspectDownList and Maskout(suspect). Recovery happens implicitly
+// when subsequent traffic arrives from suspect (handled by the
+// pump's clearSuspicion call).
+//
+// Self-suspicion (someone announcing they suspect themselves) and
+// suspicion-of-the-sender (the SuspectDown's sender naming itself
+// as the suspect) are both pathological cases that we ignore.
+func (m *Manager) handleSuspectDown(susp *pb.SuspectDown, sender *pb.ReplicaID) {
+	target := susp.GetSuspect()
+	if target == nil {
+		return
+	}
+	if bytes.Equal(target.GetValue(), m.cfg.Self.GetValue()) {
+		// Someone suspects us. We obviously aren't down; the next
+		// message we send will clear their suspicion via the
+		// pump's clearSuspicion path on their side. We don't need
+		// to act locally.
+		return
+	}
+	if bytes.Equal(target.GetValue(), sender.GetValue()) {
+		// Sender is suspecting itself — pathological; ignore.
+		return
+	}
+	m.markSuspected(target)
+}
 
 func (m *Manager) handleRecovering(_ *pb.Recovering, _ *pb.ReplicaID)   {}
 func (m *Manager) handleRecoveryAck(_ *pb.RecoveryAck, _ *pb.ReplicaID) {}
