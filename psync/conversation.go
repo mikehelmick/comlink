@@ -149,10 +149,12 @@ type maskRequest struct {
 	replica *pb.ReplicaID
 	ctx     context.Context
 }
+type replayLogRequest struct{}
 
-func (sendRequest) isRequest()     {}
-func (incomingRequest) isRequest() {}
-func (maskRequest) isRequest()     {}
+func (sendRequest) isRequest()      {}
+func (incomingRequest) isRequest()  {}
+func (maskRequest) isRequest()      {}
+func (replayLogRequest) isRequest() {}
 
 type response interface{ isResponse() }
 
@@ -161,11 +163,16 @@ type sendResponse struct {
 	err error
 }
 type maskResponse struct{ err error }
+type replayLogResponse struct {
+	inserted int
+	err      error
+}
 type emptyResponse struct{}
 
-func (sendResponse) isResponse()  {}
-func (maskResponse) isResponse()  {}
-func (emptyResponse) isResponse() {}
+func (sendResponse) isResponse()      {}
+func (maskResponse) isResponse()      {}
+func (replayLogResponse) isResponse() {}
+func (emptyResponse) isResponse()     {}
 
 // serverImpl is the immutable handler that implements
 // genserver.Server. It owns no mutable state — everything runtime
@@ -214,6 +221,9 @@ func (s *serverImpl) HandleCall(req request, st *state) (response, *state) {
 			err = s.mask.Maskout(r.ctx, r.replica)
 		}
 		return maskResponse{err: err}, st
+	case replayLogRequest:
+		n, err := s.handleReplay(st)
+		return replayLogResponse{inserted: n, err: err}, st
 	default:
 		return emptyResponse{}, st
 	}
@@ -575,6 +585,62 @@ func (s *serverImpl) processNewlyAvailable(st *state, senderBytes []byte, seq ui
 			s.handleEnvelope(st, pe.env, pe.from)
 		}
 	}
+}
+
+// handleReplay iterates the local log and inserts each entry into
+// the in-memory graph. Used by Restart() to reconstruct state after
+// a process crash.
+//
+// Entries that are already present (e.g. previous partial replay,
+// or the same entry seen via the network meanwhile) are skipped.
+// Entries whose causal predecessors are missing — possible if the
+// log has been trimmed below their wave — are also skipped; the
+// post-replay leaf-set + lost-message exchange recovers them via
+// peers per PLAN §1 pruned-region invariant.
+//
+// Replayed entries are NOT pushed to the application's Recv
+// channel: re-delivery is the application's concern (Phase 4 will
+// add a checkpoint mechanism so the application can know what was
+// already applied pre-crash).
+//
+// Returns the number of entries successfully inserted.
+func (s *serverImpl) handleReplay(st *state) (int, error) {
+	ctx := context.Background()
+	inserted := 0
+	for entry, err := range s.log.Range(ctx, s.log.FirstOffset(), clog.EndOfLog) {
+		if err != nil {
+			return inserted, err
+		}
+		env := entry.Envelope
+		if env.GetId().GetSender() == nil {
+			continue
+		}
+		// Dedup against existing graph contents.
+		senderSeq, err := s.membership.SenderSeq(env.GetId())
+		if err != nil {
+			s.logger.Warn("psync: replay: malformed log entry", "err", err)
+			continue
+		}
+		if st.graph.Has(env.GetId().GetSender().GetValue(), senderSeq) {
+			continue
+		}
+		_, _, err = st.graph.Insert(env)
+		switch {
+		case err == nil:
+			inserted++
+		case errors.Is(err, ErrMissingParents):
+			// Pruned predecessor; will be recovered by leaf
+			// exchange + lost-message protocol after replay.
+			s.logger.Debug("psync: replay: missing parent (will recover via peers)",
+				"sender", fmt.Sprintf("%x", env.GetId().GetSender().GetValue()),
+				"seq", senderSeq)
+		case errors.Is(err, ErrAlreadyPresent):
+			// Already-handled.
+		default:
+			s.logger.Warn("psync: replay: insert error", "err", err)
+		}
+	}
+	return inserted, nil
 }
 
 // currentView returns the conversation-wide vector clock from this

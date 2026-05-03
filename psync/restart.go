@@ -34,22 +34,28 @@ const DefaultRestartRetryInterval = 250 * time.Millisecond
 var ErrRestartTimedOut = errors.New("psync: restart timed out without any peer ack")
 
 // Restart announces this replica is rebuilding state after a crash
-// (paper §2.3). It broadcasts a RestartMessage to every other
-// active member, retries at intervals until at least one peer
-// responds with a RestartAck, then triggers lost-message fetches
-// for every leaf in the received ack(s) — the existing lost-
-// message protocol does the rest, transitively pulling in
-// ancestors as needed.
+// (paper §2.3). It performs a three-step recovery:
+//
+//  1. Replay the local MessageLog into the in-memory context graph.
+//     This recovers everything that was durable at crash time.
+//  2. Broadcast a RestartMessage to every other active member,
+//     retrying at intervals until at least one peer responds with
+//     a RestartAck.
+//  3. Issue a LostMessageRequest for each leaf in the received
+//     ack(s) — the existing lost-message protocol transitively
+//     pulls in ancestors that aren't already in the graph (the
+//     "pruned region" recovery from PLAN §1 exit criteria).
 //
 // Returns once the first RestartAck has been processed. If no peer
 // has acknowledged by the time ctx is done, returns
 // ErrRestartTimedOut. Background ack collection continues until
 // the Conversation is closed.
-//
-// Phase 1: assumes the local context graph is empty at call time
-// (a typical post-restart scenario). Phase 1(h) layers automatic
-// log-replay-on-construction on top.
 func (c *Conversation) Restart(ctx context.Context) error {
+	// 1. Replay local log into the graph.
+	resp := c.srv.Call(replayLogRequest{})
+	if rr := resp.(replayLogResponse); rr.err != nil {
+		return fmt.Errorf("psync: Restart: log replay: %w", rr.err)
+	}
 	// Subscribe to RestartAcks for the duration of this Restart.
 	ackCh := make(chan *pb.RestartAck, 16)
 	c.restartMu.Lock()
