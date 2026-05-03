@@ -52,6 +52,14 @@ func MarshalHeartbeat() ([]byte, error) {
 	return proto.Marshal(&pb.ConvFrame{Body: &pb.ConvFrame_Heartbeat{Heartbeat: &pb.Heartbeat{}}})
 }
 
+// MarshalWatermark wraps a Watermark advertising offset in a
+// ConvFrame.
+func MarshalWatermark(offset uint64) ([]byte, error) {
+	return proto.Marshal(&pb.ConvFrame{
+		Body: &pb.ConvFrame_Watermark{Watermark: &pb.Watermark{Offset: offset}},
+	})
+}
+
 // MarshalSuspectDown wraps a SuspectDown event for `suspect`. This
 // is informational — no Ack/Nack response is expected.
 func MarshalSuspectDown(suspect *pb.ReplicaID) ([]byte, error) {
@@ -128,6 +136,7 @@ func marshalMembership(ev *pb.MembershipEvent) ([]byte, error) {
 type Decoded struct {
 	App         []byte // populated for ConvFrame.app
 	Heartbeat   bool   // true for ConvFrame.heartbeat
+	Watermark   *pb.Watermark
 	SuspectDown *pb.SuspectDown
 	VoteOut     *pb.VoteOut
 	VoteOutAck  *pb.VoteOutAck
@@ -145,7 +154,9 @@ func (d Decoded) HasMembership() bool {
 }
 
 // IsApp reports whether the decoded frame carries application data.
-func (d Decoded) IsApp() bool { return d.App != nil || (!d.Heartbeat && !d.HasMembership()) }
+func (d Decoded) IsApp() bool {
+	return d.App != nil || (!d.Heartbeat && d.Watermark == nil && !d.HasMembership())
+}
 
 // Unmarshal decodes a ConvFrame from data. The returned Decoded
 // has exactly one variant populated.
@@ -166,6 +177,8 @@ func Unmarshal(data []byte) (Decoded, error) {
 		return Decoded{App: app}, nil
 	case *pb.ConvFrame_Heartbeat:
 		return Decoded{Heartbeat: true}, nil
+	case *pb.ConvFrame_Watermark:
+		return Decoded{Watermark: body.Watermark}, nil
 	case *pb.ConvFrame_Membership:
 		return decodeMembership(body.Membership), nil
 	default:

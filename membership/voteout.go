@@ -246,6 +246,12 @@ func (m *Manager) checkVoteOutDecision(session *voteOutSession) {
 	m.fd.RemoveMember(session.target)
 	// Clear any soft-suspicion entry for target.
 	m.clearSuspicion(session.target)
+	// Drop target's watermark from the trim tracker so the
+	// safe-trim frontier no longer waits on them.
+	if m.trim != nil {
+		m.trim.Forget(session.target)
+		m.maybeTrim()
+	}
 
 	session.done.Do(func() {
 		session.err = nil

@@ -65,6 +65,23 @@ func TestRoundtripHeartbeat(t *testing.T) {
 	}
 }
 
+func TestRoundtripWatermark(t *testing.T) {
+	bs, err := frame.MarshalWatermark(42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := frame.Unmarshal(bs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Watermark == nil {
+		t.Fatal("Watermark not set")
+	}
+	if got.Watermark.GetOffset() != 42 {
+		t.Fatalf("Watermark.Offset = %d, want 42", got.Watermark.GetOffset())
+	}
+}
+
 func TestRoundtripMembershipEvents(t *testing.T) {
 	cases := []struct {
 		name    string

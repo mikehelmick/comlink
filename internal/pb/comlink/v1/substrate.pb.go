@@ -63,6 +63,7 @@ type ConvFrame struct {
 	//	*ConvFrame_App
 	//	*ConvFrame_Heartbeat
 	//	*ConvFrame_Membership
+	//	*ConvFrame_Watermark
 	Body          isConvFrame_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -132,6 +133,15 @@ func (x *ConvFrame) GetMembership() *MembershipEvent {
 	return nil
 }
 
+func (x *ConvFrame) GetWatermark() *Watermark {
+	if x != nil {
+		if x, ok := x.Body.(*ConvFrame_Watermark); ok {
+			return x.Watermark
+		}
+	}
+	return nil
+}
+
 type isConvFrame_Body interface {
 	isConvFrame_Body()
 }
@@ -148,11 +158,70 @@ type ConvFrame_Membership struct {
 	Membership *MembershipEvent `protobuf:"bytes,3,opt,name=membership,proto3,oneof"`
 }
 
+type ConvFrame_Watermark struct {
+	Watermark *Watermark `protobuf:"bytes,4,opt,name=watermark,proto3,oneof"`
+}
+
 func (*ConvFrame_App) isConvFrame_Body() {}
 
 func (*ConvFrame_Heartbeat) isConvFrame_Body() {}
 
 func (*ConvFrame_Membership) isConvFrame_Body() {}
+
+func (*ConvFrame_Watermark) isConvFrame_Body() {}
+
+// Watermark advertises the lowest log offset the sender still
+// needs for its own recovery (PLAN §2.8). Each replica
+// periodically multicasts its watermark; receivers track the
+// most recent watermark from every member and compute
+// min(watermarks) over the active membership list to find the
+// safe trim frontier.
+//
+// The sender ReplicaID is implicit from envelope.id.sender, so
+// it does not appear here.
+type Watermark struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Offset        uint64                 `protobuf:"varint,1,opt,name=offset,proto3" json:"offset,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Watermark) Reset() {
+	*x = Watermark{}
+	mi := &file_comlink_v1_substrate_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Watermark) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Watermark) ProtoMessage() {}
+
+func (x *Watermark) ProtoReflect() protoreflect.Message {
+	mi := &file_comlink_v1_substrate_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Watermark.ProtoReflect.Descriptor instead.
+func (*Watermark) Descriptor() ([]byte, []int) {
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *Watermark) GetOffset() uint64 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
 
 // Heartbeat is a content-free dummy message emitted by
 // FailureDetection when the conversation has been quiet for the
@@ -167,7 +236,7 @@ type Heartbeat struct {
 
 func (x *Heartbeat) Reset() {
 	*x = Heartbeat{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[1]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -179,7 +248,7 @@ func (x *Heartbeat) String() string {
 func (*Heartbeat) ProtoMessage() {}
 
 func (x *Heartbeat) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[1]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -192,7 +261,7 @@ func (x *Heartbeat) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Heartbeat.ProtoReflect.Descriptor instead.
 func (*Heartbeat) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{1}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{2}
 }
 
 // MembershipEvent carries one of the membership-protocol control
@@ -230,7 +299,7 @@ type MembershipEvent struct {
 
 func (x *MembershipEvent) Reset() {
 	*x = MembershipEvent{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[2]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -242,7 +311,7 @@ func (x *MembershipEvent) String() string {
 func (*MembershipEvent) ProtoMessage() {}
 
 func (x *MembershipEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[2]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -255,7 +324,7 @@ func (x *MembershipEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MembershipEvent.ProtoReflect.Descriptor instead.
 func (*MembershipEvent) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{2}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *MembershipEvent) GetEvent() isMembershipEvent_Event {
@@ -387,7 +456,7 @@ type SuspectDown struct {
 
 func (x *SuspectDown) Reset() {
 	*x = SuspectDown{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[3]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -399,7 +468,7 @@ func (x *SuspectDown) String() string {
 func (*SuspectDown) ProtoMessage() {}
 
 func (x *SuspectDown) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[3]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -412,7 +481,7 @@ func (x *SuspectDown) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SuspectDown.ProtoReflect.Descriptor instead.
 func (*SuspectDown) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{3}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *SuspectDown) GetSuspect() *ReplicaID {
@@ -433,7 +502,7 @@ type VoteOut struct {
 
 func (x *VoteOut) Reset() {
 	*x = VoteOut{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[4]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -445,7 +514,7 @@ func (x *VoteOut) String() string {
 func (*VoteOut) ProtoMessage() {}
 
 func (x *VoteOut) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[4]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -458,7 +527,7 @@ func (x *VoteOut) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteOut.ProtoReflect.Descriptor instead.
 func (*VoteOut) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{4}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *VoteOut) GetTarget() *ReplicaID {
@@ -480,7 +549,7 @@ type VoteOutAck struct {
 
 func (x *VoteOutAck) Reset() {
 	*x = VoteOutAck{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[5]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -492,7 +561,7 @@ func (x *VoteOutAck) String() string {
 func (*VoteOutAck) ProtoMessage() {}
 
 func (x *VoteOutAck) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[5]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -505,7 +574,7 @@ func (x *VoteOutAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteOutAck.ProtoReflect.Descriptor instead.
 func (*VoteOutAck) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{5}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *VoteOutAck) GetTarget() *ReplicaID {
@@ -526,7 +595,7 @@ type VoteOutNack struct {
 
 func (x *VoteOutNack) Reset() {
 	*x = VoteOutNack{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[6]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -538,7 +607,7 @@ func (x *VoteOutNack) String() string {
 func (*VoteOutNack) ProtoMessage() {}
 
 func (x *VoteOutNack) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[6]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -551,7 +620,7 @@ func (x *VoteOutNack) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteOutNack.ProtoReflect.Descriptor instead.
 func (*VoteOutNack) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{6}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *VoteOutNack) GetTarget() *ReplicaID {
@@ -575,7 +644,7 @@ type VoteIn struct {
 
 func (x *VoteIn) Reset() {
 	*x = VoteIn{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[7]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -587,7 +656,7 @@ func (x *VoteIn) String() string {
 func (*VoteIn) ProtoMessage() {}
 
 func (x *VoteIn) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[7]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -600,7 +669,7 @@ func (x *VoteIn) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteIn.ProtoReflect.Descriptor instead.
 func (*VoteIn) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{7}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *VoteIn) GetTarget() *ReplicaID {
@@ -627,7 +696,7 @@ type VoteInAck struct {
 
 func (x *VoteInAck) Reset() {
 	*x = VoteInAck{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[8]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -639,7 +708,7 @@ func (x *VoteInAck) String() string {
 func (*VoteInAck) ProtoMessage() {}
 
 func (x *VoteInAck) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[8]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -652,7 +721,7 @@ func (x *VoteInAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteInAck.ProtoReflect.Descriptor instead.
 func (*VoteInAck) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{8}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *VoteInAck) GetTarget() *ReplicaID {
@@ -673,7 +742,7 @@ type VoteInNack struct {
 
 func (x *VoteInNack) Reset() {
 	*x = VoteInNack{}
-	mi := &file_comlink_v1_substrate_proto_msgTypes[9]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -685,7 +754,7 @@ func (x *VoteInNack) String() string {
 func (*VoteInNack) ProtoMessage() {}
 
 func (x *VoteInNack) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_substrate_proto_msgTypes[9]
+	mi := &file_comlink_v1_substrate_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -698,7 +767,7 @@ func (x *VoteInNack) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteInNack.ProtoReflect.Descriptor instead.
 func (*VoteInNack) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{9}
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *VoteInNack) GetTarget() *ReplicaID {
@@ -713,14 +782,17 @@ var File_comlink_v1_substrate_proto protoreflect.FileDescriptor
 const file_comlink_v1_substrate_proto_rawDesc = "" +
 	"\n" +
 	"\x1acomlink/v1/substrate.proto\x12\n" +
-	"comlink.v1\x1a\x18comlink/v1/comlink.proto\"\x9d\x01\n" +
+	"comlink.v1\x1a\x18comlink/v1/comlink.proto\"\xd4\x01\n" +
 	"\tConvFrame\x12\x12\n" +
 	"\x03app\x18\x01 \x01(\fH\x00R\x03app\x125\n" +
 	"\theartbeat\x18\x02 \x01(\v2\x15.comlink.v1.HeartbeatH\x00R\theartbeat\x12=\n" +
 	"\n" +
 	"membership\x18\x03 \x01(\v2\x1b.comlink.v1.MembershipEventH\x00R\n" +
-	"membershipB\x06\n" +
-	"\x04body\"\v\n" +
+	"membership\x125\n" +
+	"\twatermark\x18\x04 \x01(\v2\x15.comlink.v1.WatermarkH\x00R\twatermarkB\x06\n" +
+	"\x04body\"#\n" +
+	"\tWatermark\x12\x16\n" +
+	"\x06offset\x18\x01 \x01(\x04R\x06offset\"\v\n" +
 	"\tHeartbeat\"\xb5\x03\n" +
 	"\x0fMembershipEvent\x12<\n" +
 	"\fsuspect_down\x18\x01 \x01(\v2\x17.comlink.v1.SuspectDownH\x00R\vsuspectDown\x120\n" +
@@ -764,42 +836,44 @@ func file_comlink_v1_substrate_proto_rawDescGZIP() []byte {
 	return file_comlink_v1_substrate_proto_rawDescData
 }
 
-var file_comlink_v1_substrate_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_comlink_v1_substrate_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_comlink_v1_substrate_proto_goTypes = []any{
 	(*ConvFrame)(nil),       // 0: comlink.v1.ConvFrame
-	(*Heartbeat)(nil),       // 1: comlink.v1.Heartbeat
-	(*MembershipEvent)(nil), // 2: comlink.v1.MembershipEvent
-	(*SuspectDown)(nil),     // 3: comlink.v1.SuspectDown
-	(*VoteOut)(nil),         // 4: comlink.v1.VoteOut
-	(*VoteOutAck)(nil),      // 5: comlink.v1.VoteOutAck
-	(*VoteOutNack)(nil),     // 6: comlink.v1.VoteOutNack
-	(*VoteIn)(nil),          // 7: comlink.v1.VoteIn
-	(*VoteInAck)(nil),       // 8: comlink.v1.VoteInAck
-	(*VoteInNack)(nil),      // 9: comlink.v1.VoteInNack
-	(*ReplicaID)(nil),       // 10: comlink.v1.ReplicaID
+	(*Watermark)(nil),       // 1: comlink.v1.Watermark
+	(*Heartbeat)(nil),       // 2: comlink.v1.Heartbeat
+	(*MembershipEvent)(nil), // 3: comlink.v1.MembershipEvent
+	(*SuspectDown)(nil),     // 4: comlink.v1.SuspectDown
+	(*VoteOut)(nil),         // 5: comlink.v1.VoteOut
+	(*VoteOutAck)(nil),      // 6: comlink.v1.VoteOutAck
+	(*VoteOutNack)(nil),     // 7: comlink.v1.VoteOutNack
+	(*VoteIn)(nil),          // 8: comlink.v1.VoteIn
+	(*VoteInAck)(nil),       // 9: comlink.v1.VoteInAck
+	(*VoteInNack)(nil),      // 10: comlink.v1.VoteInNack
+	(*ReplicaID)(nil),       // 11: comlink.v1.ReplicaID
 }
 var file_comlink_v1_substrate_proto_depIdxs = []int32{
-	1,  // 0: comlink.v1.ConvFrame.heartbeat:type_name -> comlink.v1.Heartbeat
-	2,  // 1: comlink.v1.ConvFrame.membership:type_name -> comlink.v1.MembershipEvent
-	3,  // 2: comlink.v1.MembershipEvent.suspect_down:type_name -> comlink.v1.SuspectDown
-	4,  // 3: comlink.v1.MembershipEvent.vote_out:type_name -> comlink.v1.VoteOut
-	5,  // 4: comlink.v1.MembershipEvent.vote_out_ack:type_name -> comlink.v1.VoteOutAck
-	6,  // 5: comlink.v1.MembershipEvent.vote_out_nack:type_name -> comlink.v1.VoteOutNack
-	7,  // 6: comlink.v1.MembershipEvent.vote_in:type_name -> comlink.v1.VoteIn
-	8,  // 7: comlink.v1.MembershipEvent.vote_in_ack:type_name -> comlink.v1.VoteInAck
-	9,  // 8: comlink.v1.MembershipEvent.vote_in_nack:type_name -> comlink.v1.VoteInNack
-	10, // 9: comlink.v1.SuspectDown.suspect:type_name -> comlink.v1.ReplicaID
-	10, // 10: comlink.v1.VoteOut.target:type_name -> comlink.v1.ReplicaID
-	10, // 11: comlink.v1.VoteOutAck.target:type_name -> comlink.v1.ReplicaID
-	10, // 12: comlink.v1.VoteOutNack.target:type_name -> comlink.v1.ReplicaID
-	10, // 13: comlink.v1.VoteIn.target:type_name -> comlink.v1.ReplicaID
-	10, // 14: comlink.v1.VoteInAck.target:type_name -> comlink.v1.ReplicaID
-	10, // 15: comlink.v1.VoteInNack.target:type_name -> comlink.v1.ReplicaID
-	16, // [16:16] is the sub-list for method output_type
-	16, // [16:16] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	2,  // 0: comlink.v1.ConvFrame.heartbeat:type_name -> comlink.v1.Heartbeat
+	3,  // 1: comlink.v1.ConvFrame.membership:type_name -> comlink.v1.MembershipEvent
+	1,  // 2: comlink.v1.ConvFrame.watermark:type_name -> comlink.v1.Watermark
+	4,  // 3: comlink.v1.MembershipEvent.suspect_down:type_name -> comlink.v1.SuspectDown
+	5,  // 4: comlink.v1.MembershipEvent.vote_out:type_name -> comlink.v1.VoteOut
+	6,  // 5: comlink.v1.MembershipEvent.vote_out_ack:type_name -> comlink.v1.VoteOutAck
+	7,  // 6: comlink.v1.MembershipEvent.vote_out_nack:type_name -> comlink.v1.VoteOutNack
+	8,  // 7: comlink.v1.MembershipEvent.vote_in:type_name -> comlink.v1.VoteIn
+	9,  // 8: comlink.v1.MembershipEvent.vote_in_ack:type_name -> comlink.v1.VoteInAck
+	10, // 9: comlink.v1.MembershipEvent.vote_in_nack:type_name -> comlink.v1.VoteInNack
+	11, // 10: comlink.v1.SuspectDown.suspect:type_name -> comlink.v1.ReplicaID
+	11, // 11: comlink.v1.VoteOut.target:type_name -> comlink.v1.ReplicaID
+	11, // 12: comlink.v1.VoteOutAck.target:type_name -> comlink.v1.ReplicaID
+	11, // 13: comlink.v1.VoteOutNack.target:type_name -> comlink.v1.ReplicaID
+	11, // 14: comlink.v1.VoteIn.target:type_name -> comlink.v1.ReplicaID
+	11, // 15: comlink.v1.VoteInAck.target:type_name -> comlink.v1.ReplicaID
+	11, // 16: comlink.v1.VoteInNack.target:type_name -> comlink.v1.ReplicaID
+	17, // [17:17] is the sub-list for method output_type
+	17, // [17:17] is the sub-list for method input_type
+	17, // [17:17] is the sub-list for extension type_name
+	17, // [17:17] is the sub-list for extension extendee
+	0,  // [0:17] is the sub-list for field type_name
 }
 
 func init() { file_comlink_v1_substrate_proto_init() }
@@ -812,8 +886,9 @@ func file_comlink_v1_substrate_proto_init() {
 		(*ConvFrame_App)(nil),
 		(*ConvFrame_Heartbeat)(nil),
 		(*ConvFrame_Membership)(nil),
+		(*ConvFrame_Watermark)(nil),
 	}
-	file_comlink_v1_substrate_proto_msgTypes[2].OneofWrappers = []any{
+	file_comlink_v1_substrate_proto_msgTypes[3].OneofWrappers = []any{
 		(*MembershipEvent_SuspectDown)(nil),
 		(*MembershipEvent_VoteOut)(nil),
 		(*MembershipEvent_VoteOutAck)(nil),
@@ -828,7 +903,7 @@ func file_comlink_v1_substrate_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_comlink_v1_substrate_proto_rawDesc), len(file_comlink_v1_substrate_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

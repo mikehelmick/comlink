@@ -35,6 +35,7 @@ package membership
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -45,7 +46,9 @@ import (
 	"github.com/mikehelmick/comlink/failure"
 	"github.com/mikehelmick/comlink/frame"
 	pb "github.com/mikehelmick/comlink/internal/pb/comlink/v1"
+	clog "github.com/mikehelmick/comlink/log"
 	"github.com/mikehelmick/comlink/psync"
+	"github.com/mikehelmick/comlink/trim"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -89,6 +92,13 @@ type Config struct {
 	// accepted decisions when those reach them via the
 	// conversation.
 	InitialGroupSize int
+
+	// Log is the underlying psync.MessageLog. Required for the
+	// trim protocol (PLAN §2.8): Manager.SetWatermark broadcasts
+	// the local watermark and, when the safe-trim frontier
+	// advances, calls Log.Truncate. Should be the SAME instance
+	// passed into the underlying psync.Conversation.
+	Log clog.MessageLog
 }
 
 // AppMessage is the unit handed to applications via Manager.Recv.
@@ -120,6 +130,9 @@ type Manager struct {
 	// per kind at a time.
 	voteOutSessions map[string]*voteOutSession
 	voteInSessions  map[string]*voteInSession
+	// trim tracks per-replica watermarks for the trim protocol
+	// (PLAN §2.8 / Phase 4).
+	trim *trim.Tracker
 
 	closeOnce sync.Once
 	stopped   chan struct{}
@@ -162,6 +175,7 @@ func New(cfg Config) (*Manager, error) {
 		suspectDownList: make(map[string]struct{}),
 		voteOutSessions: make(map[string]*voteOutSession),
 		voteInSessions:  make(map[string]*voteInSession),
+		trim:            trim.New(),
 	}
 	m.membershipList = make([]*pb.ReplicaID, len(cfg.Members))
 	for i, r := range cfg.Members {
@@ -245,6 +259,68 @@ func (m *Manager) InMajorityPartition() bool {
 	return len(m.membershipList)*2 > m.cfg.InitialGroupSize
 }
 
+// SetWatermark is the application's checkpoint API (PLAN §2.8 /
+// Phase 4): the application calls this when it has snapshotted
+// its state and no longer needs log entries below `offset` for
+// its own recovery.
+//
+// Effect:
+//   - Updates the local watermark in the trim tracker.
+//   - Broadcasts a Watermark(offset) frame so peers can update
+//     their view of our watermark.
+//   - Recomputes the safe-trim frontier; if it advanced, truncates
+//     the local log.
+func (m *Manager) SetWatermark(offset uint64) {
+	if m.cfg.Log == nil {
+		return
+	}
+	advanced := m.trim.Update(m.cfg.Self, clog.Offset(offset))
+	if !advanced {
+		return
+	}
+	bs, err := frame.MarshalWatermark(offset)
+	if err != nil {
+		m.logger.Warn("membership: marshal Watermark", "err", err)
+		return
+	}
+	go m.asyncSend(bs, "Watermark")
+	m.maybeTrim()
+}
+
+// handleWatermark records a peer's watermark advertisement and
+// re-evaluates the safe-trim frontier.
+func (m *Manager) handleWatermark(w *pb.Watermark, sender *pb.ReplicaID) {
+	if m.trim == nil {
+		return
+	}
+	if !m.trim.Update(sender, clog.Offset(w.GetOffset())) {
+		return
+	}
+	m.maybeTrim()
+}
+
+// maybeTrim computes the current safe-trim frontier and truncates
+// the local log to it if it has advanced. Called whenever any
+// replica's watermark advances.
+func (m *Manager) maybeTrim() {
+	if m.cfg.Log == nil {
+		return
+	}
+	m.mu.Lock()
+	active := make([]*pb.ReplicaID, len(m.membershipList))
+	for i, r := range m.membershipList {
+		active[i] = proto.Clone(r).(*pb.ReplicaID)
+	}
+	m.mu.Unlock()
+	frontier, ok := m.trim.SafeFrontier(active)
+	if !ok || frontier <= m.cfg.Log.FirstOffset() {
+		return
+	}
+	if err := m.cfg.Log.Truncate(context.Background(), frontier); err != nil {
+		m.logger.Warn("membership: log.Truncate", "frontier", frontier, "err", err)
+	}
+}
+
 // Close stops the Manager. The underlying Conversation is NOT
 // closed; the caller owns it. Close is independent of Conversation
 // lifecycle — Manager.Close exits cleanly whether or not the
@@ -308,6 +384,8 @@ func (m *Manager) dispatch(d psync.Delivery, dec frame.Decoded, sender *pb.Repli
 		// Liveness signal only; NoteReceived already credited.
 	case dec.SuspectDown != nil:
 		m.handleSuspectDown(dec.SuspectDown, sender)
+	case dec.Watermark != nil:
+		m.handleWatermark(dec.Watermark, sender)
 	case dec.VoteOut != nil:
 		m.handleVoteOut(dec.VoteOut, sender)
 	case dec.VoteOutAck != nil:

@@ -45,7 +45,21 @@ message ConvFrame {
     bytes app = 1;
     Heartbeat heartbeat = 2;
     MembershipEvent membership = 3;
+    Watermark watermark = 4;
   }
+}
+
+// Watermark advertises the lowest log offset the sender still
+// needs for its own recovery (PLAN §2.8). Each replica
+// periodically multicasts its watermark; receivers track the
+// most recent watermark from every member and compute
+// min(watermarks) over the active membership list to find the
+// safe trim frontier.
+//
+// The sender ReplicaID is implicit from envelope.id.sender, so
+// it does not appear here.
+message Watermark {
+  uint64 offset = 1;
 }
 
 // Heartbeat is a content-free dummy message emitted by
