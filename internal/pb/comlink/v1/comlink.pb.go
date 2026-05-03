@@ -24,6 +24,10 @@
 // Envelope is the framing for any message that flows on the network or
 // is stored in the message log; protocol-specific types (e.g. Psync
 // payloads in Phase 1) are serialized into Envelope.payload.
+//
+// MessageID is a vector-clock encoding (PLAN.md §2.10): the message's
+// causal predecessors are implicit in vector_clock and there is no
+// separate "predecessors" field on the wire envelope.
 
 package comlinkv1
 
@@ -42,10 +46,10 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// ConversationID uniquely identifies a Psync conversation. Generated when
-// the conversation is first opened and persisted to stable storage so it
-// survives restart. Encoded as 16 random bytes (UUID-like) but the format
-// is opaque to consumers.
+// ConversationID uniquely identifies a Psync conversation. Generated
+// when the conversation is first opened and persisted to stable storage
+// so it survives restart. Encoded as 16 random bytes (UUID-like) but
+// the format is opaque to consumers.
 type ConversationID struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Value         []byte                 `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"`
@@ -136,15 +140,55 @@ func (x *ReplicaID) GetValue() []byte {
 	return nil
 }
 
-// MessageID is globally unique without coordination: the (replica_id,
-// sequence_number) pair is monotonic per replica per conversation, so
-// (conversation_id, replica_id, sequence_number) is unique across the
-// system.
+// MessageID is the vector-clock-based identity for a message. It both
+// identifies the message globally and encodes its causal position in
+// the conversation's context graph.
+//
+// Layout:
+//
+//	conversation_id  - which conversation this message belongs to.
+//	sender           - the originating replica (full ReplicaID, not a
+//	                   slot index — slot indices would be ambiguous
+//	                   across membership-change boundaries; see PLAN
+//	                   §2.10).
+//	vector_clock     - one slot per current participant in the
+//	                   conversation, ordered by ReplicaID byte order.
+//	                   The slot for `sender` carries this message's
+//	                   own monotonic per-replica seq number; other
+//	                   slots carry the highest seq from each
+//	                   respective participant that this message
+//	                   causally depends on.
+//
+// Causal comparison:
+//
+//	M1 strictly precedes M2  iff  M1.vector_clock[i] <= M2.vector_clock[i] for all i,
+//	                              and M1.vector_clock != M2.vector_clock.
+//	M1 || M2 (concurrent)    iff  neither dominates.
+//
+// Direct DAG parents of M (when reconstructing the context graph on
+// receive):
+//
+//	For each slot i:
+//	  - if i == slot(M.sender) and vector_clock[i] > 1, the parent at
+//	    this slot is sender's previous message at seq vector_clock[i]−1.
+//	  - if i != slot(M.sender) and vector_clock[i] > 0, the parent at
+//	    this slot is the message from participant i with seq
+//	    vector_clock[i].
+//
+// Vector evolution under membership change (PLAN §2.10.1):
+//
+//	Vectors only ever grow over the lifetime of a conversation. A
+//	member-add message extends every replica's vector by one slot
+//	(inserted at the sorted position of the new ReplicaID); a
+//	member-remove message freezes the slot but does not delete it. A
+//	receiver whose own membership view is shorter than an incoming
+//	message's vector_clock treats the message as being from a future
+//	membership era and catches up via the lost-message protocol.
 type MessageID struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	ConversationId *ConversationID        `protobuf:"bytes,1,opt,name=conversation_id,json=conversationId,proto3" json:"conversation_id,omitempty"`
-	ReplicaId      *ReplicaID             `protobuf:"bytes,2,opt,name=replica_id,json=replicaId,proto3" json:"replica_id,omitempty"`
-	SequenceNumber uint64                 `protobuf:"varint,3,opt,name=sequence_number,json=sequenceNumber,proto3" json:"sequence_number,omitempty"`
+	Sender         *ReplicaID             `protobuf:"bytes,2,opt,name=sender,proto3" json:"sender,omitempty"`
+	VectorClock    []uint64               `protobuf:"varint,3,rep,packed,name=vector_clock,json=vectorClock,proto3" json:"vector_clock,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -186,32 +230,27 @@ func (x *MessageID) GetConversationId() *ConversationID {
 	return nil
 }
 
-func (x *MessageID) GetReplicaId() *ReplicaID {
+func (x *MessageID) GetSender() *ReplicaID {
 	if x != nil {
-		return x.ReplicaId
+		return x.Sender
 	}
 	return nil
 }
 
-func (x *MessageID) GetSequenceNumber() uint64 {
+func (x *MessageID) GetVectorClock() []uint64 {
 	if x != nil {
-		return x.SequenceNumber
+		return x.VectorClock
 	}
-	return 0
+	return nil
 }
 
 // Envelope is the framing for any message that flows on the network or
-// is stored in the local MessageLog.
-//
-// In Phase 0 only the round-trip Hello uses this; predecessors is empty.
-// In Phase 1 (Psync), predecessors lists the message IDs that this
-// message causally follows (the parents of this node in the context
-// graph).
+// is stored in the local MessageLog. Causal predecessors are implicit
+// in id.vector_clock — there is no separate predecessors field.
 type Envelope struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            *MessageID             `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Predecessors  []*MessageID           `protobuf:"bytes,2,rep,name=predecessors,proto3" json:"predecessors,omitempty"`
-	Payload       []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
+	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -249,13 +288,6 @@ func (*Envelope) Descriptor() ([]byte, []int) {
 func (x *Envelope) GetId() *MessageID {
 	if x != nil {
 		return x.Id
-	}
-	return nil
-}
-
-func (x *Envelope) GetPredecessors() []*MessageID {
-	if x != nil {
-		return x.Predecessors
 	}
 	return nil
 }
@@ -322,16 +354,14 @@ const file_comlink_v1_comlink_proto_rawDesc = "" +
 	"\x0eConversationID\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\fR\x05value\"!\n" +
 	"\tReplicaID\x12\x14\n" +
-	"\x05value\x18\x01 \x01(\fR\x05value\"\xaf\x01\n" +
+	"\x05value\x18\x01 \x01(\fR\x05value\"\xa2\x01\n" +
 	"\tMessageID\x12C\n" +
-	"\x0fconversation_id\x18\x01 \x01(\v2\x1a.comlink.v1.ConversationIDR\x0econversationId\x124\n" +
-	"\n" +
-	"replica_id\x18\x02 \x01(\v2\x15.comlink.v1.ReplicaIDR\treplicaId\x12'\n" +
-	"\x0fsequence_number\x18\x03 \x01(\x04R\x0esequenceNumber\"\x86\x01\n" +
+	"\x0fconversation_id\x18\x01 \x01(\v2\x1a.comlink.v1.ConversationIDR\x0econversationId\x12-\n" +
+	"\x06sender\x18\x02 \x01(\v2\x15.comlink.v1.ReplicaIDR\x06sender\x12!\n" +
+	"\fvector_clock\x18\x03 \x03(\x04R\vvectorClock\"K\n" +
 	"\bEnvelope\x12%\n" +
-	"\x02id\x18\x01 \x01(\v2\x15.comlink.v1.MessageIDR\x02id\x129\n" +
-	"\fpredecessors\x18\x02 \x03(\v2\x15.comlink.v1.MessageIDR\fpredecessors\x12\x18\n" +
-	"\apayload\x18\x03 \x01(\fR\apayload\"\x1b\n" +
+	"\x02id\x18\x01 \x01(\v2\x15.comlink.v1.MessageIDR\x02id\x12\x18\n" +
+	"\apayload\x18\x02 \x01(\fR\apayload\"\x1b\n" +
 	"\x05Hello\x12\x12\n" +
 	"\x04text\x18\x01 \x01(\tR\x04textBAZ?github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1b\x06proto3"
 
@@ -357,14 +387,13 @@ var file_comlink_v1_comlink_proto_goTypes = []any{
 }
 var file_comlink_v1_comlink_proto_depIdxs = []int32{
 	0, // 0: comlink.v1.MessageID.conversation_id:type_name -> comlink.v1.ConversationID
-	1, // 1: comlink.v1.MessageID.replica_id:type_name -> comlink.v1.ReplicaID
+	1, // 1: comlink.v1.MessageID.sender:type_name -> comlink.v1.ReplicaID
 	2, // 2: comlink.v1.Envelope.id:type_name -> comlink.v1.MessageID
-	2, // 3: comlink.v1.Envelope.predecessors:type_name -> comlink.v1.MessageID
-	4, // [4:4] is the sub-list for method output_type
-	4, // [4:4] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_comlink_v1_comlink_proto_init() }

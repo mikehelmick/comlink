@@ -20,14 +20,18 @@ syntax = "proto3";
 // Envelope is the framing for any message that flows on the network or
 // is stored in the message log; protocol-specific types (e.g. Psync
 // payloads in Phase 1) are serialized into Envelope.payload.
+//
+// MessageID is a vector-clock encoding (PLAN.md §2.10): the message's
+// causal predecessors are implicit in vector_clock and there is no
+// separate "predecessors" field on the wire envelope.
 package comlink.v1;
 
 option go_package = "github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1";
 
-// ConversationID uniquely identifies a Psync conversation. Generated when
-// the conversation is first opened and persisted to stable storage so it
-// survives restart. Encoded as 16 random bytes (UUID-like) but the format
-// is opaque to consumers.
+// ConversationID uniquely identifies a Psync conversation. Generated
+// when the conversation is first opened and persisted to stable storage
+// so it survives restart. Encoded as 16 random bytes (UUID-like) but
+// the format is opaque to consumers.
 message ConversationID {
   bytes value = 1;
 }
@@ -38,27 +42,58 @@ message ReplicaID {
   bytes value = 1;
 }
 
-// MessageID is globally unique without coordination: the (replica_id,
-// sequence_number) pair is monotonic per replica per conversation, so
-// (conversation_id, replica_id, sequence_number) is unique across the
-// system.
+// MessageID is the vector-clock-based identity for a message. It both
+// identifies the message globally and encodes its causal position in
+// the conversation's context graph.
+//
+// Layout:
+//   conversation_id  - which conversation this message belongs to.
+//   sender           - the originating replica (full ReplicaID, not a
+//                      slot index — slot indices would be ambiguous
+//                      across membership-change boundaries; see PLAN
+//                      §2.10).
+//   vector_clock     - one slot per current participant in the
+//                      conversation, ordered by ReplicaID byte order.
+//                      The slot for `sender` carries this message's
+//                      own monotonic per-replica seq number; other
+//                      slots carry the highest seq from each
+//                      respective participant that this message
+//                      causally depends on.
+//
+// Causal comparison:
+//   M1 strictly precedes M2  iff  M1.vector_clock[i] <= M2.vector_clock[i] for all i,
+//                                 and M1.vector_clock != M2.vector_clock.
+//   M1 || M2 (concurrent)    iff  neither dominates.
+//
+// Direct DAG parents of M (when reconstructing the context graph on
+// receive):
+//   For each slot i:
+//     - if i == slot(M.sender) and vector_clock[i] > 1, the parent at
+//       this slot is sender's previous message at seq vector_clock[i]−1.
+//     - if i != slot(M.sender) and vector_clock[i] > 0, the parent at
+//       this slot is the message from participant i with seq
+//       vector_clock[i].
+//
+// Vector evolution under membership change (PLAN §2.10.1):
+//   Vectors only ever grow over the lifetime of a conversation. A
+//   member-add message extends every replica's vector by one slot
+//   (inserted at the sorted position of the new ReplicaID); a
+//   member-remove message freezes the slot but does not delete it. A
+//   receiver whose own membership view is shorter than an incoming
+//   message's vector_clock treats the message as being from a future
+//   membership era and catches up via the lost-message protocol.
 message MessageID {
   ConversationID conversation_id = 1;
-  ReplicaID replica_id = 2;
-  uint64 sequence_number = 3;
+  ReplicaID sender = 2;
+  repeated uint64 vector_clock = 3;
 }
 
 // Envelope is the framing for any message that flows on the network or
-// is stored in the local MessageLog.
-//
-// In Phase 0 only the round-trip Hello uses this; predecessors is empty.
-// In Phase 1 (Psync), predecessors lists the message IDs that this
-// message causally follows (the parents of this node in the context
-// graph).
+// is stored in the local MessageLog. Causal predecessors are implicit
+// in id.vector_clock — there is no separate predecessors field.
 message Envelope {
   MessageID id = 1;
-  repeated MessageID predecessors = 2;
-  bytes payload = 3;
+  bytes payload = 2;
 }
 
 // Hello is the Phase 0 round-trip placeholder. Marshaled into
