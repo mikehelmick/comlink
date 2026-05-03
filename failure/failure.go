@@ -171,6 +171,25 @@ func (d *Detector) Suspected(replica *pb.ReplicaID) bool {
 	return ok
 }
 
+// RemoveMember stops tracking replica entirely — used after a
+// VoteOut concludes the replica is permanently removed from the
+// conversation. Subsequent ticks will not check for suspicion of
+// replica.
+func (d *Detector) RemoveMember(replica *pb.ReplicaID) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	key := string(replica.GetValue())
+	delete(d.lastReceived, key)
+	delete(d.suspected, key)
+	kept := d.memberByteForms[:0]
+	for _, mb := range d.memberByteForms {
+		if !bytes.Equal(mb, replica.GetValue()) {
+			kept = append(kept, mb)
+		}
+	}
+	d.memberByteForms = kept
+}
+
 // Close stops the Detector loop. Idempotent.
 func (d *Detector) Close() error {
 	d.stopOnce.Do(func() {

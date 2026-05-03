@@ -101,6 +101,10 @@ type Manager struct {
 	// implies a corresponding Maskout is in place on the
 	// underlying conversation.
 	suspectDownList map[string]struct{}
+	// voteOutSessions tracks in-flight VoteOut votes keyed by
+	// target ReplicaID bytes. One session per target at a time
+	// (Phase 3(e)).
+	voteOutSessions map[string]*voteOutSession
 
 	closeOnce sync.Once
 	stopped   chan struct{}
@@ -138,6 +142,7 @@ func New(cfg Config) (*Manager, error) {
 		stopped:         make(chan struct{}),
 		pumpDone:        make(chan struct{}),
 		suspectDownList: make(map[string]struct{}),
+		voteOutSessions: make(map[string]*voteOutSession),
 	}
 	m.membershipList = make([]*pb.ReplicaID, len(cfg.Members))
 	for i, r := range cfg.Members {
@@ -297,6 +302,13 @@ func (m *Manager) dispatch(d psync.Delivery, dec frame.Decoded, sender *pb.Repli
 
 // sendHeartbeat is called by the FailureDetector when the
 // conversation has been quiet for QuietInterval.
+//
+// Sends spawn a goroutine because callers of this method may be
+// holding locks or sitting on the receive path (the FailureDetector
+// callback fires from a tick goroutine; we don't want it to block
+// on conv.Send, which would re-enter the genserver). This is the
+// general pattern for any Manager-internal Send: spawn so the
+// caller is never re-entrantly blocked.
 func (m *Manager) sendHeartbeat() {
 	if m.isClosed() {
 		return
@@ -306,8 +318,21 @@ func (m *Manager) sendHeartbeat() {
 		m.logger.Warn("membership: marshal heartbeat", "err", err)
 		return
 	}
+	go m.asyncSend(bs, "heartbeat")
+}
+
+// asyncSend issues conv.Send in a goroutine, logging errors. The
+// goroutine ensures the calling code path (pump, FD callback,
+// etc.) does not re-enter the underlying psync genserver while
+// holding its delivery loop blocked.
+func (m *Manager) asyncSend(bs []byte, kind string) {
+	if m.isClosed() {
+		return
+	}
 	if _, err := m.conv.Send(bs); err != nil {
-		m.logger.Warn("membership: send heartbeat", "err", err)
+		if !m.isClosed() {
+			m.logger.Warn("membership: send "+kind, "err", err)
+		}
 		return
 	}
 	m.fd.NoteSent()
@@ -329,11 +354,7 @@ func (m *Manager) onSuspect(replica *pb.ReplicaID) {
 		m.logger.Warn("membership: marshal SuspectDown", "err", err)
 		return
 	}
-	if _, err := m.conv.Send(bs); err != nil {
-		m.logger.Warn("membership: send SuspectDown", "err", err)
-		return
-	}
-	m.fd.NoteSent()
+	go m.asyncSend(bs, "SuspectDown")
 }
 
 // markSuspected adds replica to the local SuspectDownList. PLAN
@@ -400,11 +421,8 @@ func (m *Manager) handleSuspectDown(susp *pb.SuspectDown, sender *pb.ReplicaID) 
 func (m *Manager) handleRecovering(_ *pb.Recovering, _ *pb.ReplicaID)   {}
 func (m *Manager) handleRecoveryAck(_ *pb.RecoveryAck, _ *pb.ReplicaID) {}
 
-// VoteOut/VoteIn handlers — Phase 3(e) implements the explicit
-// ML-mutation protocols.
-func (m *Manager) handleVoteOut(_ *pb.VoteOut, _ *pb.ReplicaID)         {}
-func (m *Manager) handleVoteOutAck(_ *pb.VoteOutAck, _ *pb.ReplicaID)   {}
-func (m *Manager) handleVoteOutNack(_ *pb.VoteOutNack, _ *pb.ReplicaID) {}
-func (m *Manager) handleVoteIn(_ *pb.VoteIn, _ *pb.ReplicaID)           {}
-func (m *Manager) handleVoteInAck(_ *pb.VoteInAck, _ *pb.ReplicaID)     {}
-func (m *Manager) handleVoteInNack(_ *pb.VoteInNack, _ *pb.ReplicaID)   {}
+// VoteOut/VoteIn handlers — VoteOut handlers live in voteout.go;
+// VoteIn handlers come in Phase 3(f).
+func (m *Manager) handleVoteIn(_ *pb.VoteIn, _ *pb.ReplicaID)         {}
+func (m *Manager) handleVoteInAck(_ *pb.VoteInAck, _ *pb.ReplicaID)   {}
+func (m *Manager) handleVoteInNack(_ *pb.VoteInNack, _ *pb.ReplicaID) {}

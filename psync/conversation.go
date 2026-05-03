@@ -153,6 +153,7 @@ type replayLogRequest struct{}
 type waveCompleteRequest struct{ wave uint64 }
 type messagesInWaveRequest struct{ wave uint64 }
 type stableMessageIDsRequest struct{}
+type freezeMemberRequest struct{ replica *pb.ReplicaID }
 
 func (sendRequest) isRequest()             {}
 func (incomingRequest) isRequest()         {}
@@ -161,6 +162,7 @@ func (replayLogRequest) isRequest()        {}
 func (waveCompleteRequest) isRequest()     {}
 func (messagesInWaveRequest) isRequest()   {}
 func (stableMessageIDsRequest) isRequest() {}
+func (freezeMemberRequest) isRequest()     {}
 
 type response interface{ isResponse() }
 
@@ -180,6 +182,7 @@ type messagesInWaveResponse struct {
 type stableMessageIDsResponse struct {
 	ids []*pb.MessageID
 }
+type freezeMemberResponse struct{ err error }
 type emptyResponse struct{}
 
 func (sendResponse) isResponse()             {}
@@ -188,6 +191,7 @@ func (replayLogResponse) isResponse()        {}
 func (waveCompleteResponse) isResponse()     {}
 func (messagesInWaveResponse) isResponse()   {}
 func (stableMessageIDsResponse) isResponse() {}
+func (freezeMemberResponse) isResponse()     {}
 func (emptyResponse) isResponse()            {}
 
 // serverImpl is the immutable handler that implements
@@ -258,6 +262,9 @@ func (s *serverImpl) HandleCall(req request, st *state) (response, *state) {
 			ids = append(ids, proto.Clone(n.Envelope.GetId()).(*pb.MessageID))
 		}
 		return stableMessageIDsResponse{ids: ids}, st
+	case freezeMemberRequest:
+		err := s.membership.Freeze(r.replica)
+		return freezeMemberResponse{err: err}, st
 	default:
 		return emptyResponse{}, st
 	}
@@ -453,6 +460,16 @@ func (c *Conversation) MessagesInWave(w uint64) []*pb.Envelope {
 func (c *Conversation) StableMessageIDs() []*pb.MessageID {
 	resp := c.srv.Call(stableMessageIDsRequest{})
 	return resp.(stableMessageIDsResponse).ids
+}
+
+// FreezeMember marks replica's slot as frozen in the underlying
+// Membership view (PLAN §2.10.1). Future messages purportedly
+// from replica are rejected; the slot stays in place so existing
+// vector clocks remain valid. Used by membership.Manager when a
+// VoteOut is decided.
+func (c *Conversation) FreezeMember(replica *pb.ReplicaID) error {
+	resp := c.srv.Call(freezeMemberRequest{replica: replica})
+	return resp.(freezeMemberResponse).err
 }
 
 // Close stops the conversation. Idempotent.
