@@ -24,6 +24,7 @@ import (
 
 	"github.com/mikehelmick/go-functional/genserver"
 
+	"github.com/mikehelmick/comlink/clock"
 	pb "github.com/mikehelmick/comlink/internal/pb/comlink/v1"
 	clog "github.com/mikehelmick/comlink/log"
 	"github.com/mikehelmick/comlink/stable"
@@ -67,6 +68,11 @@ type Config struct {
 
 	// Optional logger. If nil, slog.Default() is used.
 	Logger *slog.Logger
+
+	// Optional clock; used by Restart's retry loop. Defaults to
+	// clock.NewSystem(). Tests use clock.Manual to drive restart
+	// retries deterministically.
+	Clock clock.Clock
 }
 
 // Conversation is one replica's view of a Psync conversation.
@@ -84,10 +90,16 @@ type Conversation struct {
 	srv      *genserver.GenServer[*state, request, response]
 	cfg      Config
 	logger   *slog.Logger
+	clk      clock.Clock
 	deliver  chan Delivery
 	pumpDone chan struct{}
 	closeMu  sync.Mutex
 	closed   bool
+
+	// Restart subscription. Set by Restart() while a restart is in
+	// progress; serverImpl pushes incoming RestartAcks here.
+	restartMu       sync.Mutex
+	restartAckChan  chan *pb.RestartAck
 }
 
 // state is the mutable per-conversation data the genserver carries
@@ -171,6 +183,11 @@ type serverImpl struct {
 	mask       *Mask
 	deliver    chan<- Delivery
 	logger     *slog.Logger
+	// onRestartAck, if non-nil, is invoked on every received
+	// RestartAck so the Conversation's Restart() can collect them.
+	// Stored as a func to avoid coupling serverImpl to Conversation
+	// directly.
+	onRestartAck func(*pb.RestartAck)
 }
 
 // Init creates the initial mutable state.
@@ -241,6 +258,11 @@ func New(ctx context.Context, cfg Config) (*Conversation, error) {
 	}
 	deliver := make(chan Delivery, bufSize)
 
+	clk := cfg.Clock
+	if clk == nil {
+		clk = clock.NewSystem()
+	}
+
 	impl := &serverImpl{
 		convID:     proto.Clone(cfg.ConversationID).(*pb.ConversationID),
 		self:       proto.Clone(cfg.Self).(*pb.ReplicaID),
@@ -253,17 +275,37 @@ func New(ctx context.Context, cfg Config) (*Conversation, error) {
 		deliver:    deliver,
 		logger:     logger,
 	}
-	srv := genserver.Start[*state, request, response](impl)
 
 	c := &Conversation{
-		srv:      srv,
 		cfg:      cfg,
 		logger:   logger,
+		clk:      clk,
 		deliver:  deliver,
 		pumpDone: make(chan struct{}),
 	}
+	// Wire the restart-ack callback before starting the server so we
+	// don't race with any incoming RestartAck.
+	impl.onRestartAck = c.deliverRestartAck
+	c.srv = genserver.Start[*state, request, response](impl)
+
 	go c.pumpInput(ctx)
 	return c, nil
+}
+
+// deliverRestartAck pushes ack to the active restart listener (if
+// any). Non-blocking — drops if no one is listening or the channel
+// is full.
+func (c *Conversation) deliverRestartAck(ack *pb.RestartAck) {
+	c.restartMu.Lock()
+	ch := c.restartAckChan
+	c.restartMu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- ack:
+	default:
+	}
 }
 
 func validateConfig(cfg Config) error {
@@ -390,16 +432,20 @@ func (s *serverImpl) handleSend(st *state, payload []byte) (*pb.MessageID, error
 }
 
 func (s *serverImpl) handleIncoming(st *state, from *pb.ReplicaID, data []byte) {
-	env, lostReq, err := UnmarshalWire(data)
+	got, err := UnmarshalWire(data)
 	if err != nil {
 		s.logger.Warn("psync: unmarshal wire", "err", err)
 		return
 	}
 	switch {
-	case env != nil:
-		s.handleEnvelope(st, env, from)
-	case lostReq != nil:
-		s.handleLostRequest(st, lostReq, from)
+	case got.Envelope != nil:
+		s.handleEnvelope(st, got.Envelope, from)
+	case got.LostMessageRequest != nil:
+		s.handleLostRequest(st, got.LostMessageRequest, from)
+	case got.RestartMessage != nil:
+		s.handleRestartMessage(st, got.RestartMessage, from)
+	case got.RestartAck != nil:
+		s.handleRestartAckIncoming(st, got.RestartAck, from)
 	}
 }
 

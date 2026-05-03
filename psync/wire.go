@@ -46,20 +46,54 @@ func MarshalLostMessageRequest(missingSender *pb.ReplicaID, missingSeq uint64) (
 	})
 }
 
+// MarshalRestartMessage wraps a RestartMessage in a PsyncMessage.
+func MarshalRestartMessage(restarter *pb.ReplicaID) ([]byte, error) {
+	return proto.Marshal(&pb.PsyncMessage{
+		Body: &pb.PsyncMessage_RestartMessage{
+			RestartMessage: &pb.RestartMessage{Restarter: restarter},
+		},
+	})
+}
+
+// MarshalRestartAck wraps a RestartAck in a PsyncMessage.
+func MarshalRestartAck(responder *pb.ReplicaID, leaves []*pb.MessageID) ([]byte, error) {
+	return proto.Marshal(&pb.PsyncMessage{
+		Body: &pb.PsyncMessage_RestartAck{
+			RestartAck: &pb.RestartAck{
+				Responder: responder,
+				Leaves:    leaves,
+			},
+		},
+	})
+}
+
+// Decoded is the union of all possible decoded PsyncMessage bodies.
+// Exactly one field is non-nil on a successful UnmarshalWire.
+type Decoded struct {
+	Envelope           *pb.Envelope
+	LostMessageRequest *pb.LostMessageRequest
+	RestartMessage     *pb.RestartMessage
+	RestartAck         *pb.RestartAck
+}
+
 // UnmarshalWire decodes a transport payload into a PsyncMessage and
-// returns the inner body via type-asserting accessors. Exactly one
-// of the returned envelope / lostReq is non-nil on success.
-func UnmarshalWire(data []byte) (env *pb.Envelope, lostReq *pb.LostMessageRequest, err error) {
+// returns the inner body via the Decoded union. Exactly one field
+// of the returned Decoded is non-nil on success.
+func UnmarshalWire(data []byte) (Decoded, error) {
 	pm := &pb.PsyncMessage{}
 	if err := proto.Unmarshal(data, pm); err != nil {
-		return nil, nil, err
+		return Decoded{}, err
 	}
 	switch body := pm.GetBody().(type) {
 	case *pb.PsyncMessage_Envelope:
-		return body.Envelope, nil, nil
+		return Decoded{Envelope: body.Envelope}, nil
 	case *pb.PsyncMessage_LostMessageRequest:
-		return nil, body.LostMessageRequest, nil
+		return Decoded{LostMessageRequest: body.LostMessageRequest}, nil
+	case *pb.PsyncMessage_RestartMessage:
+		return Decoded{RestartMessage: body.RestartMessage}, nil
+	case *pb.PsyncMessage_RestartAck:
+		return Decoded{RestartAck: body.RestartAck}, nil
 	default:
-		return nil, nil, ErrEmptyPsyncMessage
+		return Decoded{}, ErrEmptyPsyncMessage
 	}
 }

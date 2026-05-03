@@ -55,13 +55,35 @@ message LostMessageRequest {
   uint64 missing_seq = 2;
 }
 
+// RestartMessage announces that the named replica has restarted
+// and is rebuilding its context graph (paper §2.3). Receivers
+// respond with a RestartAck containing their current leaf set;
+// the restarter then fetches each leaf via the lost-message
+// protocol.
+//
+// Per paper §2.3, broadcast is not atomic — at least one peer must
+// receive it. The restarter retries at intervals until it gets
+// at least one RestartAck.
+message RestartMessage {
+  ReplicaID restarter = 1;
+}
+
+// RestartAck carries the responder's current leaf set. The
+// restarter combines acks from multiple peers (it accepts as many
+// as arrive within a deadline).
+message RestartAck {
+  ReplicaID responder = 1;
+  repeated MessageID leaves = 2;
+}
+
 // PsyncMessage is the outer wrapper for every byte payload Psync
 // hands to the transport. Receivers unmarshal PsyncMessage, dispatch
-// on the body oneof. Phase 1 ships envelope + lost_message_request;
-// Phase 1(g) will extend with restart_message and restart_ack.
+// on the body oneof.
 message PsyncMessage {
   oneof body {
     Envelope envelope = 1;
     LostMessageRequest lost_message_request = 2;
+    RestartMessage restart_message = 3;
+    RestartAck restart_ack = 4;
   }
 }

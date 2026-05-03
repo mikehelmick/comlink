@@ -158,16 +158,125 @@ func (x *LostMessageRequest) GetMissingSeq() uint64 {
 	return 0
 }
 
+// RestartMessage announces that the named replica has restarted
+// and is rebuilding its context graph (paper §2.3). Receivers
+// respond with a RestartAck containing their current leaf set;
+// the restarter then fetches each leaf via the lost-message
+// protocol.
+//
+// Per paper §2.3, broadcast is not atomic — at least one peer must
+// receive it. The restarter retries at intervals until it gets
+// at least one RestartAck.
+type RestartMessage struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Restarter     *ReplicaID             `protobuf:"bytes,1,opt,name=restarter,proto3" json:"restarter,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RestartMessage) Reset() {
+	*x = RestartMessage{}
+	mi := &file_comlink_v1_psync_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestartMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestartMessage) ProtoMessage() {}
+
+func (x *RestartMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_comlink_v1_psync_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestartMessage.ProtoReflect.Descriptor instead.
+func (*RestartMessage) Descriptor() ([]byte, []int) {
+	return file_comlink_v1_psync_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *RestartMessage) GetRestarter() *ReplicaID {
+	if x != nil {
+		return x.Restarter
+	}
+	return nil
+}
+
+// RestartAck carries the responder's current leaf set. The
+// restarter combines acks from multiple peers (it accepts as many
+// as arrive within a deadline).
+type RestartAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Responder     *ReplicaID             `protobuf:"bytes,1,opt,name=responder,proto3" json:"responder,omitempty"`
+	Leaves        []*MessageID           `protobuf:"bytes,2,rep,name=leaves,proto3" json:"leaves,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RestartAck) Reset() {
+	*x = RestartAck{}
+	mi := &file_comlink_v1_psync_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestartAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestartAck) ProtoMessage() {}
+
+func (x *RestartAck) ProtoReflect() protoreflect.Message {
+	mi := &file_comlink_v1_psync_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestartAck.ProtoReflect.Descriptor instead.
+func (*RestartAck) Descriptor() ([]byte, []int) {
+	return file_comlink_v1_psync_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *RestartAck) GetResponder() *ReplicaID {
+	if x != nil {
+		return x.Responder
+	}
+	return nil
+}
+
+func (x *RestartAck) GetLeaves() []*MessageID {
+	if x != nil {
+		return x.Leaves
+	}
+	return nil
+}
+
 // PsyncMessage is the outer wrapper for every byte payload Psync
 // hands to the transport. Receivers unmarshal PsyncMessage, dispatch
-// on the body oneof. Phase 1 ships envelope + lost_message_request;
-// Phase 1(g) will extend with restart_message and restart_ack.
+// on the body oneof.
 type PsyncMessage struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Body:
 	//
 	//	*PsyncMessage_Envelope
 	//	*PsyncMessage_LostMessageRequest
+	//	*PsyncMessage_RestartMessage
+	//	*PsyncMessage_RestartAck
 	Body          isPsyncMessage_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -175,7 +284,7 @@ type PsyncMessage struct {
 
 func (x *PsyncMessage) Reset() {
 	*x = PsyncMessage{}
-	mi := &file_comlink_v1_psync_proto_msgTypes[2]
+	mi := &file_comlink_v1_psync_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -187,7 +296,7 @@ func (x *PsyncMessage) String() string {
 func (*PsyncMessage) ProtoMessage() {}
 
 func (x *PsyncMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_psync_proto_msgTypes[2]
+	mi := &file_comlink_v1_psync_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -200,7 +309,7 @@ func (x *PsyncMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PsyncMessage.ProtoReflect.Descriptor instead.
 func (*PsyncMessage) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_psync_proto_rawDescGZIP(), []int{2}
+	return file_comlink_v1_psync_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *PsyncMessage) GetBody() isPsyncMessage_Body {
@@ -228,6 +337,24 @@ func (x *PsyncMessage) GetLostMessageRequest() *LostMessageRequest {
 	return nil
 }
 
+func (x *PsyncMessage) GetRestartMessage() *RestartMessage {
+	if x != nil {
+		if x, ok := x.Body.(*PsyncMessage_RestartMessage); ok {
+			return x.RestartMessage
+		}
+	}
+	return nil
+}
+
+func (x *PsyncMessage) GetRestartAck() *RestartAck {
+	if x != nil {
+		if x, ok := x.Body.(*PsyncMessage_RestartAck); ok {
+			return x.RestartAck
+		}
+	}
+	return nil
+}
+
 type isPsyncMessage_Body interface {
 	isPsyncMessage_Body()
 }
@@ -240,9 +367,21 @@ type PsyncMessage_LostMessageRequest struct {
 	LostMessageRequest *LostMessageRequest `protobuf:"bytes,2,opt,name=lost_message_request,json=lostMessageRequest,proto3,oneof"`
 }
 
+type PsyncMessage_RestartMessage struct {
+	RestartMessage *RestartMessage `protobuf:"bytes,3,opt,name=restart_message,json=restartMessage,proto3,oneof"`
+}
+
+type PsyncMessage_RestartAck struct {
+	RestartAck *RestartAck `protobuf:"bytes,4,opt,name=restart_ack,json=restartAck,proto3,oneof"`
+}
+
 func (*PsyncMessage_Envelope) isPsyncMessage_Body() {}
 
 func (*PsyncMessage_LostMessageRequest) isPsyncMessage_Body() {}
+
+func (*PsyncMessage_RestartMessage) isPsyncMessage_Body() {}
+
+func (*PsyncMessage_RestartAck) isPsyncMessage_Body() {}
 
 var File_comlink_v1_psync_proto protoreflect.FileDescriptor
 
@@ -255,10 +394,19 @@ const file_comlink_v1_psync_proto_rawDesc = "" +
 	"\x12LostMessageRequest\x12<\n" +
 	"\x0emissing_sender\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\rmissingSender\x12\x1f\n" +
 	"\vmissing_seq\x18\x02 \x01(\x04R\n" +
-	"missingSeq\"\x9e\x01\n" +
+	"missingSeq\"E\n" +
+	"\x0eRestartMessage\x123\n" +
+	"\trestarter\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\trestarter\"p\n" +
+	"\n" +
+	"RestartAck\x123\n" +
+	"\tresponder\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\tresponder\x12-\n" +
+	"\x06leaves\x18\x02 \x03(\v2\x15.comlink.v1.MessageIDR\x06leaves\"\xa0\x02\n" +
 	"\fPsyncMessage\x122\n" +
 	"\benvelope\x18\x01 \x01(\v2\x14.comlink.v1.EnvelopeH\x00R\benvelope\x12R\n" +
-	"\x14lost_message_request\x18\x02 \x01(\v2\x1e.comlink.v1.LostMessageRequestH\x00R\x12lostMessageRequestB\x06\n" +
+	"\x14lost_message_request\x18\x02 \x01(\v2\x1e.comlink.v1.LostMessageRequestH\x00R\x12lostMessageRequest\x12E\n" +
+	"\x0frestart_message\x18\x03 \x01(\v2\x1a.comlink.v1.RestartMessageH\x00R\x0erestartMessage\x129\n" +
+	"\vrestart_ack\x18\x04 \x01(\v2\x16.comlink.v1.RestartAckH\x00R\n" +
+	"restartAckB\x06\n" +
 	"\x04bodyBAZ?github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1b\x06proto3"
 
 var (
@@ -273,23 +421,31 @@ func file_comlink_v1_psync_proto_rawDescGZIP() []byte {
 	return file_comlink_v1_psync_proto_rawDescData
 }
 
-var file_comlink_v1_psync_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_comlink_v1_psync_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_comlink_v1_psync_proto_goTypes = []any{
 	(*MaskState)(nil),          // 0: comlink.v1.MaskState
 	(*LostMessageRequest)(nil), // 1: comlink.v1.LostMessageRequest
-	(*PsyncMessage)(nil),       // 2: comlink.v1.PsyncMessage
-	(*ReplicaID)(nil),          // 3: comlink.v1.ReplicaID
-	(*Envelope)(nil),           // 4: comlink.v1.Envelope
+	(*RestartMessage)(nil),     // 2: comlink.v1.RestartMessage
+	(*RestartAck)(nil),         // 3: comlink.v1.RestartAck
+	(*PsyncMessage)(nil),       // 4: comlink.v1.PsyncMessage
+	(*ReplicaID)(nil),          // 5: comlink.v1.ReplicaID
+	(*MessageID)(nil),          // 6: comlink.v1.MessageID
+	(*Envelope)(nil),           // 7: comlink.v1.Envelope
 }
 var file_comlink_v1_psync_proto_depIdxs = []int32{
-	3, // 0: comlink.v1.LostMessageRequest.missing_sender:type_name -> comlink.v1.ReplicaID
-	4, // 1: comlink.v1.PsyncMessage.envelope:type_name -> comlink.v1.Envelope
-	1, // 2: comlink.v1.PsyncMessage.lost_message_request:type_name -> comlink.v1.LostMessageRequest
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	5, // 0: comlink.v1.LostMessageRequest.missing_sender:type_name -> comlink.v1.ReplicaID
+	5, // 1: comlink.v1.RestartMessage.restarter:type_name -> comlink.v1.ReplicaID
+	5, // 2: comlink.v1.RestartAck.responder:type_name -> comlink.v1.ReplicaID
+	6, // 3: comlink.v1.RestartAck.leaves:type_name -> comlink.v1.MessageID
+	7, // 4: comlink.v1.PsyncMessage.envelope:type_name -> comlink.v1.Envelope
+	1, // 5: comlink.v1.PsyncMessage.lost_message_request:type_name -> comlink.v1.LostMessageRequest
+	2, // 6: comlink.v1.PsyncMessage.restart_message:type_name -> comlink.v1.RestartMessage
+	3, // 7: comlink.v1.PsyncMessage.restart_ack:type_name -> comlink.v1.RestartAck
+	8, // [8:8] is the sub-list for method output_type
+	8, // [8:8] is the sub-list for method input_type
+	8, // [8:8] is the sub-list for extension type_name
+	8, // [8:8] is the sub-list for extension extendee
+	0, // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_comlink_v1_psync_proto_init() }
@@ -298,9 +454,11 @@ func file_comlink_v1_psync_proto_init() {
 		return
 	}
 	file_comlink_v1_comlink_proto_init()
-	file_comlink_v1_psync_proto_msgTypes[2].OneofWrappers = []any{
+	file_comlink_v1_psync_proto_msgTypes[4].OneofWrappers = []any{
 		(*PsyncMessage_Envelope)(nil),
 		(*PsyncMessage_LostMessageRequest)(nil),
+		(*PsyncMessage_RestartMessage)(nil),
+		(*PsyncMessage_RestartAck)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -308,7 +466,7 @@ func file_comlink_v1_psync_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_comlink_v1_psync_proto_rawDesc), len(file_comlink_v1_psync_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   3,
+			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

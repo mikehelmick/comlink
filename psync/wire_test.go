@@ -36,15 +36,15 @@ func TestRoundtripEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotEnv, gotReq, err := psync.UnmarshalWire(bytes)
+	got, err := psync.UnmarshalWire(bytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotReq != nil {
-		t.Fatalf("got non-nil request: %v", gotReq)
+	if got.LostMessageRequest != nil || got.RestartMessage != nil || got.RestartAck != nil {
+		t.Fatalf("got non-envelope body: %+v", got)
 	}
-	if !proto.Equal(gotEnv, env) {
-		t.Fatalf("envelope round-trip differs: got %v want %v", gotEnv, env)
+	if !proto.Equal(got.Envelope, env) {
+		t.Fatalf("envelope round-trip differs: got %v want %v", got.Envelope, env)
 	}
 }
 
@@ -53,23 +53,64 @@ func TestRoundtripLostMessageRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotEnv, gotReq, err := psync.UnmarshalWire(bytes)
+	got, err := psync.UnmarshalWire(bytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotEnv != nil {
-		t.Fatalf("got non-nil envelope: %v", gotEnv)
+	if got.Envelope != nil {
+		t.Fatalf("got non-nil envelope: %v", got.Envelope)
 	}
-	if !slices.Equal(gotReq.GetMissingSender().GetValue(), r("alice").GetValue()) {
-		t.Fatalf("MissingSender = %x, want alice", gotReq.GetMissingSender().GetValue())
+	if !slices.Equal(got.LostMessageRequest.GetMissingSender().GetValue(), r("alice").GetValue()) {
+		t.Fatalf("MissingSender = %x, want alice", got.LostMessageRequest.GetMissingSender().GetValue())
 	}
-	if gotReq.GetMissingSeq() != 42 {
-		t.Fatalf("MissingSeq = %d, want 42", gotReq.GetMissingSeq())
+	if got.LostMessageRequest.GetMissingSeq() != 42 {
+		t.Fatalf("MissingSeq = %d, want 42", got.LostMessageRequest.GetMissingSeq())
+	}
+}
+
+func TestRoundtripRestartMessage(t *testing.T) {
+	bytes, err := psync.MarshalRestartMessage(r("alice"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := psync.UnmarshalWire(bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RestartMessage == nil {
+		t.Fatalf("RestartMessage was nil")
+	}
+	if !slices.Equal(got.RestartMessage.GetRestarter().GetValue(), r("alice").GetValue()) {
+		t.Fatalf("Restarter mismatch")
+	}
+}
+
+func TestRoundtripRestartAck(t *testing.T) {
+	leaves := []*pb.MessageID{
+		{Sender: r("bob"), VectorClock: []uint64{1, 1}},
+		{Sender: r("carol"), VectorClock: []uint64{0, 0, 1}},
+	}
+	bytes, err := psync.MarshalRestartAck(r("bob"), leaves)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := psync.UnmarshalWire(bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RestartAck == nil {
+		t.Fatalf("RestartAck was nil")
+	}
+	if !slices.Equal(got.RestartAck.GetResponder().GetValue(), r("bob").GetValue()) {
+		t.Fatalf("Responder mismatch")
+	}
+	if len(got.RestartAck.GetLeaves()) != 2 {
+		t.Fatalf("Leaves count = %d, want 2", len(got.RestartAck.GetLeaves()))
 	}
 }
 
 func TestUnmarshalGarbage(t *testing.T) {
-	if _, _, err := psync.UnmarshalWire([]byte("not a proto")); err == nil {
+	if _, err := psync.UnmarshalWire([]byte("not a proto")); err == nil {
 		t.Fatal("UnmarshalWire(garbage) returned nil error")
 	}
 }
@@ -79,7 +120,7 @@ func TestUnmarshalEmptyPsyncMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := psync.UnmarshalWire(bytes); !errors.Is(err, psync.ErrEmptyPsyncMessage) {
+	if _, err := psync.UnmarshalWire(bytes); !errors.Is(err, psync.ErrEmptyPsyncMessage) {
 		t.Fatalf("UnmarshalWire(empty) err = %v, want ErrEmptyPsyncMessage", err)
 	}
 }
