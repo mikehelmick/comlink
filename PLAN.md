@@ -339,7 +339,7 @@ Plus the additional scenario tests:
 | Phase                                      | Status      |
 | ------------------------------------------ | ----------- |
 | 0 — Foundation                             | done        |
-| 1 — Psync                                  | not started |
+| 1 — Psync                                  | done        |
 | 2 — Order (PartialOrder, Total, SemOrder)  | not started |
 | 3 — FailureDetection + Membership          | not started |
 | 4 — Recovery + Trim (HWM)                  | not started |
