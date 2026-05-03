@@ -1,0 +1,41 @@
+// Copyright 2026 the comlink authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package comlink.v1;
+
+import "comlink/v1/comlink.proto";
+
+option go_package = "github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1";
+
+// Frame is the wire form for the gRPC transport. The payload is the
+// caller's opaque bytes (typically a marshaled Envelope, but the
+// transport doesn't interpret it).
+message Frame {
+  ReplicaID from = 1;
+  bytes payload = 2;
+}
+
+// SendAck is the response to a Frame send. Currently empty; reserved
+// for future per-message protocol negotiation.
+message SendAck {}
+
+// Transport is the gRPC service exposed by each replica's transport
+// server. Sends are unary RPCs in Phase 0 — simple and obviously
+// correct. Phase 5 may upgrade to a bidi stream for throughput if
+// benchmarks warrant.
+service Transport {
+  rpc Send(Frame) returns (SendAck);
+}
