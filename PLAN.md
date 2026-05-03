@@ -340,7 +340,7 @@ Plus the additional scenario tests:
 | ------------------------------------------ | ----------- |
 | 0 — Foundation                             | done        |
 | 1 — Psync                                  | done        |
-| 2 — Order (PartialOrder, Total, SemOrder)  | not started |
+| 2 — Order (PartialOrder, Total, SemOrder)  | done        |
 | 3 — FailureDetection + Membership          | not started |
 | 4 — Recovery + Trim (HWM)                  | not started |
 | 5 — Composition / public API               | not started |

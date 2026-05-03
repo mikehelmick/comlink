@@ -68,20 +68,6 @@ func memFactory(t *testing.T, convID *pb.ConversationID) clog.MessageLog {
 	return m
 }
 
-func fileFactoryNew(t *testing.T) (factory, string) {
-	t.Helper()
-	dir := t.TempDir()
-	return func(t *testing.T, convID *pb.ConversationID) clog.MessageLog {
-		t.Helper()
-		l, err := clog.OpenFile(dir, convID)
-		if err != nil {
-			t.Fatalf("OpenFile: %v", err)
-		}
-		t.Cleanup(func() { _ = l.Close() })
-		return l
-	}, dir
-}
-
 // runConformance exercises the contract on any MessageLog impl.
 func runConformance(t *testing.T, makeLog factory) {
 	t.Helper()

@@ -257,9 +257,9 @@ func TestSemOrderK3Generalization(t *testing.T) {
 		case strings.HasPrefix(payload, "delete:"):
 			key := payload[len("delete:"):]
 			delete(state, key)
-		case strings.HasPrefix(payload, "read:"):
-			// no-op for state machine convergence
 		}
+		// "read:..." payloads are no-ops for state-machine
+		// convergence — the switch above drops them implicitly.
 	}
 
 	// Mix of all 3 classes from each replica + settle messages.

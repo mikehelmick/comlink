@@ -19,7 +19,6 @@ import (
 	"sort"
 	"sync"
 
-	pb "github.com/mikehelmick/comlink/internal/pb/comlink/v1"
 	"github.com/mikehelmick/comlink/psync"
 )
 
@@ -109,6 +108,3 @@ func (t *Total) Close() error {
 	return nil
 }
 
-// Compile-time assertion that pb is referenced (used for symmetry
-// with future SemOrder; remove when SemOrder lands).
-var _ = (*pb.Envelope)(nil)
