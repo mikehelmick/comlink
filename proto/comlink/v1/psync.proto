@@ -17,9 +17,14 @@ syntax = "proto3";
 // Psync-internal types: state persisted via stable.Storage and
 // wire-level control messages exchanged between Psync instances
 // (lost-message requests, restart messages, etc.). Application
-// payloads ride inside Envelope.payload from comlink.proto and do
-// not appear here.
+// payloads ride inside Envelope.payload from comlink.proto.
+//
+// Wire framing: every Psync send onto the transport is a marshaled
+// PsyncMessage. The body oneof discriminates between an ordinary
+// Envelope (data) and the various control messages.
 package comlink.v1;
+
+import "comlink/v1/comlink.proto";
 
 option go_package = "github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1";
 
@@ -32,4 +37,31 @@ message MaskState {
   // Each entry is the bytes of a ReplicaID currently masked out at
   // this replica.
   repeated bytes masked_replicas = 1;
+}
+
+// LostMessageRequest asks the receiving replica to retransmit a
+// specific (sender, seq) message that the requester needs but does
+// not have locally. Per paper §2.3, the requester directs the
+// request at the sender of the NEW message that referenced the
+// missing predecessor — that sender is guaranteed to have the
+// missing message in its own log/graph, even if the missing
+// message originated elsewhere (it had to have it as a predecessor
+// of its own send).
+message LostMessageRequest {
+  // The sender whose message we're missing (NOT the peer we're
+  // asking; the message we want is from missing_sender at
+  // missing_seq).
+  ReplicaID missing_sender = 1;
+  uint64 missing_seq = 2;
+}
+
+// PsyncMessage is the outer wrapper for every byte payload Psync
+// hands to the transport. Receivers unmarshal PsyncMessage, dispatch
+// on the body oneof. Phase 1 ships envelope + lost_message_request;
+// Phase 1(g) will extend with restart_message and restart_ack.
+message PsyncMessage {
+  oneof body {
+    Envelope envelope = 1;
+    LostMessageRequest lost_message_request = 2;
+  }
 }

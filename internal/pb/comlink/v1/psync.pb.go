@@ -21,8 +21,11 @@
 // Psync-internal types: state persisted via stable.Storage and
 // wire-level control messages exchanged between Psync instances
 // (lost-message requests, restart messages, etc.). Application
-// payloads ride inside Envelope.payload from comlink.proto and do
-// not appear here.
+// payloads ride inside Envelope.payload from comlink.proto.
+//
+// Wire framing: every Psync send onto the transport is a marshaled
+// PsyncMessage. The body oneof discriminates between an ordinary
+// Envelope (data) and the various control messages.
 
 package comlinkv1
 
@@ -92,14 +95,171 @@ func (x *MaskState) GetMaskedReplicas() [][]byte {
 	return nil
 }
 
+// LostMessageRequest asks the receiving replica to retransmit a
+// specific (sender, seq) message that the requester needs but does
+// not have locally. Per paper §2.3, the requester directs the
+// request at the sender of the NEW message that referenced the
+// missing predecessor — that sender is guaranteed to have the
+// missing message in its own log/graph, even if the missing
+// message originated elsewhere (it had to have it as a predecessor
+// of its own send).
+type LostMessageRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The sender whose message we're missing (NOT the peer we're
+	// asking; the message we want is from missing_sender at
+	// missing_seq).
+	MissingSender *ReplicaID `protobuf:"bytes,1,opt,name=missing_sender,json=missingSender,proto3" json:"missing_sender,omitempty"`
+	MissingSeq    uint64     `protobuf:"varint,2,opt,name=missing_seq,json=missingSeq,proto3" json:"missing_seq,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LostMessageRequest) Reset() {
+	*x = LostMessageRequest{}
+	mi := &file_comlink_v1_psync_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LostMessageRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LostMessageRequest) ProtoMessage() {}
+
+func (x *LostMessageRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_comlink_v1_psync_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LostMessageRequest.ProtoReflect.Descriptor instead.
+func (*LostMessageRequest) Descriptor() ([]byte, []int) {
+	return file_comlink_v1_psync_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *LostMessageRequest) GetMissingSender() *ReplicaID {
+	if x != nil {
+		return x.MissingSender
+	}
+	return nil
+}
+
+func (x *LostMessageRequest) GetMissingSeq() uint64 {
+	if x != nil {
+		return x.MissingSeq
+	}
+	return 0
+}
+
+// PsyncMessage is the outer wrapper for every byte payload Psync
+// hands to the transport. Receivers unmarshal PsyncMessage, dispatch
+// on the body oneof. Phase 1 ships envelope + lost_message_request;
+// Phase 1(g) will extend with restart_message and restart_ack.
+type PsyncMessage struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Body:
+	//
+	//	*PsyncMessage_Envelope
+	//	*PsyncMessage_LostMessageRequest
+	Body          isPsyncMessage_Body `protobuf_oneof:"body"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PsyncMessage) Reset() {
+	*x = PsyncMessage{}
+	mi := &file_comlink_v1_psync_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PsyncMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PsyncMessage) ProtoMessage() {}
+
+func (x *PsyncMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_comlink_v1_psync_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PsyncMessage.ProtoReflect.Descriptor instead.
+func (*PsyncMessage) Descriptor() ([]byte, []int) {
+	return file_comlink_v1_psync_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *PsyncMessage) GetBody() isPsyncMessage_Body {
+	if x != nil {
+		return x.Body
+	}
+	return nil
+}
+
+func (x *PsyncMessage) GetEnvelope() *Envelope {
+	if x != nil {
+		if x, ok := x.Body.(*PsyncMessage_Envelope); ok {
+			return x.Envelope
+		}
+	}
+	return nil
+}
+
+func (x *PsyncMessage) GetLostMessageRequest() *LostMessageRequest {
+	if x != nil {
+		if x, ok := x.Body.(*PsyncMessage_LostMessageRequest); ok {
+			return x.LostMessageRequest
+		}
+	}
+	return nil
+}
+
+type isPsyncMessage_Body interface {
+	isPsyncMessage_Body()
+}
+
+type PsyncMessage_Envelope struct {
+	Envelope *Envelope `protobuf:"bytes,1,opt,name=envelope,proto3,oneof"`
+}
+
+type PsyncMessage_LostMessageRequest struct {
+	LostMessageRequest *LostMessageRequest `protobuf:"bytes,2,opt,name=lost_message_request,json=lostMessageRequest,proto3,oneof"`
+}
+
+func (*PsyncMessage_Envelope) isPsyncMessage_Body() {}
+
+func (*PsyncMessage_LostMessageRequest) isPsyncMessage_Body() {}
+
 var File_comlink_v1_psync_proto protoreflect.FileDescriptor
 
 const file_comlink_v1_psync_proto_rawDesc = "" +
 	"\n" +
 	"\x16comlink/v1/psync.proto\x12\n" +
-	"comlink.v1\"4\n" +
+	"comlink.v1\x1a\x18comlink/v1/comlink.proto\"4\n" +
 	"\tMaskState\x12'\n" +
-	"\x0fmasked_replicas\x18\x01 \x03(\fR\x0emaskedReplicasBAZ?github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1b\x06proto3"
+	"\x0fmasked_replicas\x18\x01 \x03(\fR\x0emaskedReplicas\"s\n" +
+	"\x12LostMessageRequest\x12<\n" +
+	"\x0emissing_sender\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\rmissingSender\x12\x1f\n" +
+	"\vmissing_seq\x18\x02 \x01(\x04R\n" +
+	"missingSeq\"\x9e\x01\n" +
+	"\fPsyncMessage\x122\n" +
+	"\benvelope\x18\x01 \x01(\v2\x14.comlink.v1.EnvelopeH\x00R\benvelope\x12R\n" +
+	"\x14lost_message_request\x18\x02 \x01(\v2\x1e.comlink.v1.LostMessageRequestH\x00R\x12lostMessageRequestB\x06\n" +
+	"\x04bodyBAZ?github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1b\x06proto3"
 
 var (
 	file_comlink_v1_psync_proto_rawDescOnce sync.Once
@@ -113,16 +273,23 @@ func file_comlink_v1_psync_proto_rawDescGZIP() []byte {
 	return file_comlink_v1_psync_proto_rawDescData
 }
 
-var file_comlink_v1_psync_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_comlink_v1_psync_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_comlink_v1_psync_proto_goTypes = []any{
-	(*MaskState)(nil), // 0: comlink.v1.MaskState
+	(*MaskState)(nil),          // 0: comlink.v1.MaskState
+	(*LostMessageRequest)(nil), // 1: comlink.v1.LostMessageRequest
+	(*PsyncMessage)(nil),       // 2: comlink.v1.PsyncMessage
+	(*ReplicaID)(nil),          // 3: comlink.v1.ReplicaID
+	(*Envelope)(nil),           // 4: comlink.v1.Envelope
 }
 var file_comlink_v1_psync_proto_depIdxs = []int32{
-	0, // [0:0] is the sub-list for method output_type
-	0, // [0:0] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	3, // 0: comlink.v1.LostMessageRequest.missing_sender:type_name -> comlink.v1.ReplicaID
+	4, // 1: comlink.v1.PsyncMessage.envelope:type_name -> comlink.v1.Envelope
+	1, // 2: comlink.v1.PsyncMessage.lost_message_request:type_name -> comlink.v1.LostMessageRequest
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_comlink_v1_psync_proto_init() }
@@ -130,13 +297,18 @@ func file_comlink_v1_psync_proto_init() {
 	if File_comlink_v1_psync_proto != nil {
 		return
 	}
+	file_comlink_v1_comlink_proto_init()
+	file_comlink_v1_psync_proto_msgTypes[2].OneofWrappers = []any{
+		(*PsyncMessage_Envelope)(nil),
+		(*PsyncMessage_LostMessageRequest)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_comlink_v1_psync_proto_rawDesc), len(file_comlink_v1_psync_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   1,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
