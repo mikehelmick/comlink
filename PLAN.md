@@ -319,20 +319,125 @@ Plus the additional scenario tests:
 - **Benchmark:** checkpointing overhead at varying op rates and checkpoint intervals (paper Table 4 — track our equivalent).
 **Artifacts:** `recovery/` package, `trim/` package, segmented `log/` impl, tests, benchmark.
 
-### Phase 5 — Composition / public API
-**Scope:** `stack` package: a small composition struct that wires Psync + chosen Order + FailureDetection + Membership + Recovery into a working substrate. Public `StateMachine` interface for application code (`Apply(cmd) -> result`, `Snapshot()`, `Restore(snapshot)`). Configuration knobs (which order protocol, checkpoint interval, heartbeat interval, etc.).
+### Phase 5 — Public API: Cluster + Substrates
 
-**`StateMachine` contract documented for application authors (paper §2.1):**
-- `Apply` MUST be **deterministic**: given the same prior state and the same command, it produces the same result and the same new state, on every replica, every time. No reading wall-clock time, no random numbers from non-seeded sources, no map iteration order leaking into outputs, no non-deterministic side effects. The library cannot enforce this; violating it breaks the replication.
-- `Apply` MUST be **atomic with respect to other commands**: while one `Apply` is in progress on a replica, no other `Apply` runs against the same state. The library serializes `Apply` calls per replica (single GenServer goroutine) — the contract is the application must not leak partial state out of the function (e.g. into a global) where another goroutine could observe it.
-- `Snapshot` MUST capture all state needed to deterministically restore via `Restore`; nothing else `Apply` reads can be hidden in non-snapshotted state.
-- The contract is documented at the `StateMachine` interface godoc and validated in tests with at least one example of each violation producing a divergent-replica error rather than silent corruption.
+The public API for building distributed systems on the substrate.
+Two-layer architecture decided in collaborative design pass:
+
+- **Cluster** is one node's handle to the deployed group. Owns a
+  built-in *system conversation* (well-known ConversationID
+  derived from ClusterID) whose membership IS the cluster
+  membership. Cluster admin operations (VoteIn/VoteOut, learning
+  cluster members) all go through the system conv.
+- **Substrate** is one node's handle to a specific application's
+  state machine. Substrates are created via Cluster.NewSubstrate;
+  each runs on its own ConversationID with a member set that is a
+  subset of the cluster's. One node hosts many Substrates over
+  one shared transport.
+
+**Cluster identity & bootstrap:**
+- `ClusterID` is generated once at cluster creation and persisted
+  to stable.Storage. Subsequent startups load it.
+- `Bootstrap.Force = true` is REQUIRED to mint a fresh ClusterID;
+  default behavior assumes "join existing cluster." Operator
+  error preventing accidental cluster fragmentation.
+- gRPC connection handshake exchanges ClusterID via interceptors;
+  mismatch → reject the connection. Prevents two clusters with
+  overlapping ConversationIDs from accidentally merging.
+
+**Sponsors (TransportConfig.Sponsors):**
+- A small map of `ReplicaID -> addr` for bootstrap routing; just
+  enough to make first contact with the cluster.
+- After bootstrap, full peer routing learned from VoteIn events
+  is persisted to stable.Storage so subsequent startups don't
+  need full sponsor lists, only enough to recover if persisted
+  state is lost.
+
+**StateMachine interface (collaborative design pass):**
+```go
+type StateMachine interface {
+    // Apply is invoked once per delivered command on this replica
+    // in the substrate's chosen ordering. MUST be deterministic
+    // and infallible — same prior state + same Message at every
+    // replica yields the same post-state. The app handles its own
+    // errors internally; substrate doesn't need a return value.
+    Apply(ctx context.Context, msg *Message)
+}
+
+type Message struct {
+    ID      *MessageID
+    Payload []byte
+    Sender  ReplicaID
+    Offset  uint64  // local log offset; pass to SetWatermark when
+                    // app has durably persisted state covering it
+    Wave    uint64
+}
+```
+
+App owns its own storage (no Snapshot/Restore on the SM); the
+existing `Substrate.SetWatermark(offset)` is the trim hook.
+
+**Configuration:**
+- Plain `Config` struct, idiomatic Go (no builder).
+- `env:"..."` tags on env-loadable fields via
+  `github.com/sethvargo/go-envconfig`. Helper:
+  `comlink.LoadConfigFromEnv(ctx) (Config, error)`.
+- TransportConfig is escape-hatch / config: takes either a
+  pre-built `transport.Network` (for tests) OR `Listen + Sponsors`
+  for production gRPC.
+
+**Security:**
+- Transport security delegated to the deployment layer
+  (Kubernetes service mesh + proxyless gRPC). Our gRPC stays
+  insecure at the transport level.
+- ClusterID handshake is the application-level identity check
+  preventing cluster cross-contamination.
+
+**Submit semantics:**
+- `Substrate.Submit(ctx, payload) error` blocks until applied
+  locally. No result return — apps embed correlation IDs in the
+  payload if they need request/response.
+
+**Now in scope (was deferred from earlier phases):**
+- Vector-clock reshape on VoteIn (PLAN §2.10.1) — load-bearing
+  for app substrates whose membership changes after creation.
+- Multi-conversation transport routing — one node, many
+  Substrates, one gRPC server. ConversationID added to wire
+  Frame for dispatch.
+- Persistent membership / routing state in stable.Storage.
+
+**Sub-commit plan (~12–14 commits):**
+- 5(a) ClusterID proto + generation + persistence + bootstrap discipline.
+- 5(b) Multi-conversation transport routing (ConversationID on Frame, dispatch).
+- 5(c) Vector-clock reshape on VoteIn (psync.Membership.AddSlot, in-graph reshape).
+- 5(d) Cluster scaffolding + system conversation wiring.
+- 5(e) System StateMachine (cluster membership / routing state).
+- 5(f) Cluster admin API (VoteIn/VoteOut/Members at cluster level).
+- 5(g) App Substrate via Cluster.NewSubstrate.
+- 5(h) Sponsors + bootstrap fallback.
+- 5(i) gRPC ClusterID handshake interceptor.
+- 5(j) Substrate.Submit + StateMachine wiring through chosen Order.
+- 5(k) envconfig integration + LoadConfigFromEnv helper.
+- 5(l) Determinism-violation detection test.
+- 5(m) End-to-end replicated-counter integration test on the public API.
 
 **Exit criterion:**
-- Mix-and-match config tests run cleanly (e.g. `Total` vs `SemOrder`; with/without `Recovery`).
-- Public API has a documented godoc surface; a new caller can build a replicated counter in under ~50 lines.
-- Determinism-violation test: a deliberately-broken `StateMachine` (one that calls `time.Now()` inside `Apply`) is detected by the test harness's cross-replica state comparison.
-**Artifacts:** `stack/` package, godoc, top-level `README.md` with quickstart.
+- A new replicated state machine can be built with the public API
+  in under ~80 lines of application code (Cluster + Substrate +
+  StateMachine impl).
+- Multi-conversation: one node can host two simultaneous
+  application substrates over one transport.
+- Bootstrap: Scenario X (founder Force=true, joiners pull
+  ClusterID via sponsors) and Scenario Y (live admin VoteIn pulls
+  in a new node) both work end-to-end.
+- Determinism-violation test: a SM that calls time.Now in Apply
+  is detected by the cross-replica state comparison.
+- Vector-clock reshape: a VoteIn during active traffic doesn't
+  break in-flight messages or cause divergent state.
+
+**Artifacts:** `comlink/` (new top-level package) — Cluster,
+Substrate, Config, StateMachine, Message, ClusterID/ConversationID/
+ReplicaID public types. Top-level `README.md` quickstart.
 
 ### Phase 6 — Demo apps
 **Scope:** the replicated directory from §3 of the paper (canonical example; exercises SemOrder commutativity via `delete`/`insert`/`update`). A second app — likely a replicated KV store with watch — to prove the substrate generalizes.
@@ -375,7 +480,7 @@ Plus the additional scenario tests:
 | 2 — Order (PartialOrder, Total, SemOrder)  | done        |
 | 3 — FailureDetection + Membership          | done (v1)   |
 | 4 — Recovery + Trim (HWM)                  | done (v1)   |
-| 5 — Composition / public API               | not started |
+| 5 — Public API: Cluster + Substrates       | in progress |
 | 6 — Demo apps                              | not started |
 
 Update this table as each phase moves through `in progress` and `done`.
