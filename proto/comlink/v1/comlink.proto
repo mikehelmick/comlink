@@ -36,6 +36,20 @@ message ConversationID {
   bytes value = 1;
 }
 
+// ClusterID identifies a comlink cluster (Phase 5 — PLAN §5).
+// Generated once at cluster bootstrap (Cluster created with
+// Bootstrap.Force = true), persisted to stable.Storage, and
+// exchanged at gRPC connection handshake to prevent two separate
+// clusters with overlapping ConversationIDs from accidentally
+// merging. Encoded as 16 random bytes (UUID-like).
+//
+// The system conversation's ConversationID is derived
+// deterministically from ClusterID so every node in the cluster
+// agrees on it without coordination — see comlink.SystemConversationID.
+message ClusterID {
+  bytes value = 1;
+}
+
 // ReplicaID uniquely identifies a participant (process / replica) in a
 // conversation. Stable across restarts of the same logical replica.
 message ReplicaID {

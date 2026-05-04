@@ -94,6 +94,60 @@ func (x *ConversationID) GetValue() []byte {
 	return nil
 }
 
+// ClusterID identifies a comlink cluster (Phase 5 — PLAN §5).
+// Generated once at cluster bootstrap (Cluster created with
+// Bootstrap.Force = true), persisted to stable.Storage, and
+// exchanged at gRPC connection handshake to prevent two separate
+// clusters with overlapping ConversationIDs from accidentally
+// merging. Encoded as 16 random bytes (UUID-like).
+//
+// The system conversation's ConversationID is derived
+// deterministically from ClusterID so every node in the cluster
+// agrees on it without coordination — see comlink.SystemConversationID.
+type ClusterID struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Value         []byte                 `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ClusterID) Reset() {
+	*x = ClusterID{}
+	mi := &file_comlink_v1_comlink_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClusterID) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClusterID) ProtoMessage() {}
+
+func (x *ClusterID) ProtoReflect() protoreflect.Message {
+	mi := &file_comlink_v1_comlink_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClusterID.ProtoReflect.Descriptor instead.
+func (*ClusterID) Descriptor() ([]byte, []int) {
+	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *ClusterID) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
 // ReplicaID uniquely identifies a participant (process / replica) in a
 // conversation. Stable across restarts of the same logical replica.
 type ReplicaID struct {
@@ -105,7 +159,7 @@ type ReplicaID struct {
 
 func (x *ReplicaID) Reset() {
 	*x = ReplicaID{}
-	mi := &file_comlink_v1_comlink_proto_msgTypes[1]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -117,7 +171,7 @@ func (x *ReplicaID) String() string {
 func (*ReplicaID) ProtoMessage() {}
 
 func (x *ReplicaID) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_comlink_proto_msgTypes[1]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -130,7 +184,7 @@ func (x *ReplicaID) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicaID.ProtoReflect.Descriptor instead.
 func (*ReplicaID) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{1}
+	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *ReplicaID) GetValue() []byte {
@@ -195,7 +249,7 @@ type MessageID struct {
 
 func (x *MessageID) Reset() {
 	*x = MessageID{}
-	mi := &file_comlink_v1_comlink_proto_msgTypes[2]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -207,7 +261,7 @@ func (x *MessageID) String() string {
 func (*MessageID) ProtoMessage() {}
 
 func (x *MessageID) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_comlink_proto_msgTypes[2]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -220,7 +274,7 @@ func (x *MessageID) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MessageID.ProtoReflect.Descriptor instead.
 func (*MessageID) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{2}
+	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *MessageID) GetConversationId() *ConversationID {
@@ -257,7 +311,7 @@ type Envelope struct {
 
 func (x *Envelope) Reset() {
 	*x = Envelope{}
-	mi := &file_comlink_v1_comlink_proto_msgTypes[3]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -269,7 +323,7 @@ func (x *Envelope) String() string {
 func (*Envelope) ProtoMessage() {}
 
 func (x *Envelope) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_comlink_proto_msgTypes[3]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -282,7 +336,7 @@ func (x *Envelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Envelope.ProtoReflect.Descriptor instead.
 func (*Envelope) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{3}
+	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *Envelope) GetId() *MessageID {
@@ -310,7 +364,7 @@ type Hello struct {
 
 func (x *Hello) Reset() {
 	*x = Hello{}
-	mi := &file_comlink_v1_comlink_proto_msgTypes[4]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -322,7 +376,7 @@ func (x *Hello) String() string {
 func (*Hello) ProtoMessage() {}
 
 func (x *Hello) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_comlink_proto_msgTypes[4]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -335,7 +389,7 @@ func (x *Hello) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Hello.ProtoReflect.Descriptor instead.
 func (*Hello) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{4}
+	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *Hello) GetText() string {
@@ -352,6 +406,8 @@ const file_comlink_v1_comlink_proto_rawDesc = "" +
 	"\x18comlink/v1/comlink.proto\x12\n" +
 	"comlink.v1\"&\n" +
 	"\x0eConversationID\x12\x14\n" +
+	"\x05value\x18\x01 \x01(\fR\x05value\"!\n" +
+	"\tClusterID\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\fR\x05value\"!\n" +
 	"\tReplicaID\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\fR\x05value\"\xa2\x01\n" +
@@ -377,18 +433,19 @@ func file_comlink_v1_comlink_proto_rawDescGZIP() []byte {
 	return file_comlink_v1_comlink_proto_rawDescData
 }
 
-var file_comlink_v1_comlink_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_comlink_v1_comlink_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_comlink_v1_comlink_proto_goTypes = []any{
 	(*ConversationID)(nil), // 0: comlink.v1.ConversationID
-	(*ReplicaID)(nil),      // 1: comlink.v1.ReplicaID
-	(*MessageID)(nil),      // 2: comlink.v1.MessageID
-	(*Envelope)(nil),       // 3: comlink.v1.Envelope
-	(*Hello)(nil),          // 4: comlink.v1.Hello
+	(*ClusterID)(nil),      // 1: comlink.v1.ClusterID
+	(*ReplicaID)(nil),      // 2: comlink.v1.ReplicaID
+	(*MessageID)(nil),      // 3: comlink.v1.MessageID
+	(*Envelope)(nil),       // 4: comlink.v1.Envelope
+	(*Hello)(nil),          // 5: comlink.v1.Hello
 }
 var file_comlink_v1_comlink_proto_depIdxs = []int32{
 	0, // 0: comlink.v1.MessageID.conversation_id:type_name -> comlink.v1.ConversationID
-	1, // 1: comlink.v1.MessageID.sender:type_name -> comlink.v1.ReplicaID
-	2, // 2: comlink.v1.Envelope.id:type_name -> comlink.v1.MessageID
+	2, // 1: comlink.v1.MessageID.sender:type_name -> comlink.v1.ReplicaID
+	3, // 2: comlink.v1.Envelope.id:type_name -> comlink.v1.MessageID
 	3, // [3:3] is the sub-list for method output_type
 	3, // [3:3] is the sub-list for method input_type
 	3, // [3:3] is the sub-list for extension type_name
@@ -407,7 +464,7 @@ func file_comlink_v1_comlink_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_comlink_v1_comlink_proto_rawDesc), len(file_comlink_v1_comlink_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   5,
+			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
