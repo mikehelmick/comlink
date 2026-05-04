@@ -28,6 +28,18 @@ message Frame {
   bytes payload = 2;
 }
 
+// MultiplexFrame is the inner wrapper used by transport.Multiplex
+// (Phase 5(b)) to host multiple conversations on one underlying
+// transport. Multiplex.Send wraps the caller's payload with the
+// owning conversation_id; the receiving Multiplex decodes and
+// routes the inner payload to the matching per-conversation
+// Recv channel. The conversation_id is OPAQUE to the transport —
+// we re-use the comlink ConversationID type for type-safety.
+message MultiplexFrame {
+  ConversationID conversation_id = 1;
+  bytes payload = 2;
+}
+
 // SendAck is the response to a Frame send. Currently empty; reserved
 // for future per-message protocol negotiation.
 message SendAck {}
