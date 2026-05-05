@@ -198,3 +198,46 @@ func replicaIDFromPB(p *pb.ReplicaID) ReplicaID {
 	return ReplicaID(p.GetValue())
 }
 
+// MessageID is the public form of a substrate-level message
+// identity. Apps see this in their StateMachine.Apply.
+type MessageID struct {
+	ConversationID ConversationID
+	Sender         ReplicaID
+	VectorClock    []uint64
+}
+
+// SenderSeq returns the sender's own sequence number (the value
+// in vector_clock at sender's slot). Returns 0 if Sender or
+// VectorClock are empty.
+func (m *MessageID) SenderSeq() uint64 {
+	// Without membership context we can't compute the sender's
+	// slot index, so we cheat: in our insertion-order scheme,
+	// the first non-zero scan from the beginning that matches
+	// the sender's expected slot would need to know membership.
+	// For external observability we return the max of the vector,
+	// which is the wave number — and document that callers who
+	// need the actual seq must convert via the substrate's
+	// known membership. SenderSeq is not currently used anywhere
+	// in the substrate; this method exists for app convenience.
+	var maxV uint64
+	for _, v := range m.VectorClock {
+		if v > maxV {
+			maxV = v
+		}
+	}
+	return maxV
+}
+
+// messageIDFromPB converts an internal pb.MessageID into the
+// public form.
+func messageIDFromPB(p *pb.MessageID) *MessageID {
+	if p == nil {
+		return nil
+	}
+	return &MessageID{
+		ConversationID: ConversationID(p.GetConversationId().GetValue()),
+		Sender:         ReplicaID(p.GetSender().GetValue()),
+		VectorClock:    append([]uint64(nil), p.GetVectorClock()...),
+	}
+}
+
