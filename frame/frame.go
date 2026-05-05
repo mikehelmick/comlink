@@ -125,6 +125,18 @@ func MarshalVoteInNack(target *pb.ReplicaID) ([]byte, error) {
 	})
 }
 
+// MarshalMemberAdd is the commit-phase message broadcast by a
+// VoteIn proposer once it has collected quorum Acks. The
+// message's vector clock anchors the partial-order point at
+// which every replica grows its psync.Membership.
+func MarshalMemberAdd(target *pb.ReplicaID) ([]byte, error) {
+	return marshalMembership(&pb.MembershipEvent{
+		Event: &pb.MembershipEvent_MemberAdd{
+			MemberAdd: &pb.MemberAdd{Target: target},
+		},
+	})
+}
+
 func marshalMembership(ev *pb.MembershipEvent) ([]byte, error) {
 	return proto.Marshal(&pb.ConvFrame{
 		Body: &pb.ConvFrame_Membership{Membership: ev},
@@ -144,13 +156,15 @@ type Decoded struct {
 	VoteIn      *pb.VoteIn
 	VoteInAck   *pb.VoteInAck
 	VoteInNack  *pb.VoteInNack
+	MemberAdd   *pb.MemberAdd
 }
 
 // HasMembership reports whether any membership event variant is set.
 func (d Decoded) HasMembership() bool {
 	return d.SuspectDown != nil ||
 		d.VoteOut != nil || d.VoteOutAck != nil || d.VoteOutNack != nil ||
-		d.VoteIn != nil || d.VoteInAck != nil || d.VoteInNack != nil
+		d.VoteIn != nil || d.VoteInAck != nil || d.VoteInNack != nil ||
+		d.MemberAdd != nil
 }
 
 // IsApp reports whether the decoded frame carries application data.
@@ -202,6 +216,8 @@ func decodeMembership(ev *pb.MembershipEvent) Decoded {
 		return Decoded{VoteInAck: e.VoteInAck}
 	case *pb.MembershipEvent_VoteInNack:
 		return Decoded{VoteInNack: e.VoteInNack}
+	case *pb.MembershipEvent_MemberAdd:
+		return Decoded{MemberAdd: e.MemberAdd}
 	default:
 		return Decoded{}
 	}

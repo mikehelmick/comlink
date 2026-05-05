@@ -154,6 +154,7 @@ type waveCompleteRequest struct{ wave uint64 }
 type messagesInWaveRequest struct{ wave uint64 }
 type stableMessageIDsRequest struct{}
 type freezeMemberRequest struct{ replica *pb.ReplicaID }
+type addMemberRequest struct{ replica *pb.ReplicaID }
 
 func (sendRequest) isRequest()             {}
 func (incomingRequest) isRequest()         {}
@@ -163,6 +164,7 @@ func (waveCompleteRequest) isRequest()     {}
 func (messagesInWaveRequest) isRequest()   {}
 func (stableMessageIDsRequest) isRequest() {}
 func (freezeMemberRequest) isRequest()     {}
+func (addMemberRequest) isRequest()        {}
 
 type response interface{ isResponse() }
 
@@ -183,6 +185,10 @@ type stableMessageIDsResponse struct {
 	ids []*pb.MessageID
 }
 type freezeMemberResponse struct{ err error }
+type addMemberResponse struct {
+	slot int
+	err  error
+}
 type emptyResponse struct{}
 
 func (sendResponse) isResponse()             {}
@@ -192,6 +198,7 @@ func (waveCompleteResponse) isResponse()     {}
 func (messagesInWaveResponse) isResponse()   {}
 func (stableMessageIDsResponse) isResponse() {}
 func (freezeMemberResponse) isResponse()     {}
+func (addMemberResponse) isResponse()        {}
 func (emptyResponse) isResponse()            {}
 
 // serverImpl is the immutable handler that implements
@@ -265,6 +272,9 @@ func (s *serverImpl) HandleCall(req request, st *state) (response, *state) {
 	case freezeMemberRequest:
 		err := s.membership.Freeze(r.replica)
 		return freezeMemberResponse{err: err}, st
+	case addMemberRequest:
+		slot, err := s.membership.Add(r.replica)
+		return addMemberResponse{slot: slot, err: err}, st
 	default:
 		return emptyResponse{}, st
 	}
@@ -470,6 +480,19 @@ func (c *Conversation) StableMessageIDs() []*pb.MessageID {
 func (c *Conversation) FreezeMember(replica *pb.ReplicaID) error {
 	resp := c.srv.Call(freezeMemberRequest{replica: replica})
 	return resp.(freezeMemberResponse).err
+}
+
+// AddMember appends replica to the underlying Membership at a
+// new slot (PLAN §2.10.1 — insertion order, always at the end).
+// Returns the new slot index. Used by membership.Manager when a
+// VoteIn's MemberAdd commit is processed.
+//
+// Vectors of in-flight messages from before this Add are
+// shorter than the new shape; psync's vector helpers handle
+// them via lazy zero-padding at the end.
+func (c *Conversation) AddMember(replica *pb.ReplicaID) (int, error) {
+	resp := c.srv.Call(addMemberRequest{replica: replica}).(addMemberResponse)
+	return resp.slot, resp.err
 }
 
 // Close stops the conversation. Idempotent.

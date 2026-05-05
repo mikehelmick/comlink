@@ -19,7 +19,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"sync"
 
 	"github.com/mikehelmick/comlink/frame"
@@ -41,13 +40,16 @@ var (
 	ErrVoteInInProgress = errors.New("membership: VoteIn already in progress for target")
 )
 
-// voteInSession tracks an in-flight VoteIn.
+// voteInSession tracks an in-flight VoteIn (initiator-side
+// state). Two-phase: collect quorum Ack on VoteIn, then broadcast
+// MemberAdd as the commit/anchor point.
 type voteInSession struct {
 	target         *pb.ReplicaID
 	addr           string
 	membersAtStart []*pb.ReplicaID
 	ackedBy        map[string]struct{}
 	nackedBy       map[string]struct{}
+	committed      bool // true once we've broadcast MemberAdd
 	done           sync.Once
 	err            error
 	completed      chan struct{}
@@ -161,8 +163,10 @@ func (m *Manager) cancelVoteInSession(target *pb.ReplicaID, err error) {
 	})
 }
 
-// checkVoteInDecision evaluates session and acts if a decision
-// can be made.
+// checkVoteInDecision evaluates the proposer-side session.
+// Two-phase: when quorum Acks land with no Nacks, broadcast a
+// MemberAdd commit message. Local apply happens via the pump
+// when MemberAdd arrives back at us as a self-delivery.
 func (m *Manager) checkVoteInDecision(session *voteInSession) {
 	session.mu.Lock()
 	if len(session.nackedBy) > 0 {
@@ -170,48 +174,76 @@ func (m *Manager) checkVoteInDecision(session *voteInSession) {
 		m.cancelVoteInSession(session.target, ErrVoteInNacked)
 		return
 	}
+	if session.committed {
+		session.mu.Unlock()
+		return
+	}
 	// Voter set is membersAtStart (target was NOT in ML at session
-	// creation, so all current members are voters).
+	// creation, so all current members are voters). Initiator's
+	// implicit Ack is already in ackedBy; we count it.
 	voterCount := len(session.membersAtStart)
 	needed := voterCount/2 + 1
 	if needed < 1 {
 		needed = 1
 	}
 	ackCount := len(session.ackedBy)
-	session.mu.Unlock()
 	if ackCount < needed {
+		session.mu.Unlock()
 		return
 	}
+	session.committed = true
+	target := session.target
+	session.mu.Unlock()
 
-	// Decision: accepted. Apply addition locally.
-	m.mu.Lock()
-	delete(m.voteInSessions, string(session.target.GetValue()))
-	m.addToMLLocked(session.target)
-	m.mu.Unlock()
-
-	// Notify FailureDetector to start tracking target. The
-	// Detector exposes RemoveMember; we'd want a symmetric AddMember
-	// to add it back. Phase 3(f) note: not yet implemented in
-	// failure.Detector — sketched here so callers can opt in via
-	// a separate Detector AddMember call when that lands.
-	m.notifyAdded(session.target, session.addr)
-
-	session.done.Do(func() {
-		session.err = nil
-		close(session.completed)
-	})
+	// Quorum reached. Broadcast MemberAdd. The commit signal
+	// (session.completed) fires when our own pump applies the
+	// MemberAdd via handleMemberAdd.
+	bs, err := frame.MarshalMemberAdd(target)
+	if err != nil {
+		m.cancelVoteInSession(target, fmt.Errorf("marshal MemberAdd: %w", err))
+		return
+	}
+	go m.asyncSend(bs, "MemberAdd")
 }
 
-// addToMLLocked inserts target into membershipList at its sorted
-// position. Caller must hold m.mu. The list stays sorted by
-// ReplicaID byte order to match psync.Membership ordering.
+// applyMemberAdd is invoked when handleMemberAdd processes a
+// MemberAdd for `target`. It performs the local reshape and
+// completes any matching session.
+func (m *Manager) applyMemberAdd(target *pb.ReplicaID, addr string) {
+	m.mu.Lock()
+	if m.isMemberLocked(target) {
+		// Already added — duplicate MemberAdd, no-op.
+		m.mu.Unlock()
+		return
+	}
+	session := m.voteInSessions[string(target.GetValue())]
+	if session != nil {
+		delete(m.voteInSessions, string(target.GetValue()))
+	}
+	m.addToMLLocked(target)
+	m.mu.Unlock()
+
+	// Grow the underlying psync.Membership at the new slot.
+	if _, err := m.conv.AddMember(target); err != nil {
+		m.logger.Warn("membership: psync.AddMember failed",
+			"target", fmt.Sprintf("%x", target.GetValue()), "err", err)
+	}
+
+	m.notifyAdded(target, addr)
+
+	if session != nil {
+		session.done.Do(func() {
+			session.err = nil
+			close(session.completed)
+		})
+	}
+}
+
+// addToMLLocked appends target to membershipList at the end
+// (insertion-order, matching psync.Membership.Add per PLAN
+// §2.10.1). Caller must hold m.mu.
 func (m *Manager) addToMLLocked(target *pb.ReplicaID) {
-	out := append([]*pb.ReplicaID{}, m.membershipList...)
-	out = append(out, proto.Clone(target).(*pb.ReplicaID))
-	sort.Slice(out, func(i, j int) bool {
-		return bytes.Compare(out[i].GetValue(), out[j].GetValue()) < 0
-	})
-	m.membershipList = out
+	m.membershipList = append(m.membershipList, proto.Clone(target).(*pb.ReplicaID))
 }
 
 // notifyAdded emits an Added event for downstream layers to wire
@@ -225,9 +257,12 @@ func (m *Manager) notifyAdded(target *pb.ReplicaID, addr string) {
 
 // ─── receive-side handlers ────────────────────────────────────────
 
-// handleVoteIn responds to a peer's VoteIn proposal. Default
-// policy: Ack iff target is not already in our ML. Application-
-// specific policy hooks can come in a later commit.
+// handleVoteIn responds to a peer's VoteIn proposal (Phase A:
+// quorum gate). Default policy: Ack iff target is not already a
+// member. Receivers don't track session state — the proposer
+// owns the session and broadcasts MemberAdd once quorum is
+// reached. Receivers apply the addition when MemberAdd arrives
+// (handleMemberAdd).
 func (m *Manager) handleVoteIn(req *pb.VoteIn, sender *pb.ReplicaID) {
 	target := req.GetTarget()
 	if target == nil {
@@ -239,34 +274,42 @@ func (m *Manager) handleVoteIn(req *pb.VoteIn, sender *pb.ReplicaID) {
 		return
 	}
 	if bytes.Equal(target.GetValue(), m.cfg.Self.GetValue()) {
-		// Someone is voting US in. We're already a member; this
-		// is contradictory. Ignore.
+		// Someone is voting US in. We're already a member; ignore.
 		return
 	}
-
 	m.mu.Lock()
 	alreadyMember := m.isMemberLocked(target)
+	m.mu.Unlock()
 	if alreadyMember {
-		m.mu.Unlock()
 		// Already a member; the addition is a no-op. Acknowledge
-		// so the vote can proceed (and the initiator can clean up).
+		// so the proposer can clean up.
 		m.sendVoteInAck(target)
 		return
 	}
-	session, exists := m.voteInSessions[string(target.GetValue())]
-	if !exists {
-		session = newVoteInSession(target, req.GetAddr(), m.membershipList)
-		m.voteInSessions[string(target.GetValue())] = session
-	}
-	session.mu.Lock()
-	session.ackedBy[string(sender.GetValue())] = struct{}{}
 	// Default policy: Ack.
-	session.ackedBy[string(m.cfg.Self.GetValue())] = struct{}{}
-	session.mu.Unlock()
-	m.mu.Unlock()
-
 	m.sendVoteInAck(target)
-	m.checkVoteInDecision(session)
+}
+
+// handleMemberAdd is the commit-phase receiver: applies the
+// reshape locally. PLAN §2.10.1 — MemberAdd's vector clock
+// anchors the partial-order point at which the slot grows.
+func (m *Manager) handleMemberAdd(req *pb.MemberAdd, sender *pb.ReplicaID) {
+	target := req.GetTarget()
+	if target == nil {
+		return
+	}
+	if bytes.Equal(target.GetValue(), m.cfg.Self.GetValue()) {
+		// Someone is announcing our addition. We're already a
+		// member; ignore.
+		return
+	}
+	// Sender is the proposer; their addr was originally in the
+	// VoteIn. We don't track that here — we just apply the
+	// addition. (notifyAdded is best-effort logging; callers
+	// who need the addr should subscribe to a future events
+	// channel.)
+	m.applyMemberAdd(target, "")
+	_ = sender
 }
 
 func (m *Manager) handleVoteInAck(ack *pb.VoteInAck, sender *pb.ReplicaID) {

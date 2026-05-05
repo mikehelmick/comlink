@@ -96,6 +96,7 @@ message MembershipEvent {
     VoteIn vote_in = 6;
     VoteInAck vote_in_ack = 7;
     VoteInNack vote_in_nack = 8;
+    MemberAdd member_add = 10;
   }
 }
 
@@ -143,5 +144,20 @@ message VoteInAck {
 // VoteInNack signals the sender disagrees with adding `target`
 // (e.g. policy violation, conflict).
 message VoteInNack {
+  ReplicaID target = 1;
+}
+
+// MemberAdd is the COMMIT phase of VoteIn (PLAN §2.10.1, design
+// pass): once the proposer has collected quorum VoteInAcks with
+// no VoteInNacks, it broadcasts MemberAdd as the partial-order
+// anchor at which every replica grows its psync.Membership by
+// one slot for `target`.
+//
+// Late-arriving replicas catch up via the standard lost-message
+// protocol — MemberAdd's vector clock places it in the causal
+// chain, so any post-reshape message the late replica receives
+// will reference MemberAdd as a missing predecessor and pull it
+// in.
+message MemberAdd {
   ReplicaID target = 1;
 }

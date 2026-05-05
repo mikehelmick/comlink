@@ -292,6 +292,7 @@ type MembershipEvent struct {
 	//	*MembershipEvent_VoteIn
 	//	*MembershipEvent_VoteInAck
 	//	*MembershipEvent_VoteInNack
+	//	*MembershipEvent_MemberAdd
 	Event         isMembershipEvent_Event `protobuf_oneof:"event"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -397,6 +398,15 @@ func (x *MembershipEvent) GetVoteInNack() *VoteInNack {
 	return nil
 }
 
+func (x *MembershipEvent) GetMemberAdd() *MemberAdd {
+	if x != nil {
+		if x, ok := x.Event.(*MembershipEvent_MemberAdd); ok {
+			return x.MemberAdd
+		}
+	}
+	return nil
+}
+
 type isMembershipEvent_Event interface {
 	isMembershipEvent_Event()
 }
@@ -429,6 +439,10 @@ type MembershipEvent_VoteInNack struct {
 	VoteInNack *VoteInNack `protobuf:"bytes,8,opt,name=vote_in_nack,json=voteInNack,proto3,oneof"`
 }
 
+type MembershipEvent_MemberAdd struct {
+	MemberAdd *MemberAdd `protobuf:"bytes,10,opt,name=member_add,json=memberAdd,proto3,oneof"`
+}
+
 func (*MembershipEvent_SuspectDown) isMembershipEvent_Event() {}
 
 func (*MembershipEvent_VoteOut) isMembershipEvent_Event() {}
@@ -442,6 +456,8 @@ func (*MembershipEvent_VoteIn) isMembershipEvent_Event() {}
 func (*MembershipEvent_VoteInAck) isMembershipEvent_Event() {}
 
 func (*MembershipEvent_VoteInNack) isMembershipEvent_Event() {}
+
+func (*MembershipEvent_MemberAdd) isMembershipEvent_Event() {}
 
 // SuspectDown is informational: the sender's FailureDetector has
 // flagged `suspect` as silent. Receivers update their local
@@ -777,6 +793,61 @@ func (x *VoteInNack) GetTarget() *ReplicaID {
 	return nil
 }
 
+// MemberAdd is the COMMIT phase of VoteIn (PLAN §2.10.1, design
+// pass): once the proposer has collected quorum VoteInAcks with
+// no VoteInNacks, it broadcasts MemberAdd as the partial-order
+// anchor at which every replica grows its psync.Membership by
+// one slot for `target`.
+//
+// Late-arriving replicas catch up via the standard lost-message
+// protocol — MemberAdd's vector clock places it in the causal
+// chain, so any post-reshape message the late replica receives
+// will reference MemberAdd as a missing predecessor and pull it
+// in.
+type MemberAdd struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Target        *ReplicaID             `protobuf:"bytes,1,opt,name=target,proto3" json:"target,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MemberAdd) Reset() {
+	*x = MemberAdd{}
+	mi := &file_comlink_v1_substrate_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MemberAdd) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MemberAdd) ProtoMessage() {}
+
+func (x *MemberAdd) ProtoReflect() protoreflect.Message {
+	mi := &file_comlink_v1_substrate_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MemberAdd.ProtoReflect.Descriptor instead.
+func (*MemberAdd) Descriptor() ([]byte, []int) {
+	return file_comlink_v1_substrate_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *MemberAdd) GetTarget() *ReplicaID {
+	if x != nil {
+		return x.Target
+	}
+	return nil
+}
+
 var File_comlink_v1_substrate_proto protoreflect.FileDescriptor
 
 const file_comlink_v1_substrate_proto_rawDesc = "" +
@@ -793,7 +864,7 @@ const file_comlink_v1_substrate_proto_rawDesc = "" +
 	"\x04body\"#\n" +
 	"\tWatermark\x12\x16\n" +
 	"\x06offset\x18\x01 \x01(\x04R\x06offset\"\v\n" +
-	"\tHeartbeat\"\xb5\x03\n" +
+	"\tHeartbeat\"\xed\x03\n" +
 	"\x0fMembershipEvent\x12<\n" +
 	"\fsuspect_down\x18\x01 \x01(\v2\x17.comlink.v1.SuspectDownH\x00R\vsuspectDown\x120\n" +
 	"\bvote_out\x18\x03 \x01(\v2\x13.comlink.v1.VoteOutH\x00R\avoteOut\x12:\n" +
@@ -803,7 +874,10 @@ const file_comlink_v1_substrate_proto_rawDesc = "" +
 	"\avote_in\x18\x06 \x01(\v2\x12.comlink.v1.VoteInH\x00R\x06voteIn\x127\n" +
 	"\vvote_in_ack\x18\a \x01(\v2\x15.comlink.v1.VoteInAckH\x00R\tvoteInAck\x12:\n" +
 	"\fvote_in_nack\x18\b \x01(\v2\x16.comlink.v1.VoteInNackH\x00R\n" +
-	"voteInNackB\a\n" +
+	"voteInNack\x126\n" +
+	"\n" +
+	"member_add\x18\n" +
+	" \x01(\v2\x15.comlink.v1.MemberAddH\x00R\tmemberAddB\a\n" +
 	"\x05eventJ\x04\b\x02\x10\x03J\x04\b\t\x10\n" +
 	"\">\n" +
 	"\vSuspectDown\x12/\n" +
@@ -822,6 +896,8 @@ const file_comlink_v1_substrate_proto_rawDesc = "" +
 	"\x06target\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\x06target\";\n" +
 	"\n" +
 	"VoteInNack\x12-\n" +
+	"\x06target\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\x06target\":\n" +
+	"\tMemberAdd\x12-\n" +
 	"\x06target\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\x06targetBAZ?github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1b\x06proto3"
 
 var (
@@ -836,7 +912,7 @@ func file_comlink_v1_substrate_proto_rawDescGZIP() []byte {
 	return file_comlink_v1_substrate_proto_rawDescData
 }
 
-var file_comlink_v1_substrate_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_comlink_v1_substrate_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_comlink_v1_substrate_proto_goTypes = []any{
 	(*ConvFrame)(nil),       // 0: comlink.v1.ConvFrame
 	(*Watermark)(nil),       // 1: comlink.v1.Watermark
@@ -849,7 +925,8 @@ var file_comlink_v1_substrate_proto_goTypes = []any{
 	(*VoteIn)(nil),          // 8: comlink.v1.VoteIn
 	(*VoteInAck)(nil),       // 9: comlink.v1.VoteInAck
 	(*VoteInNack)(nil),      // 10: comlink.v1.VoteInNack
-	(*ReplicaID)(nil),       // 11: comlink.v1.ReplicaID
+	(*MemberAdd)(nil),       // 11: comlink.v1.MemberAdd
+	(*ReplicaID)(nil),       // 12: comlink.v1.ReplicaID
 }
 var file_comlink_v1_substrate_proto_depIdxs = []int32{
 	2,  // 0: comlink.v1.ConvFrame.heartbeat:type_name -> comlink.v1.Heartbeat
@@ -862,18 +939,20 @@ var file_comlink_v1_substrate_proto_depIdxs = []int32{
 	8,  // 7: comlink.v1.MembershipEvent.vote_in:type_name -> comlink.v1.VoteIn
 	9,  // 8: comlink.v1.MembershipEvent.vote_in_ack:type_name -> comlink.v1.VoteInAck
 	10, // 9: comlink.v1.MembershipEvent.vote_in_nack:type_name -> comlink.v1.VoteInNack
-	11, // 10: comlink.v1.SuspectDown.suspect:type_name -> comlink.v1.ReplicaID
-	11, // 11: comlink.v1.VoteOut.target:type_name -> comlink.v1.ReplicaID
-	11, // 12: comlink.v1.VoteOutAck.target:type_name -> comlink.v1.ReplicaID
-	11, // 13: comlink.v1.VoteOutNack.target:type_name -> comlink.v1.ReplicaID
-	11, // 14: comlink.v1.VoteIn.target:type_name -> comlink.v1.ReplicaID
-	11, // 15: comlink.v1.VoteInAck.target:type_name -> comlink.v1.ReplicaID
-	11, // 16: comlink.v1.VoteInNack.target:type_name -> comlink.v1.ReplicaID
-	17, // [17:17] is the sub-list for method output_type
-	17, // [17:17] is the sub-list for method input_type
-	17, // [17:17] is the sub-list for extension type_name
-	17, // [17:17] is the sub-list for extension extendee
-	0,  // [0:17] is the sub-list for field type_name
+	11, // 10: comlink.v1.MembershipEvent.member_add:type_name -> comlink.v1.MemberAdd
+	12, // 11: comlink.v1.SuspectDown.suspect:type_name -> comlink.v1.ReplicaID
+	12, // 12: comlink.v1.VoteOut.target:type_name -> comlink.v1.ReplicaID
+	12, // 13: comlink.v1.VoteOutAck.target:type_name -> comlink.v1.ReplicaID
+	12, // 14: comlink.v1.VoteOutNack.target:type_name -> comlink.v1.ReplicaID
+	12, // 15: comlink.v1.VoteIn.target:type_name -> comlink.v1.ReplicaID
+	12, // 16: comlink.v1.VoteInAck.target:type_name -> comlink.v1.ReplicaID
+	12, // 17: comlink.v1.VoteInNack.target:type_name -> comlink.v1.ReplicaID
+	12, // 18: comlink.v1.MemberAdd.target:type_name -> comlink.v1.ReplicaID
+	19, // [19:19] is the sub-list for method output_type
+	19, // [19:19] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_comlink_v1_substrate_proto_init() }
@@ -896,6 +975,7 @@ func file_comlink_v1_substrate_proto_init() {
 		(*MembershipEvent_VoteIn)(nil),
 		(*MembershipEvent_VoteInAck)(nil),
 		(*MembershipEvent_VoteInNack)(nil),
+		(*MembershipEvent_MemberAdd)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -903,7 +983,7 @@ func file_comlink_v1_substrate_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_comlink_v1_substrate_proto_rawDesc), len(file_comlink_v1_substrate_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

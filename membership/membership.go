@@ -398,6 +398,8 @@ func (m *Manager) dispatch(d psync.Delivery, dec frame.Decoded, sender *pb.Repli
 		m.handleVoteInAck(dec.VoteInAck, sender)
 	case dec.VoteInNack != nil:
 		m.handleVoteInNack(dec.VoteInNack, sender)
+	case dec.MemberAdd != nil:
+		m.handleMemberAdd(dec.MemberAdd, sender)
 	}
 }
 

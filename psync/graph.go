@@ -20,6 +20,7 @@ import (
 	"slices"
 
 	pb "github.com/mikehelmick/comlink/internal/pb/comlink/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // ErrMissingParents is returned by Graph.Insert when one or more
@@ -131,12 +132,22 @@ func (g *Graph) Lookup(sender []byte, seq uint64) *Node {
 // in the graph, ErrMissingParents is returned along with the list,
 // and the envelope is NOT inserted.
 //
-// If an envelope with the same (sender, sender_seq) is already
-// present, ErrAlreadyPresent is returned and the existing node is
-// returned alongside.
+// Vector length tolerance (PLAN §2.10.1):
+//   - Shorter than membership: lazy-pad with zero at higher slots
+//     (an "old-era" message that predates a MemberAdd).
+//   - Longer than membership: the message is from a future era
+//     (the sender has applied a MemberAdd we haven't). Insert
+//     returns ErrMissingParents requesting the sender's previous
+//     message; following that predecessor chain pulls in the
+//     MemberAdd via the standard lost-message protocol, after
+//     which our Membership grows and a re-Insert succeeds.
 //
-// Other errors (malformed envelope, sender not in membership) are
-// returned with no insertion.
+// Other errors:
+//   - ErrAlreadyPresent: an envelope with the same (sender,
+//     sender_seq) is already in the graph; the existing node is
+//     returned alongside.
+//   - ErrUnknownSender / ErrMalformedVector: structural problems
+//     with the envelope — no insertion.
 func (g *Graph) Insert(env *pb.Envelope) (*Node, []MissingParent, error) {
 	id := env.GetId()
 	if id == nil || id.GetSender() == nil {
@@ -147,8 +158,11 @@ func (g *Graph) Insert(env *pb.Envelope) (*Node, []MissingParent, error) {
 		return nil, nil, fmt.Errorf("%w: %x", ErrUnknownSender, id.GetSender().GetValue())
 	}
 	vc := id.GetVectorClock()
-	if len(vc) != g.membership.Len() {
-		return nil, nil, fmt.Errorf("%w: vector_clock has %d slots, membership has %d", ErrMalformedVector, len(vc), g.membership.Len())
+	memLen := g.membership.Len()
+	// senderSlot must be within the message's vector — otherwise
+	// we can't extract the sender's seq.
+	if senderSlot >= len(vc) {
+		return nil, nil, fmt.Errorf("%w: sender slot %d not in vector_clock (len %d)", ErrMalformedVector, senderSlot, len(vc))
 	}
 	senderSeq := vc[senderSlot]
 	if senderSeq == 0 {
@@ -160,14 +174,38 @@ func (g *Graph) Insert(env *pb.Envelope) (*Node, []MissingParent, error) {
 		return existing, nil, ErrAlreadyPresent
 	}
 
-	// Derive parents and detect missing.
-	parents := make([]*Node, 0, len(vc))
+	// Future-era message (vector longer than our membership): the
+	// sender has applied a MemberAdd we haven't. Return the
+	// sender's previous message as a missing parent — the
+	// predecessor chain leads back through the MemberAdd, which
+	// the lost-message protocol will pull in. Once we apply
+	// MemberAdd our membership grows and re-Insert succeeds with
+	// matching shape.
+	if len(vc) > memLen {
+		// Sender's prior message is the only synthetic predecessor
+		// we can name without knowing the future-slot replica IDs.
+		// If sender just started (senderSeq == 1), we cannot
+		// name any parent — bail with a malformed-vector error.
+		if senderSeq <= 1 {
+			return nil, nil, fmt.Errorf("%w: future-era message with no derivable predecessor", ErrMalformedVector)
+		}
+		return nil, []MissingParent{{
+			Sender: proto.Clone(id.GetSender()).(*pb.ReplicaID),
+			Seq:    senderSeq - 1,
+		}}, ErrMissingParents
+	}
+
+	// Derive parents and detect missing. We iterate up to memLen
+	// (lazy-padding any vector slots beyond vc with zero).
+	parents := make([]*Node, 0, memLen)
 	var missing []MissingParent
-	for i, depSeq := range vc {
+	for i := 0; i < memLen; i++ {
+		var depSeq uint64
+		if i < len(vc) {
+			depSeq = vc[i]
+		}
 		var requiredSeq uint64
 		if i == senderSlot {
-			// Sender's own predecessor is its prior message at
-			// senderSeq - 1, if there is one.
 			if senderSeq <= 1 {
 				continue
 			}

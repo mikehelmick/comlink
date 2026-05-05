@@ -185,13 +185,53 @@ func TestInsertUnknownSender(t *testing.T) {
 	}
 }
 
-func TestInsertVectorWrongLength(t *testing.T) {
+// TestInsertVectorShorterThanMembership: PLAN §2.10.1 lazy
+// padding — a shorter vector is treated as if zero-padded at
+// the end ("old-era" message that predates a MemberAdd). It
+// inserts cleanly.
+func TestInsertVectorShorterThanMembership(t *testing.T) {
 	g, alice, _ := twoReplicaGraph()
+	// 2-replica membership; vector length 1 (only alice's slot).
+	// alice's slot is 0; senderSeq = 1; bob's slot (1) is missing
+	// so lazy-pads to 0 (no parent reference).
 	_, _, err := g.Insert(envelope(alice, []uint64{1}))
-	if !errors.Is(err, psync.ErrMalformedVector) {
-		t.Fatalf("err = %v, want ErrMalformedVector", err)
+	if err != nil {
+		t.Fatalf("shorter vector should insert cleanly via lazy padding; got err = %v", err)
 	}
-	_, _, err = g.Insert(envelope(alice, []uint64{1, 0, 0}))
+}
+
+// TestInsertVectorLongerThanMembership: a longer vector
+// indicates a future-era message (sender has applied a MemberAdd
+// we haven't). Insert returns ErrMissingParents requesting the
+// sender's previous message — the lost-message protocol pulls
+// in MemberAdd through that chain.
+func TestInsertVectorLongerThanMembership(t *testing.T) {
+	g, alice, _ := twoReplicaGraph()
+	// First, insert alice's seq 1 with the current 2-replica shape.
+	if _, _, err := g.Insert(envelope(alice, []uint64{1, 0})); err != nil {
+		t.Fatal(err)
+	}
+	// Now alice sends seq 2 in a longer (3-slot) shape, indicating
+	// alice has applied a MemberAdd we haven't.
+	_, missing, err := g.Insert(envelope(alice, []uint64{2, 0, 0}))
+	if !errors.Is(err, psync.ErrMissingParents) {
+		t.Fatalf("err = %v, want ErrMissingParents", err)
+	}
+	// The synthetic missing parent is alice's seq 1 (sender's
+	// previous message); through that chain we'd discover the
+	// MemberAdd and grow our membership.
+	if len(missing) != 1 || missing[0].Seq != 1 {
+		t.Fatalf("missing = %v, want [{alice, 1}]", missing)
+	}
+}
+
+// TestInsertVectorLongerThanMembershipNoChain: a future-era
+// message from a sender with senderSeq=1 has no derivable
+// predecessor; this is malformed (the sender should have at
+// least sent the MemberAdd before this).
+func TestInsertVectorLongerThanMembershipNoChain(t *testing.T) {
+	g, alice, _ := twoReplicaGraph()
+	_, _, err := g.Insert(envelope(alice, []uint64{1, 0, 0}))
 	if !errors.Is(err, psync.ErrMalformedVector) {
 		t.Fatalf("err = %v, want ErrMalformedVector", err)
 	}
