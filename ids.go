@@ -21,6 +21,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+
+	pb "github.com/mikehelmick/comlink/internal/pb/comlink/v1"
 )
 
 // idLen is the canonical byte length for ClusterID, ReplicaID,
@@ -172,7 +174,27 @@ func (c *ConversationID) EnvDecode(val string) error {
 // ─── equality & comparison ───────────────────────────────────────
 
 // Equal reports whether a and b are the same id.
-func (c ClusterID) Equal(other ClusterID) bool      { return bytes.Equal(c, other) }
-func (r ReplicaID) Equal(other ReplicaID) bool      { return bytes.Equal(r, other) }
+func (c ClusterID) Equal(other ClusterID) bool           { return bytes.Equal(c, other) }
+func (r ReplicaID) Equal(other ReplicaID) bool           { return bytes.Equal(r, other) }
 func (c ConversationID) Equal(other ConversationID) bool { return bytes.Equal(c, other) }
+
+// ─── proto bridges (internal — used by comlink package code only) ───
+
+// toPB converts the public ID into its internal protobuf form for
+// use with the substrate's lower layers (psync, membership,
+// transport, etc.). Currently only ReplicaID and ConversationID
+// flow into the substrate; ClusterID stays at the public layer
+// (the gRPC handshake interceptor in Phase 5(i) will need its
+// pb form, at which point we re-add it).
+func (r ReplicaID) toPB() *pb.ReplicaID           { return &pb.ReplicaID{Value: r} }
+func (c ConversationID) toPB() *pb.ConversationID { return &pb.ConversationID{Value: c} }
+
+// replicaIDFromPB converts an internal protobuf ReplicaID back
+// to the public type.
+func replicaIDFromPB(p *pb.ReplicaID) ReplicaID {
+	if p == nil {
+		return nil
+	}
+	return ReplicaID(p.GetValue())
+}
 
