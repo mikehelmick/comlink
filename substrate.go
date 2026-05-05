@@ -21,8 +21,11 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/mikehelmick/comlink/clock"
+	"github.com/mikehelmick/comlink/failure"
+	"github.com/mikehelmick/comlink/frame"
 	pb "github.com/mikehelmick/comlink/internal/pb/comlink/v1"
 	clog "github.com/mikehelmick/comlink/log"
 	"github.com/mikehelmick/comlink/order"
@@ -122,6 +125,7 @@ type Substrate struct {
 	conv  *psync.Conversation
 	log   clog.MessageLog
 	ord   order.Order
+	hb    *failure.Detector // heartbeat-only; suspicion disabled
 	close func()
 
 	stopped   chan struct{}
@@ -219,8 +223,44 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 		appliedSelf:    make(map[indexKey]struct{}),
 	}
 	s.close = rollback
+
+	// Heartbeat-only failure.Detector: emits ConvFrame.heartbeat
+	// when this conversation has been quiet, advancing stability
+	// for the Order layer. Suspicion is disabled (interval set
+	// effectively-infinite, OnSuspect is no-op) — peer liveness
+	// is the system conv's responsibility, not this substrate's.
+	s.hb = failure.New(failure.Config{
+		Self:              c.cfg.Self.toPB(),
+		Members:           pbMembers,
+		Clock:             clk,
+		QuietInterval:     150 * time.Millisecond,
+		SuspicionInterval: 100 * 365 * 24 * time.Hour,
+		TickInterval:      25 * time.Millisecond,
+		SendHeartbeat:     s.sendHeartbeat,
+		OnSuspect:         func(*pb.ReplicaID) {},
+	})
+	cleanup = append(cleanup, func() { _ = s.hb.Close() })
+
 	go s.applyPump()
 	return s, nil
+}
+
+// sendHeartbeat emits a ConvFrame.heartbeat through the
+// conversation. Idempotent and quiet — used by the embedded
+// failure.Detector when no other traffic has flowed for
+// QuietInterval. Spawned in a goroutine to avoid blocking the
+// Detector's tick goroutine on conv.Send.
+func (s *Substrate) sendHeartbeat() {
+	go func() {
+		bs, err := frame.MarshalHeartbeat()
+		if err != nil {
+			return
+		}
+		_, err = s.conv.Send(bs)
+		if err == nil {
+			s.hb.NoteSent()
+		}
+	}()
 }
 
 func validateSubstrateConfig(cfg SubstrateConfig) error {
@@ -260,10 +300,15 @@ func buildOrder(conv *psync.Conversation, cfg SubstrateConfig) (order.Order, err
 // The same payload will be applied at every replica in the
 // substrate's chosen ordering — all replicas converge.
 func (s *Substrate) Submit(ctx context.Context, payload []byte) error {
-	id, err := s.conv.Send(payload)
+	wrapped, err := frame.MarshalApp(payload)
+	if err != nil {
+		return fmt.Errorf("comlink: Submit: wrap: %w", err)
+	}
+	id, err := s.conv.Send(wrapped)
 	if err != nil {
 		return fmt.Errorf("comlink: Submit: send: %w", err)
 	}
+	s.hb.NoteSent()
 	// Compute sender_seq from the returned MessageID + our known
 	// member list. Self's slot index is its position in cfg.Members.
 	selfSlot := -1
@@ -380,6 +425,25 @@ func (s *Substrate) handleApplied(ctx context.Context, applied order.Applied) {
 		return
 	}
 	sender := env.GetId().GetSender()
+	// Inform the heartbeat tracker we got a frame from this
+	// peer; idle peers' heartbeats reset the same NoteReceived
+	// path, advancing local quiet/suspicion timers.
+	s.hb.NoteReceived(sender)
+	// Decode the substrate-level frame. App data flows to
+	// StateMachine.Apply; heartbeats are credited (already done
+	// via NoteReceived above) and otherwise dropped.
+	dec, err := frame.Unmarshal(env.GetPayload())
+	if err != nil {
+		s.logger.Warn("substrate: bad ConvFrame", "err", err)
+		return
+	}
+	if dec.App == nil {
+		// Heartbeat / membership / watermark variants don't
+		// reach the application — they exist for stability /
+		// substrate bookkeeping only.
+		return
+	}
+
 	// Compute sender's slot in our member list, then sender_seq.
 	senderSlot := -1
 	for i, m := range s.cfg.Members {
@@ -406,7 +470,7 @@ func (s *Substrate) handleApplied(ctx context.Context, applied order.Applied) {
 
 	msg := &Message{
 		ID:      messageIDFromPB(env.GetId()),
-		Payload: env.GetPayload(),
+		Payload: dec.App,
 		Sender:  replicaIDFromPB(sender),
 		Offset:  offset,
 		Wave:    waveOfVC(vc),

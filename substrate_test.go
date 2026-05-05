@@ -121,7 +121,7 @@ func TestSubstrateMultiReplicaConverges(t *testing.T) {
 		sub, err := c.NewSubstrate(ctx, comlink.SubstrateConfig{
 			ConversationID: convID,
 			Members:        members,
-			Ordering:       comlink.OrderingPartial,
+			Ordering:       comlink.OrderingTotal,
 			StateMachine:   sm,
 		})
 		if err != nil {
