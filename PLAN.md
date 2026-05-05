@@ -106,7 +106,9 @@ Paper §2.3 simplifying assumption: "we assume only a single participating proce
 - **Replica ID:** opaque per-process identifier, stable across restarts of the same logical replica. Persisted to `stable.Storage`. The membership list `ML` is a set of these.
 - **Message ID — vector clock:** `(conversation_id, sender, vector_clock)` where:
   - `sender` is the full `ReplicaID` of the originating replica (16 bytes, **not** a slot index — see "sender field" below for why).
-  - `vector_clock` is `repeated uint64`, one slot per participant in the conversation, ordered by `ReplicaID` byte order. The slot for `sender` carries this message's own monotonic per-replica seq number; other slots carry the highest seq from each respective participant that this message causally depends on.
+  - `vector_clock` is `repeated uint64`, one slot per participant in the conversation, **ordered by insertion order** (the order in which replicas were added to the conversation — original `Members` first in their input order, then each subsequent successful VoteIn appends a new slot at the end). The slot for `sender` carries this message's own monotonic per-replica seq number; other slots carry the highest seq from each respective participant that this message causally depends on.
+
+  *Why insertion-order rather than sort-by-ReplicaID:* both are deterministic across replicas (insertion-order is deterministic because MemberAdd events are totally ordered through the system conversation; every replica processes them in the same order). Insertion-order has one decisive advantage for `VoteIn` evolution: new slots always append to the end, never insert in the middle, so a shorter "old-era" vector is just a prefix of the new shape and lazy padding (zeros at the end) is correct without needing to track membership history.
   - This is a vector-clock encoding (not a single-scalar Lamport clock — that would give only total order, which would break Psync's whole partial-order premise). Two messages M₁ and M₂ are concurrent iff neither vector dominates; M₁ causally precedes M₂ iff every component of M₁'s vector ≤ M₂'s and they're not equal.
   - **The vector replaces an explicit `predecessors` field on the wire envelope.** M's direct DAG parents are derivable on receive: for each slot `i ≠ sender`, the parent at slot `i` is the message from participant `i` with seq `vector_clock[i]` (if `> 0`); the parent on `sender`'s own slot is `sender`'s prior message at seq `vector_clock[sender] − 1`.
   - **Sender field uses the full `ReplicaID` (16 bytes), not a slot index.** A slot index would be cheaper on the wire but ambiguous across membership-change boundaries (the dangerous "same vector length, disagreeing slot order" case if any subset of replicas had a transient view mismatch). The full ReplicaID makes sender identity trivially unambiguous, and the receiver can sort it back into its own slot order locally.
@@ -116,18 +118,19 @@ Paper §2.3 simplifying assumption: "we assume only a single participating proce
 
 The vector's length changes when the conversation's participant set changes. Both add and remove are themselves Psync messages, so all replicas apply the change at the same partial-order point and end up with the same shape; this is what makes vector-clock evolution deterministic.
 
-- **Member add.** A `MemberAdd(new_replica_id)` proposal is sent into the conversation as a Psync message. Once it becomes stable and is incorporated by the membership protocol (Phase 3), every replica deterministically:
-  1. Inserts the new `ReplicaID` into the sorted slot order at its sorted position.
-  2. Resizes its vector by inserting a `0` at that position; existing values are *re-indexed* to follow the new sort.
-  3. From this logical time forward, the local vector includes the new slot.
+- **Member add.** A `MemberAdd(new_replica_id)` proposal is sent into the conversation as a Psync message. Once it has been **unanimously acknowledged by every existing ML member**, every replica deterministically:
+  1. Appends the new `ReplicaID` to the end of the slot order.
+  2. Vectors used by future Sends pick up the new length.
+  3. Older in-flight messages with shorter vectors are interpreted by lazy zero-padding at the end (`v[k]` for `k >= len(v)` reads as zero).
+  Unanimous acknowledgment (rather than quorum) is required because all replicas need to be in lock-step on slot order; a member who didn't acknowledge can't be relied upon to know about the new slot. To add a replica while another is unreachable, first VoteOut the unreachable one (which only requires quorum), then VoteIn the new one against the now-smaller ML.
 - **Member remove.** A `MemberRemove(replica_id)` proposal flows through the same path. On incorporation, the slot is **frozen but not deleted**: the vector keeps the slot with whatever value it last had, but no new messages from that replica are accepted. **Vectors only ever grow over the lifetime of a conversation.** This avoids the bookkeeping of slot renumbering and makes cross-era comparison simple — a vector from an earlier era can be padded out with the (frozen) values of subsequently-frozen slots.
 - **Recovery (same `ReplicaID`).** A replica that fails and recovers (paper §5.2) keeps its existing slot — its seq counter resumes where it left off. This is *not* a membership change; the slot was never frozen.
 - **Re-admission of a removed `ReplicaID`** is out of scope for v1. If it ever becomes a goal, ReplicaIDs would need to be incarnation-stamped.
 
-**Why this is shape-coordination-safe on the wire.** Membership changes are totally ordered by the membership protocol's agreement (Phase 3), so any two replicas that have processed the same *number* of membership changes have processed the same *set* of changes — meaning they have the same vector length and the same slot order. Therefore:
+**Why this is shape-coordination-safe on the wire.** Slot order is insertion-order; new slots always append. Therefore:
 - Receiver receives a message M with `len(M.vector_clock) == len(myView)`: parse normally; slot order is guaranteed consistent.
-- Receiver receives a message M with `len(M.vector_clock) > len(myView)`: M is from a future membership era. Receiver defers M and catches up via the lost-message protocol — the membership-change message is itself a causal predecessor M depends on, so it'll be requested and applied before M is finally processed.
-- `len(M.vector_clock) < len(myView)` cannot happen for a valid message; if it does, treat as a protocol violation.
+- Receiver receives a message M with `len(M.vector_clock) > len(myView)`: M is from a future membership era. Receiver defers M and catches up via the lost-message protocol — the MemberAdd message is itself a causal predecessor M depends on, so it'll be requested and applied before M is finally processed.
+- `len(M.vector_clock) < len(myView)`: M is from a previous era (was sent before some MemberAdd this receiver has processed). The shorter vector is just a prefix; lazy-pad with zeros at the end and process. This case is expected and correct, not a protocol violation.
 
 **Voting / proposal protocol.** The agreement mechanism for `MemberAdd` is itself a small subprotocol designed in Phase 3, reusing the partial-order-driven agreement machinery from §4.2 of the paper. Removal can use either the failure-detection path (involuntary, paper §4.2) or an explicit `MemberRemove` proposal (administrative).
 

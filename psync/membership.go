@@ -15,47 +15,48 @@
 package psync
 
 import (
-	"bytes"
 	"fmt"
-	"slices"
 
 	pb "github.com/mikehelmick/comlink/internal/pb/comlink/v1"
 	"google.golang.org/protobuf/proto"
 )
 
 // Membership is the ordered participant set for a conversation.
-// Slot order is the sort order of ReplicaID byte values, fixed at
-// the time the membership was last reshaped. Vector clocks (vector.go)
-// are indexed by this slot order.
+// Slot order is **insertion order** (PLAN §2.10.1): the original
+// Members in input order, then each successful MemberAdd appended
+// at the end. New slots always append, never insert in the middle.
+// This keeps vector clocks shape-coordination-safe: an old shorter
+// vector is just a prefix of the new shape and lazy zero-padding
+// at the end is correct.
 //
-// PLAN §2.10.1: vectors only ever grow over the lifetime of a
-// conversation — Add inserts at the sorted position and shifts
-// subsequent slots; Freeze marks a slot as no-longer-receiving but
-// keeps it in the order so vector indexing stays stable for in-
-// flight messages.
+// Vector clocks (vector.go) are indexed by this slot order.
+// Freeze marks a slot as no-longer-receiving but keeps it in
+// place so vector indexing stays stable.
 //
 // Membership is not safe for concurrent mutation; the owning
 // Conversation GenServer serializes access.
 type Membership struct {
-	// replicas in sorted order; stable across reads.
 	replicas []*pb.ReplicaID
-	// frozen[i] reports whether slot i is frozen (member removed).
-	frozen []bool
+	frozen   []bool
+	// slotIndex maps string(ReplicaID.value) -> slot index for
+	// O(1) SlotOf.
+	slotIndex map[string]int
 }
 
 // NewMembership returns a Membership initialized from replicas.
-// Input is copied and sorted; the original slice is not mutated.
+// Slots are assigned in INPUT order (replicas[0] -> slot 0,
+// replicas[1] -> slot 1, ...). The input slice is copied; the
+// original is not mutated.
 func NewMembership(replicas []*pb.ReplicaID) *Membership {
 	m := &Membership{
-		replicas: make([]*pb.ReplicaID, len(replicas)),
-		frozen:   make([]bool, len(replicas)),
+		replicas:  make([]*pb.ReplicaID, len(replicas)),
+		frozen:    make([]bool, len(replicas)),
+		slotIndex: make(map[string]int, len(replicas)),
 	}
 	for i, r := range replicas {
 		m.replicas[i] = proto.Clone(r).(*pb.ReplicaID)
+		m.slotIndex[string(r.GetValue())] = i
 	}
-	slices.SortFunc(m.replicas, func(a, b *pb.ReplicaID) int {
-		return bytes.Compare(a.GetValue(), b.GetValue())
-	})
 	return m
 }
 
@@ -73,35 +74,30 @@ func (m *Membership) IsFrozen(i int) bool { return m.frozen[i] }
 // SlotOf returns the slot index for replica r, or -1 if r is not in
 // the membership.
 func (m *Membership) SlotOf(r *pb.ReplicaID) int {
-	val := r.GetValue()
-	idx, found := slices.BinarySearchFunc(m.replicas, val, func(a *pb.ReplicaID, target []byte) int {
-		return bytes.Compare(a.GetValue(), target)
-	})
-	if !found {
+	idx, ok := m.slotIndex[string(r.GetValue())]
+	if !ok {
 		return -1
 	}
 	return idx
 }
 
-// Add inserts a new ReplicaID into the sorted slot order, returning
-// the slot index it was inserted at. Returns an error if the
-// replica is already present.
+// Add appends a new ReplicaID at the end of the slot order,
+// returning the new slot index. Returns an error if the replica
+// is already present.
 //
-// Per PLAN §2.10.1, callers (the membership protocol in Phase 3)
-// must ensure that all replicas process the corresponding
-// MemberAdd message at the same partial-order point so vector
-// reshapes happen consistently.
+// PLAN §2.10.1 invariant: VoteIn ordering through the membership
+// protocol guarantees every replica's local Add happens at the
+// same logical point, so all replicas agree on slot order.
 func (m *Membership) Add(r *pb.ReplicaID) (int, error) {
 	val := r.GetValue()
-	idx, found := slices.BinarySearchFunc(m.replicas, val, func(a *pb.ReplicaID, target []byte) int {
-		return bytes.Compare(a.GetValue(), target)
-	})
-	if found {
-		return -1, fmt.Errorf("psync: Add: replica %x already present at slot %d", val, idx)
+	if existing, present := m.slotIndex[string(val)]; present {
+		return -1, fmt.Errorf("psync: Add: replica %x already present at slot %d", val, existing)
 	}
 	cloned := proto.Clone(r).(*pb.ReplicaID)
-	m.replicas = slices.Insert(m.replicas, idx, cloned)
-	m.frozen = slices.Insert(m.frozen, idx, false)
+	idx := len(m.replicas)
+	m.replicas = append(m.replicas, cloned)
+	m.frozen = append(m.frozen, false)
+	m.slotIndex[string(val)] = idx
 	return idx, nil
 }
 

@@ -19,18 +19,21 @@ import (
 	"strings"
 )
 
-// Vector is a fixed-length vector clock indexed by sorted-membership
-// slot. Slot semantics: vector[i] is the highest sequence number
-// from the i-th participant (sorted by ReplicaID byte order) that
-// the bearer message causally depends on; the slot belonging to the
-// sender carries the sender's own monotonic seq.
+// Vector is a vector clock indexed by insertion-order membership
+// slot (PLAN §2.10.1). Slot semantics: vector[i] is the highest
+// sequence number from the i-th participant (in the order they
+// were added to the conversation) that the bearer message
+// causally depends on; the slot belonging to the sender carries
+// the sender's own monotonic seq.
 //
-// All Vector helpers in this file require operands of the same
-// length; mismatched lengths indicate a membership-shape disagreement
-// that the caller must handle separately (PLAN §2.10.1: a receiver
-// with a shorter view defers and catches up via the lost-message
-// protocol). The helpers panic on length mismatch so the bug surfaces
-// loudly rather than producing silently-wrong causality answers.
+// Length tolerance: comparison helpers in this file accept
+// vectors of different lengths and treat the shorter one as if
+// padded with zeros at the end (lazy padding). This is correct
+// because new slots always append: a shorter vector is just a
+// prefix of the new shape (an "old-era" message that predates a
+// MemberAdd). The conversation layer is still responsible for
+// detecting that an INCOMING longer vector is from a future era
+// and catching up via the lost-message protocol before applying.
 type Vector []uint64
 
 // String renders the vector compactly for logs and errors.
@@ -50,11 +53,21 @@ func (v Vector) String() string {
 	return b.String()
 }
 
-// Equal reports whether a and b are component-wise equal.
+// at returns v[i] if i is in range, else 0 (lazy padding).
+func at(v Vector, i int) uint64 {
+	if i < len(v) {
+		return v[i]
+	}
+	return 0
+}
+
+// Equal reports whether a and b are component-wise equal under
+// lazy zero-padding (a shorter vector is treated as if extended
+// with zeros).
 func Equal(a, b Vector) bool {
-	mustSameLen(a, b)
-	for i := range a {
-		if a[i] != b[i] {
+	n := max(len(a), len(b))
+	for i := 0; i < n; i++ {
+		if at(a, i) != at(b, i) {
 			return false
 		}
 	}
@@ -62,19 +75,21 @@ func Equal(a, b Vector) bool {
 }
 
 // Dominates reports whether a strictly dominates b: a[i] >= b[i]
-// for all i AND there is at least one i where a[i] > b[i].
+// for all i AND there is at least one i where a[i] > b[i] (lazy
+// padding applies to both sides).
 //
 // Causal interpretation: Dominates(a, b) means the message bearing
 // a strictly causally follows the one bearing b — every message b
 // depends on is also a dependency of a, plus at least one more.
 func Dominates(a, b Vector) bool {
-	mustSameLen(a, b)
+	n := max(len(a), len(b))
 	any := false
-	for i := range a {
-		if a[i] < b[i] {
+	for i := 0; i < n; i++ {
+		ai, bi := at(a, i), at(b, i)
+		if ai < bi {
 			return false
 		}
-		if a[i] > b[i] {
+		if ai > bi {
 			any = true
 		}
 	}
@@ -88,21 +103,19 @@ func HappensBefore(a, b Vector) bool {
 }
 
 // Concurrent reports whether a and b are causally independent:
-// neither dominates the other. Equivalent to neither happens-before
-// the other.
+// neither dominates the other and they are not equal.
 func Concurrent(a, b Vector) bool {
-	mustSameLen(a, b)
 	return !Dominates(a, b) && !Dominates(b, a) && !Equal(a, b)
 }
 
 // Max returns a freshly-allocated vector whose slots are the
-// component-wise maximum of a and b. Used by the receiver to advance
-// its own causal view after accepting an incoming message.
+// component-wise maximum of a and b (lazy padding). The result
+// has length max(len(a), len(b)).
 func Max(a, b Vector) Vector {
-	mustSameLen(a, b)
-	out := make(Vector, len(a))
-	for i := range a {
-		out[i] = max(a[i], b[i])
+	n := max(len(a), len(b))
+	out := make(Vector, n)
+	for i := 0; i < n; i++ {
+		out[i] = max(at(a, i), at(b, i))
 	}
 	return out
 }
@@ -125,10 +138,4 @@ func Clone(v Vector) Vector {
 	out := make(Vector, len(v))
 	copy(out, v)
 	return out
-}
-
-func mustSameLen(a, b Vector) {
-	if len(a) != len(b) {
-		panic(fmt.Sprintf("psync: vector length mismatch %d vs %d — caller must reconcile membership shape first (PLAN §2.10.1)", len(a), len(b)))
-	}
 }

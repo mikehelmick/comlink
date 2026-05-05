@@ -126,24 +126,76 @@ func TestClone(t *testing.T) {
 	}
 }
 
-func TestVectorOpsLengthMismatchPanics(t *testing.T) {
-	tests := []struct {
-		name string
-		op   func()
+// TestVectorOpsAcceptDifferentLengths exercises PLAN §2.10.1
+// lazy zero-padding: comparison helpers accept vectors of
+// different lengths and treat the shorter as if extended with
+// zeros at the end (an "old-era" message that predates a
+// MemberAdd). Old behavior was to panic; new behavior matches
+// insertion-order's append-only invariant.
+func TestVectorOpsAcceptDifferentLengths(t *testing.T) {
+	cases := []struct {
+		name      string
+		shorter   psync.Vector
+		longer    psync.Vector
+		equal     bool
+		shortDoms bool // Dominates(shorter, longer)?
+		longDoms  bool // Dominates(longer, shorter)?
+		conc      bool
 	}{
-		{"Equal", func() { psync.Equal(psync.Vector{1}, psync.Vector{1, 2}) }},
-		{"Dominates", func() { psync.Dominates(psync.Vector{1}, psync.Vector{1, 2}) }},
-		{"Concurrent", func() { psync.Concurrent(psync.Vector{1}, psync.Vector{1, 2}) }},
-		{"Max", func() { psync.Max(psync.Vector{1}, psync.Vector{1, 2}) }},
+		{
+			"shorter zero-padded equals longer",
+			psync.Vector{1, 2},
+			psync.Vector{1, 2, 0},
+			true, false, false, false,
+		},
+		{
+			"longer dominates with later-slot value",
+			psync.Vector{1, 2},
+			psync.Vector{1, 2, 5},
+			false, false, true, false,
+		},
+		{
+			"longer happens-before-or-equal in seen slots, shorter has higher in early slot",
+			psync.Vector{2, 3},
+			psync.Vector{1, 3, 0},
+			false, true, false, false,
+		},
+		{
+			"different in seen slot AND new slot used",
+			psync.Vector{2, 3},
+			psync.Vector{1, 3, 5},
+			false, false, false, true,
+		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			defer func() {
-				if recover() == nil {
-					t.Fatal("expected panic on length mismatch")
-				}
-			}()
-			tt.op()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := psync.Equal(tc.shorter, tc.longer); got != tc.equal {
+				t.Errorf("Equal = %v, want %v", got, tc.equal)
+			}
+			if got := psync.Dominates(tc.shorter, tc.longer); got != tc.shortDoms {
+				t.Errorf("Dominates(shorter, longer) = %v, want %v", got, tc.shortDoms)
+			}
+			if got := psync.Dominates(tc.longer, tc.shorter); got != tc.longDoms {
+				t.Errorf("Dominates(longer, shorter) = %v, want %v", got, tc.longDoms)
+			}
+			if got := psync.Concurrent(tc.shorter, tc.longer); got != tc.conc {
+				t.Errorf("Concurrent = %v, want %v", got, tc.conc)
+			}
 		})
+	}
+}
+
+// TestVectorMaxAcceptsDifferentLengths confirms Max returns a
+// vector of the longer length, lazy-padding the shorter side.
+func TestVectorMaxAcceptsDifferentLengths(t *testing.T) {
+	got := psync.Max(psync.Vector{3, 1}, psync.Vector{2, 4, 5})
+	want := psync.Vector{3, 4, 5}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Max[%d] = %d, want %d", i, got[i], want[i])
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Max length = %d, want %d", len(got), len(want))
 	}
 }

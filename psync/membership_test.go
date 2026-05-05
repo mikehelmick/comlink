@@ -28,10 +28,12 @@ func r(tag string) *pb.ReplicaID {
 	return &pb.ReplicaID{Value: b}
 }
 
-func TestNewMembershipSorts(t *testing.T) {
-	// Pass in scrambled order; expect sorted output.
+// TestNewMembershipPreservesInsertionOrder: PLAN §2.10.1 — slot
+// order is the input order, NOT sorted-by-ReplicaID. New slots
+// from later Add calls append to the end.
+func TestNewMembershipPreservesInsertionOrder(t *testing.T) {
 	m := psync.NewMembership([]*pb.ReplicaID{r("zoe"), r("alice"), r("bob"), r("carol")})
-	want := []string{"alice", "bob", "carol", "zoe"}
+	want := []string{"zoe", "alice", "bob", "carol"}
 	for i, name := range want {
 		got := m.Replica(i).GetValue()
 		if !bytes.HasPrefix(got, []byte(name)) {
@@ -53,26 +55,28 @@ func TestSlotOf(t *testing.T) {
 	}
 }
 
-func TestAddInsertsAtSortedPosition(t *testing.T) {
+// TestAddAppendsAtEnd: PLAN §2.10.1 — new slots always append at
+// the end (insertion order), never insert in the middle.
+func TestAddAppendsAtEnd(t *testing.T) {
 	m := psync.NewMembership([]*pb.ReplicaID{r("alice"), r("carol")})
 	idx, err := m.Add(r("bob"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if idx != 1 {
-		t.Fatalf("Add(bob) returned slot %d, want 1", idx)
+	if idx != 2 {
+		t.Fatalf("Add(bob) returned slot %d, want 2 (append at end)", idx)
 	}
 	if m.Len() != 3 {
 		t.Fatalf("Len = %d, want 3", m.Len())
 	}
 	if got := m.SlotOf(r("alice")); got != 0 {
-		t.Errorf("alice slot after Add = %d, want 0", got)
+		t.Errorf("alice slot = %d, want 0 (unchanged)", got)
 	}
-	if got := m.SlotOf(r("bob")); got != 1 {
-		t.Errorf("bob slot after Add = %d, want 1", got)
+	if got := m.SlotOf(r("carol")); got != 1 {
+		t.Errorf("carol slot = %d, want 1 (unchanged)", got)
 	}
-	if got := m.SlotOf(r("carol")); got != 2 {
-		t.Errorf("carol slot after Add (should have shifted from 1 to 2) = %d, want 2", got)
+	if got := m.SlotOf(r("bob")); got != 2 {
+		t.Errorf("bob slot = %d, want 2 (appended)", got)
 	}
 }
 
@@ -164,13 +168,11 @@ func TestSenderSeqVectorTooShort(t *testing.T) {
 	}
 }
 
-// TestAddPreservesSlotMappingForExistingReplicas exercises the
-// PLAN §2.10.1 reshape semantics: when a replica is added at slot
-// position k, every existing replica at slot >= k shifts up by one.
-// Vector clocks issued before and after the add are different
-// shapes, but everyone agrees on the new shape (because Add is
-// deterministic — same input yields same slot order).
-func TestAddPreservesSlotMappingForExistingReplicas(t *testing.T) {
+// TestAddDoesNotShiftExistingSlots: PLAN §2.10.1 — insertion-order
+// means new slots append; existing slot indices are immutable.
+// This is the property that lets old-era vectors be lazy-padded
+// with zeros at the end.
+func TestAddDoesNotShiftExistingSlots(t *testing.T) {
 	m := psync.NewMembership([]*pb.ReplicaID{r("a"), r("c")})
 	if got := m.SlotOf(r("c")); got != 1 {
 		t.Fatalf("pre-add: c slot = %d, want 1", got)
@@ -178,7 +180,10 @@ func TestAddPreservesSlotMappingForExistingReplicas(t *testing.T) {
 	if _, err := m.Add(r("b")); err != nil {
 		t.Fatal(err)
 	}
-	if got := m.SlotOf(r("c")); got != 2 {
-		t.Fatalf("post-add: c slot = %d, want 2", got)
+	if got := m.SlotOf(r("c")); got != 1 {
+		t.Fatalf("post-add: c slot = %d, want 1 (unchanged — Add appends)", got)
+	}
+	if got := m.SlotOf(r("b")); got != 2 {
+		t.Fatalf("post-add: b slot = %d, want 2 (appended)", got)
 	}
 }
