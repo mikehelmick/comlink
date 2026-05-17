@@ -15,11 +15,33 @@
 package comlink
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/mikehelmick/comlink/clock"
 	"github.com/mikehelmick/comlink/transport"
+	"github.com/sethvargo/go-envconfig"
 )
+
+// LoadConfigFromEnv populates a ClusterConfig from environment
+// variables. The recognized variables are documented in tag
+// comments on ClusterConfig, TransportConfig, and BootstrapConfig.
+//
+// Logger / Clock / TransportConfig.Network cannot be set via env
+// — apps that need them should mutate the returned config before
+// passing it to NewCluster.
+//
+// Empty env returns a zero ClusterConfig, NOT an error — apps
+// can then layer programmatic overrides on top.
+func LoadConfigFromEnv(ctx context.Context) (ClusterConfig, error) {
+	var cfg ClusterConfig
+	if err := envconfig.Process(ctx, &cfg); err != nil {
+		return ClusterConfig{}, fmt.Errorf("comlink: load config from env: %w", err)
+	}
+	return cfg, nil
+}
 
 // ClusterConfig configures a Cluster (PLAN §5). All fields except
 // Logger and Clock are required for production use; tests with
@@ -29,15 +51,16 @@ type ClusterConfig struct {
 	// Self is this replica's stable identity within the cluster.
 	// Generated once at first run; persisted by the application
 	// and re-supplied on subsequent starts.
-	Self ReplicaID
+	Self ReplicaID `env:"COMLINK_SELF"`
 
 	// Members is the initial cluster membership at first
 	// (Bootstrap.Force=true) startup. Subsequent startups load
 	// the persisted ML and ignore this field — it's the
 	// scenario-X founder's input.
 	//
-	// Self must appear in Members.
-	Members []ReplicaID
+	// Self must appear in Members. Env form: comma-separated
+	// hex ReplicaIDs.
+	Members []ReplicaID `env:"COMLINK_MEMBERS"`
 
 	// DataDir is the filesystem root for stable.Storage and
 	// log.MessageLog files. Layout:
@@ -49,7 +72,11 @@ type ClusterConfig struct {
 	// non-nil with Force=true on the founder node to create a
 	// fresh cluster; nil otherwise to join an existing cluster
 	// (the persisted ClusterID is loaded).
-	Bootstrap *BootstrapConfig
+	//
+	// Env form: any of COMLINK_BOOTSTRAP_FORCE,
+	// COMLINK_BOOTSTRAP_ALLOW_OVERRIDE, COMLINK_BOOTSTRAP_CLUSTER_ID.
+	// Setting any of these allocates BootstrapConfig.
+	Bootstrap *BootstrapConfig `env:", prefix=COMLINK_BOOTSTRAP_"`
 
 	// Transport configures how this Cluster communicates with
 	// peers. See TransportConfig.
@@ -65,6 +92,9 @@ type ClusterConfig struct {
 // TransportConfig configures the network transport for a
 // Cluster. Either Network OR Listen must be set; if both are,
 // Network wins (the Listen+Sponsors path is ignored).
+//
+// Env-loaded into ClusterConfig.Transport with no prefix (the
+// fields' own env tags already carry COMLINK_TRANSPORT_*).
 type TransportConfig struct {
 	// Listen is the bind address for this replica's gRPC server,
 	// e.g. ":8001" or "0.0.0.0:8001". When set (and Network is
@@ -96,4 +126,24 @@ type TransportConfig struct {
 type Sponsor struct {
 	ID   ReplicaID
 	Addr string
+}
+
+// EnvDecode parses one Sponsor in "<hex_replica_id>@host:port"
+// form. envconfig handles the comma-splitting for slice fields,
+// invoking EnvDecode once per element.
+func (s *Sponsor) EnvDecode(val string) error {
+	at := strings.IndexByte(val, '@')
+	if at < 0 {
+		return fmt.Errorf("comlink: Sponsor %q: expected <hex_replica_id>@<addr>", val)
+	}
+	id, err := ParseReplicaID(val[:at])
+	if err != nil {
+		return fmt.Errorf("comlink: Sponsor %q: %w", val, err)
+	}
+	s.ID = id
+	s.Addr = val[at+1:]
+	if s.Addr == "" {
+		return fmt.Errorf("comlink: Sponsor %q: empty addr", val)
+	}
+	return nil
 }

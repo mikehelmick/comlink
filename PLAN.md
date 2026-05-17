@@ -419,7 +419,7 @@ existing `Substrate.SetWatermark(offset)` is the trim hook.
 - 5(g) Cluster admin API (VoteIn/VoteOut/Members at cluster level) + persistent membership state. ✅
 - 5(h) Sponsors + bootstrap fallback (joiner learns ClusterID via sponsor handshake). ✅
 - 5(i) gRPC ClusterID handshake interceptor + transport routing updates on admit/evict. ✅
-- 5(j) envconfig integration + LoadConfigFromEnv helper.
+- 5(j) envconfig integration + LoadConfigFromEnv helper. ✅
 - 5(k) Determinism-violation detection test.
 - 5(l) End-to-end replicated-counter integration test on the public API.
 - 5(m) README quickstart.

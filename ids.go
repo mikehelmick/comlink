@@ -141,8 +141,13 @@ func parseHexID(s string) ([]byte, error) {
 // ─── envconfig.Decoder support ───────────────────────────────────
 
 // EnvDecode implements envconfig.Decoder so ClusterID can be
-// loaded from environment variables.
+// loaded from environment variables. An empty value is treated
+// as a no-op (the field stays nil) — useful when ClusterID is
+// optional in env-driven config.
 func (c *ClusterID) EnvDecode(val string) error {
+	if val == "" {
+		return nil
+	}
 	parsed, err := ParseClusterID(val)
 	if err != nil {
 		return err
@@ -151,8 +156,11 @@ func (c *ClusterID) EnvDecode(val string) error {
 	return nil
 }
 
-// EnvDecode implements envconfig.Decoder.
+// EnvDecode implements envconfig.Decoder. Empty value → no-op.
 func (r *ReplicaID) EnvDecode(val string) error {
+	if val == "" {
+		return nil
+	}
 	parsed, err := ParseReplicaID(val)
 	if err != nil {
 		return err
@@ -161,8 +169,11 @@ func (r *ReplicaID) EnvDecode(val string) error {
 	return nil
 }
 
-// EnvDecode implements envconfig.Decoder.
+// EnvDecode implements envconfig.Decoder. Empty value → no-op.
 func (c *ConversationID) EnvDecode(val string) error {
+	if val == "" {
+		return nil
+	}
 	parsed, err := ParseConversationID(val)
 	if err != nil {
 		return err
