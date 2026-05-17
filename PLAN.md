@@ -420,9 +420,9 @@ existing `Substrate.SetWatermark(offset)` is the trim hook.
 - 5(h) Sponsors + bootstrap fallback (joiner learns ClusterID via sponsor handshake). ✅
 - 5(i) gRPC ClusterID handshake interceptor + transport routing updates on admit/evict. ✅
 - 5(j) envconfig integration + LoadConfigFromEnv helper. ✅
-- 5(k) Determinism-violation detection test.
-- 5(l) End-to-end replicated-counter integration test on the public API.
-- 5(m) README quickstart.
+- 5(k) Determinism-violation detection test. ✅
+- 5(l) End-to-end replicated-counter integration test on the public API. ✅
+- 5(m) README quickstart. ✅
 
 Phase 5(g) sub-design — persistence of cluster ML:
 - The membership.Manager fires a new OnMembershipChange callback
