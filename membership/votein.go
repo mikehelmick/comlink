@@ -249,19 +249,19 @@ func (m *Manager) addToMLLocked(target *pb.ReplicaID) {
 
 // notifyAdded emits an Added event for downstream layers to wire
 // up transport routing, etc. Logs unconditionally and invokes
-// Config.OnMembershipChange (if set) on a goroutine — callbacks
-// must not re-enter the Manager.
+// Config.OnMembershipChange (if set) SYNCHRONOUSLY — callers
+// rely on routing/persistence being in place before the VoteIn
+// waiter completes.
 func (m *Manager) notifyAdded(target *pb.ReplicaID, addr string) {
 	m.logger.Info("membership: replica added",
 		"target", fmt.Sprintf("%x", target.GetValue()),
 		"addr", addr)
 	if cb := m.cfg.OnMembershipChange; cb != nil {
-		event := MembershipChange{
+		cb(MembershipChange{
 			Kind:    MembershipChangeAdded,
 			Replica: proto.Clone(target).(*pb.ReplicaID),
 			Addr:    addr,
-		}
-		go cb(event)
+		})
 	}
 }
 

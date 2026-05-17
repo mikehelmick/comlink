@@ -60,6 +60,14 @@ type Cluster struct {
 	sysLog  clog.MessageLog
 	sysMgr  *membership.Manager
 
+	// runCtx is the Cluster's own lifetime context, cancelled by
+	// Close. Internal goroutines (psync pumps, membership pump,
+	// transport mux) MUST tie themselves to runCtx — not the
+	// caller's NewCluster context, which is typically a short-lived
+	// bootstrap timeout that fires the moment NewCluster returns.
+	runCtx    context.Context
+	runCancel context.CancelFunc
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -84,11 +92,16 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 		clk = clock.NewSystem()
 	}
 
+	// runCtx outlives NewCluster — internal goroutines bind to it.
+	// Cancelled by Close, NOT by the caller's bootstrap ctx.
+	runCtx, runCancel := context.WithCancel(context.Background())
+
 	storage, err := stable.NewFile(filepath.Join(cfg.DataDir, "cluster_state"))
 	if err != nil {
+		runCancel()
 		return nil, fmt.Errorf("comlink: open stable.Storage: %w", err)
 	}
-	cleanup := []func(){func() { _ = storage.Close() }}
+	cleanup := []func(){func() { _ = storage.Close() }, runCancel}
 	rollback := func() {
 		for i := len(cleanup) - 1; i >= 0; i-- {
 			cleanup[i]()
@@ -185,7 +198,7 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 		members[i] = m.GetId()
 	}
 
-	sysConv, err := psync.New(ctx, psync.Config{
+	sysConv, err := psync.New(runCtx, psync.Config{
 		ConversationID:  sysConvID.toPB(),
 		Self:            cfg.Self.toPB(),
 		Members:         members,
@@ -215,6 +228,8 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 		mux:            mux,
 		sysConv:        sysConv,
 		sysLog:         sysLog,
+		runCtx:         runCtx,
+		runCancel:      runCancel,
 	}
 
 	sysMgr, err := membership.New(membership.Config{
@@ -489,6 +504,9 @@ func (c *Cluster) Close() error {
 			record(c.network.Close())
 		}
 		record(c.storage.Close())
+		if c.runCancel != nil {
+			c.runCancel()
+		}
 		c.closeErr = firstErr
 	})
 	return c.closeErr

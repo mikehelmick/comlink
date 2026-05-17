@@ -263,16 +263,15 @@ func (m *Manager) checkVoteOutDecision(session *voteOutSession) {
 
 // notifyRemoved emits a Removed event for downstream layers
 // (transport routing teardown, stable.Storage persistence, etc).
-// Callback runs on a goroutine — must not re-enter the Manager.
+// Synchronous — same rationale as notifyAdded.
 func (m *Manager) notifyRemoved(target *pb.ReplicaID) {
 	m.logger.Info("membership: replica removed",
 		"target", fmt.Sprintf("%x", target.GetValue()))
 	if cb := m.cfg.OnMembershipChange; cb != nil {
-		event := MembershipChange{
+		cb(MembershipChange{
 			Kind:    MembershipChangeRemoved,
 			Replica: proto.Clone(target).(*pb.ReplicaID),
-		}
-		go cb(event)
+		})
 	}
 }
 

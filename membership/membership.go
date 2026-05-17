@@ -100,13 +100,23 @@ type Config struct {
 	// passed into the underlying psync.Conversation.
 	Log clog.MessageLog
 
-	// OnMembershipChange is invoked after an accepted membership
-	// change has been applied locally (after the ML mutation and
-	// any psync reshape). Optional. The callback runs on an
-	// internal goroutine; it MUST NOT call back into the Manager
-	// (re-entrant deadlock). The intended use is to persist or
-	// propagate the change to other layers (transport routing,
-	// stable.Storage, etc).
+	// OnMembershipChange is invoked SYNCHRONOUSLY after an
+	// accepted membership change has been applied locally (after
+	// the ML mutation and any psync reshape) and BEFORE the
+	// VoteIn/VoteOut waiter is signaled. Optional.
+	//
+	// Synchronous semantics matter: callers (e.g. comlink.Cluster)
+	// rely on having transport routing and stable.Storage
+	// persistence in place before the next protocol step can
+	// observe the new ML — otherwise a follow-up VoteIn would
+	// broadcast to peers we haven't yet wired up routing for, and
+	// silently drop.
+	//
+	// The callback runs in the Manager pump's goroutine. It MUST
+	// NOT call back into Manager methods that block on the pump
+	// (Send via the conv, VoteIn, VoteOut) — re-entrant deadlock.
+	// In-memory mutations and fast I/O (file writes, map updates)
+	// are fine.
 	//
 	// addr is populated only for MembershipChangeAdded; for
 	// MembershipChangeRemoved it is the empty string.

@@ -186,7 +186,11 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 	for i, m := range cfg.Members {
 		pbMembers[i] = m.toPB()
 	}
-	conv, err := psync.New(ctx, psync.Config{
+	// Bind psync to the Cluster's lifetime ctx, NOT the caller's
+	// NewSubstrate ctx — the latter is typically a short-lived
+	// bootstrap context that would otherwise kill the conv's pumps
+	// the moment NewSubstrate returns.
+	conv, err := psync.New(c.runCtx, psync.Config{
 		ConversationID:  cfg.ConversationID.toPB(),
 		Self:            c.cfg.Self.toPB(),
 		Members:         pbMembers,
