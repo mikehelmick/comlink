@@ -95,16 +95,19 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 		}
 	}
 
-	var bootstrap BootstrapConfig
-	if cfg.Bootstrap != nil {
-		bootstrap = *cfg.Bootstrap
-	}
-	clusterID, err := loadOrCreateClusterID(ctx, storage, bootstrap)
+	// Build the Network (bound listener, gRPC server constructed,
+	// but NOT yet serving — we register the Cluster service and
+	// SetClusterID before Start). For sponsor bootstrap we need
+	// the actual listen addr early to send in the JoinRequest.
+	network, ownedNetwork, err := buildNetwork(cfg)
 	if err != nil {
 		rollback()
 		return nil, err
 	}
-	sysConvID := SystemConversationID(clusterID)
+	if ownedNetwork {
+		cleanup = append(cleanup, func() { _ = network.Close() })
+	}
+	selfAddr := networkAddr(network, cfg)
 
 	memStore, err := loadMemberStore(ctx, storage)
 	if err != nil {
@@ -112,17 +115,34 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 		return nil, err
 	}
 
-	// Seed the persisted ML on first startup using cfg.Members.
-	// On subsequent startups, the persisted list is authoritative
-	// — cfg.Members is treated as the bootstrap-only set.
+	// Bootstrap discipline (PLAN §5):
+	//   - If persisted ClusterID exists: load it, persisted ML is
+	//     authoritative.
+	//   - If Force: mint or install BootstrapConfig.ClusterID,
+	//     seed memStore from cfg.Members.
+	//   - If sponsors present (no Force, no persisted): do sponsor
+	//     handshake — dial sponsor, call Cluster.Join. Sponsor
+	//     VoteIns us and returns (ClusterID, post-admission ML).
+	//     Persist both locally.
+	//   - Otherwise: ErrBootstrapRequired.
+	clusterID, err := loadClusterIDOrJoin(ctx, cfg, storage, memStore, selfAddr, logger)
+	if err != nil {
+		rollback()
+		return nil, err
+	}
+	sysConvID := SystemConversationID(clusterID)
+
+	// Seed memStore from cfg.Members on first non-joiner startup.
 	if memStore.Empty() {
+		if len(cfg.Members) == 0 {
+			rollback()
+			return nil, errors.New("comlink: no persisted ML and no cfg.Members to seed from (joiner mode requires sponsors)")
+		}
 		seed := make([]*pb.ClusterMember, 0, len(cfg.Members))
 		for _, m := range cfg.Members {
-			// Self gets cfg.Transport.Listen; peers get the addr
-			// from cfg.Transport.Sponsors when present, else "".
 			addr := ""
 			if m.Equal(cfg.Self) {
-				addr = cfg.Transport.Listen
+				addr = selfAddr
 			} else {
 				for _, sp := range cfg.Transport.Sponsors {
 					if sp.ID.Equal(m) {
@@ -139,13 +159,11 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 		}
 	}
 
-	network, ownedNetwork, err := buildNetwork(cfg)
-	if err != nil {
+	// Cluster must be in persisted ML.
+	persisted := memStore.Members()
+	if !containsReplica(persisted, cfg.Self) {
 		rollback()
-		return nil, err
-	}
-	if ownedNetwork {
-		cleanup = append(cleanup, func() { _ = network.Close() })
+		return nil, fmt.Errorf("comlink: Self %s not in persisted ML (cluster state may be corrupt or this node was voted out)", cfg.Self)
 	}
 
 	mux := transport.NewMultiplex(network, 0)
@@ -162,7 +180,6 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 	cleanup = append(cleanup, func() { _ = sysLog.Close() })
 
 	// Initial ML for the system conv = persisted membership.
-	persisted := memStore.Members()
 	members := make([]*pb.ReplicaID, len(persisted))
 	for i, m := range persisted {
 		members[i] = m.GetId()
@@ -216,11 +233,113 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 	}
 	cleanup = append(cleanup, func() { _ = sysMgr.Close() })
 	c.sysMgr = sysMgr
+
+	// Apply persisted routing into the gRPC network (no-op for
+	// the in-memory escape hatch).
+	if gn, ok := network.(*cgrpc.Network); ok {
+		gn.SetClusterID(clusterID)
+		gn.RegisterService(&pb.Cluster_ServiceDesc, &joinService{owner: c})
+		for _, m := range persisted {
+			if cfg.Self.Equal(ReplicaID(m.GetId().GetValue())) {
+				continue
+			}
+			if m.GetAddr() != "" {
+				gn.AddPeer(m.GetId(), m.GetAddr())
+			}
+		}
+		gn.Start()
+	}
+
 	logger.Info("comlink: cluster started",
 		"cluster_id", clusterID.String(),
 		"self", cfg.Self.String(),
 		"members", len(persisted))
 	return c, nil
+}
+
+// networkAddr returns the local network address for use in
+// sponsor handshakes. For the gRPC Network, it's the actual
+// listener addr (resolved if ":0"); otherwise it's whatever
+// cfg.Transport.Listen contained, which may be empty for the
+// in-memory escape hatch (sponsor handshake won't work there).
+func networkAddr(n transport.Network, cfg ClusterConfig) string {
+	if gn, ok := n.(*cgrpc.Network); ok {
+		return gn.Addr()
+	}
+	return cfg.Transport.Listen
+}
+
+// containsReplica reports whether members contains an entry for r.
+func containsReplica(members []*pb.ClusterMember, r ReplicaID) bool {
+	for _, m := range members {
+		if r.Equal(ReplicaID(m.GetId().GetValue())) {
+			return true
+		}
+	}
+	return false
+}
+
+// loadClusterIDOrJoin implements the bootstrap discipline.
+// Returns the (possibly newly-installed) ClusterID. Side effects:
+// on the sponsor-handshake path, persists ClusterID and seeds
+// memStore from the sponsor's response.
+func loadClusterIDOrJoin(
+	ctx context.Context,
+	cfg ClusterConfig,
+	storage stable.Storage,
+	memStore *memberStore,
+	selfAddr string,
+	logger *slog.Logger,
+) (ClusterID, error) {
+	var bootstrap BootstrapConfig
+	if cfg.Bootstrap != nil {
+		bootstrap = *cfg.Bootstrap
+	}
+	// First try standard load (or Force-mint).
+	id, err := loadOrCreateClusterID(ctx, storage, bootstrap)
+	if err == nil {
+		return id, nil
+	}
+	// ErrBootstrapRequired is the only error we can recover from
+	// via sponsor handshake. Anything else (override conflict,
+	// generation failure, etc) propagates.
+	if !errors.Is(err, ErrBootstrapRequired) {
+		return nil, err
+	}
+	// No persisted ID, not Force. Try sponsors.
+	if len(cfg.Transport.Sponsors) == 0 {
+		return nil, err // ErrBootstrapRequired
+	}
+	logger.Info("comlink: attempting sponsor bootstrap",
+		"sponsors", len(cfg.Transport.Sponsors),
+		"self_addr", selfAddr)
+	var lastErr error
+	for _, sp := range cfg.Transport.Sponsors {
+		resp, joinErr := dialSponsorJoin(ctx, sp.Addr, cfg.Self, selfAddr)
+		if joinErr != nil {
+			logger.Warn("comlink: sponsor Join failed",
+				"sponsor", sp.Addr, "err", joinErr)
+			lastErr = joinErr
+			continue
+		}
+		// Install ClusterID + ML.
+		clusterID := ClusterID(resp.GetClusterId().GetValue())
+		if err := persistClusterID(ctx, storage, clusterID); err != nil {
+			return nil, fmt.Errorf("comlink: persist ClusterID from sponsor: %w", err)
+		}
+		if err := memStore.SetAll(ctx, resp.GetMembers()); err != nil {
+			return nil, fmt.Errorf("comlink: persist members from sponsor: %w", err)
+		}
+		logger.Info("comlink: sponsor bootstrap succeeded",
+			"sponsor", sp.Addr,
+			"cluster_id", clusterID.String(),
+			"members", len(resp.GetMembers()))
+		return clusterID, nil
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("comlink: all sponsors failed: %w", lastErr)
+	}
+	return nil, err
 }
 
 func validateClusterConfig(cfg ClusterConfig) error {
@@ -230,18 +349,19 @@ func validateClusterConfig(cfg ClusterConfig) error {
 	if cfg.DataDir == "" {
 		return errors.New("comlink: ClusterConfig.DataDir is required")
 	}
-	if len(cfg.Members) == 0 {
-		return errors.New("comlink: ClusterConfig.Members must be non-empty (initial cluster membership)")
-	}
-	selfFound := false
-	for _, m := range cfg.Members {
-		if m.Equal(cfg.Self) {
-			selfFound = true
-			break
+	// Members may be empty for joiner mode (sponsors will supply
+	// the ML). If non-empty, Self must be present.
+	if len(cfg.Members) > 0 {
+		selfFound := false
+		for _, m := range cfg.Members {
+			if m.Equal(cfg.Self) {
+				selfFound = true
+				break
+			}
 		}
-	}
-	if !selfFound {
-		return fmt.Errorf("comlink: ClusterConfig.Self %s not in Members", cfg.Self)
+		if !selfFound {
+			return fmt.Errorf("comlink: ClusterConfig.Self %s not in Members", cfg.Self)
+		}
 	}
 	if cfg.Transport.Network == nil && cfg.Transport.Listen == "" {
 		return errors.New("comlink: ClusterConfig.Transport: must provide Network or Listen")
@@ -276,6 +396,17 @@ func (c *Cluster) Self() ReplicaID { return c.cfg.Self }
 // SystemConversationID returns the well-known ID of the system
 // conversation derived from ClusterID.
 func (c *Cluster) SystemConversationID() ConversationID { return c.sysConvID }
+
+// ListenAddr returns the local gRPC listener address, useful for
+// configuring peers' Sponsors lists in tests / orchestration.
+// Returns "" if Cluster was built against a non-gRPC Network (the
+// in-memory escape hatch used in tests).
+func (c *Cluster) ListenAddr() string {
+	if gn, ok := c.network.(*cgrpc.Network); ok {
+		return gn.Addr()
+	}
+	return ""
+}
 
 // Members returns a snapshot of the current cluster ML.
 func (c *Cluster) Members() []ReplicaID {
@@ -314,17 +445,25 @@ func (c *Cluster) VoteOut(ctx context.Context, target ReplicaID) error {
 }
 
 // onMembershipChange is the membership.Manager callback.
-// Persists the change to stable.Storage so it survives restart.
-// Runs on a goroutine spawned by the Manager — must not call
-// back into c.sysMgr.
+// Persists the change to stable.Storage so it survives restart,
+// and updates gRPC routing (so VoteIn'd replicas become
+// reachable via Send and VoteOut'd ones are dropped). Runs on a
+// goroutine spawned by the Manager — must not call back into
+// c.sysMgr.
 func (c *Cluster) onMembershipChange(event membership.MembershipChange) {
 	ctx := context.Background()
 	var err error
 	switch event.Kind {
 	case membership.MembershipChangeAdded:
 		err = c.members.Add(ctx, event.Replica, event.Addr)
+		if gn, ok := c.network.(*cgrpc.Network); ok && event.Addr != "" {
+			gn.AddPeer(event.Replica, event.Addr)
+		}
 	case membership.MembershipChangeRemoved:
 		err = c.members.Remove(ctx, event.Replica)
+		if gn, ok := c.network.(*cgrpc.Network); ok {
+			gn.RemovePeer(event.Replica)
+		}
 	}
 	if err != nil {
 		c.logger.Error("comlink: persist membership change",

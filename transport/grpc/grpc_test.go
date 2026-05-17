@@ -42,11 +42,13 @@ func twoNode(t *testing.T) (*cgrpc.Network, *cgrpc.Network) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.Start()
 	b, err := cgrpc.Listen(bID, "127.0.0.1:0", nil)
 	if err != nil {
 		_ = a.Close()
 		t.Fatal(err)
 	}
+	b.Start()
 	a.AddPeer(bID, b.Addr())
 	b.AddPeer(aID, a.Addr())
 	t.Cleanup(func() {

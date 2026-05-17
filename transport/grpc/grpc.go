@@ -28,6 +28,7 @@ package grpc
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -36,9 +37,30 @@ import (
 	pb "github.com/mikehelmick/comlink/internal/pb/comlink/v1"
 	"github.com/mikehelmick/comlink/transport"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
+
+// ClusterIDMetadataKey is the gRPC metadata key carrying the
+// sender's ClusterID on every outbound call. The server-side
+// interceptor rejects calls whose metadata ClusterID doesn't
+// match the server's own (preventing two distinct clusters with
+// overlapping ConversationIDs from accidentally merging).
+//
+// Hex-encoded so the value is printable in logs / metadata
+// inspection tools.
+const ClusterIDMetadataKey = "x-comlink-cluster-id"
+
+// ExemptHandshakeMethods are full gRPC method names that bypass
+// the ClusterID handshake check. The sponsor Join RPC must
+// bypass — a joiner uses Join to LEARN the ClusterID and can't
+// possibly send it on the way in.
+var ExemptHandshakeMethods = map[string]bool{
+	"/comlink.v1.Cluster/Join": true,
+}
 
 // Peer is a routing-table entry mapping a ReplicaID to a network
 // address.
@@ -55,15 +77,28 @@ type Network struct {
 	recv     chan transport.Inbound
 	addr     string
 
-	mu     sync.Mutex
-	peers  map[string]string           // string(ReplicaID.Value) -> addr
-	conns  map[string]*grpc.ClientConn // dialed connections
-	closed bool
+	// clusterIDHex is the hex-encoded ClusterID stamped into
+	// outgoing metadata and validated on incoming calls.
+	// Empty before SetClusterID is called — in that state the
+	// server is permissive (used during the brief window
+	// between Listen and SetClusterID at startup).
+	clusterIDHex string
+
+	mu      sync.Mutex
+	peers   map[string]string           // string(ReplicaID.Value) -> addr
+	conns   map[string]*grpc.ClientConn // dialed connections
+	started bool
+	closed  bool
 }
 
-// Listen starts a gRPC server bound to listenAddr (use ":0" for an
-// OS-assigned port). The Network returned is ready to Send and Recv;
-// peers configures the routing table.
+// Listen builds the gRPC Network and binds the listener, but does
+// NOT start accepting connections. The caller can register
+// additional services via RegisterService and then call Start to
+// begin Serve. Splitting Listen and Start lets the Cluster
+// register the Cluster/Join handler before traffic flows.
+//
+// listenAddr accepts ":0" for an OS-assigned port — read it back
+// via Addr() after Listen returns.
 func Listen(local *pb.ReplicaID, listenAddr string, peers []Peer) (*Network, error) {
 	if local == nil {
 		return nil, errors.New("grpc: nil local replica id")
@@ -84,12 +119,76 @@ func Listen(local *pb.ReplicaID, listenAddr string, peers []Peer) (*Network, err
 		n.peers[string(p.ID.GetValue())] = p.Addr
 	}
 
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(grpc.UnaryInterceptor(n.serverInterceptor))
 	pb.RegisterTransportServer(srv, &handler{recv: n.recv})
 	n.server = srv
 
-	go func() { _ = srv.Serve(lis) }()
 	return n, nil
+}
+
+// Start begins accepting connections on the bound listener. Must
+// be called exactly once after Listen (and any RegisterService
+// calls). Safe to call from any goroutine.
+func (n *Network) Start() {
+	n.mu.Lock()
+	if n.started || n.closed {
+		n.mu.Unlock()
+		return
+	}
+	n.started = true
+	n.mu.Unlock()
+	go func() { _ = n.server.Serve(n.listener) }()
+}
+
+// RegisterService registers an extra gRPC service on the shared
+// server. Must be called BEFORE Start (gRPC panics if a service
+// is registered after Serve begins).
+func (n *Network) RegisterService(desc *grpc.ServiceDesc, impl any) {
+	n.server.RegisterService(desc, impl)
+}
+
+// SetClusterID stamps this Network with the local ClusterID so
+// it can both attach it to outgoing calls and validate it on
+// incoming calls. Safe to call once at Cluster construction
+// time. Subsequent calls overwrite (used at sponsor-handshake
+// completion when the joiner learns the ID).
+func (n *Network) SetClusterID(id []byte) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.clusterIDHex = hex.EncodeToString(id)
+}
+
+// serverInterceptor enforces the ClusterID handshake on every
+// inbound unary RPC except those in ExemptHandshakeMethods.
+func (n *Network) serverInterceptor(
+	ctx context.Context,
+	req any,
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (any, error) {
+	if ExemptHandshakeMethods[info.FullMethod] {
+		return handler(ctx, req)
+	}
+	n.mu.Lock()
+	expected := n.clusterIDHex
+	n.mu.Unlock()
+	if expected == "" {
+		// Cluster hasn't installed its ID yet — permissive (this
+		// window is narrow; closes when Cluster calls
+		// SetClusterID before Start).
+		return handler(ctx, req)
+	}
+	md, _ := metadata.FromIncomingContext(ctx)
+	vals := md.Get(ClusterIDMetadataKey)
+	if len(vals) == 0 {
+		return nil, status.Errorf(codes.PermissionDenied,
+			"grpc: peer did not send %s metadata", ClusterIDMetadataKey)
+	}
+	if vals[0] != expected {
+		return nil, status.Errorf(codes.PermissionDenied,
+			"grpc: cluster id mismatch (peer=%s, server=%s)", vals[0], expected)
+	}
+	return handler(ctx, req)
 }
 
 // Addr returns the actual listen address (useful with ":0").
@@ -113,6 +212,20 @@ func (n *Network) AddPeer(id *pb.ReplicaID, addr string) {
 		}
 	}
 	n.peers[key] = addr
+}
+
+// RemovePeer drops a routing-table entry and tears down any
+// cached connection. Safe to call concurrently with Send (Send
+// will see ErrUnknownPeer if RemovePeer wins the race).
+func (n *Network) RemovePeer(id *pb.ReplicaID) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	key := string(id.GetValue())
+	delete(n.peers, key)
+	if conn, ok := n.conns[key]; ok {
+		_ = conn.Close()
+		delete(n.conns, key)
+	}
 }
 
 // Local returns this network's replica id.
@@ -144,7 +257,10 @@ func (n *Network) Send(ctx context.Context, peer *pb.ReplicaID, payload []byte) 
 	n.mu.Unlock()
 
 	if conn == nil {
-		newConn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		newConn, err := grpc.NewClient(addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithUnaryInterceptor(n.clientInterceptor),
+		)
 		if err != nil {
 			return fmt.Errorf("grpc: dial %s: %w", addr, err)
 		}
@@ -163,6 +279,27 @@ func (n *Network) Send(ctx context.Context, peer *pb.ReplicaID, payload []byte) 
 	client := pb.NewTransportClient(conn)
 	_, err := client.Send(ctx, &pb.Frame{From: n.Local(), Payload: payload})
 	return err
+}
+
+// clientInterceptor attaches the local ClusterID to every
+// outbound unary call (skipping exempt methods, e.g. Join).
+func (n *Network) clientInterceptor(
+	ctx context.Context,
+	method string,
+	req, reply any,
+	cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker,
+	opts ...grpc.CallOption,
+) error {
+	if !ExemptHandshakeMethods[method] {
+		n.mu.Lock()
+		id := n.clusterIDHex
+		n.mu.Unlock()
+		if id != "" {
+			ctx = metadata.AppendToOutgoingContext(ctx, ClusterIDMetadataKey, id)
+		}
+	}
+	return invoker(ctx, method, req, reply, cc, opts...)
 }
 
 // Close stops the gRPC server, closes outgoing connections, and
