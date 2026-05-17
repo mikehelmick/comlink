@@ -462,6 +462,15 @@ ReplicaID public types. Top-level `README.md` quickstart.
 **Exit criterion:** both apps run on 3- and 5-replica clusters under the gRPC transport, survive single and concurrent failures, and recover correctly when failed nodes restart.
 **Artifacts:** `examples/directory/`, `examples/kvstore/`, integration tests under `examples/*/test/`.
 
+**Sub-commit plan (~6–8 commits):**
+- 6(a) examples/kvstore: Store package (Get/Set/Delete/Watch) on a Substrate; in-process unit tests.
+- 6(b) examples/kvstore: 3-replica gRPC integration test (founder + 2 sponsor-joined replicas).
+- 6(c) examples/kvstore: 5-replica failure-injection test (kill replica during writes; remaining converge).
+- 6(d) examples/directory: directory data model + SemOrder ops (insert / update / delete by name).
+- 6(e) examples/directory: SemOrder commutativity end-to-end test (concurrent inserts to disjoint names commute; same-name conflicts resolve deterministically).
+- 6(f) Restart recovery test: kill, restart with same DataDir, replicated state recovers from log replay.
+- 6(g) examples/kvstore/cmd: CLI entrypoint for hand-on-keyboard cluster smoke-testing.
+
 ---
 
 ## 6. Open Questions / Parked Decisions
@@ -498,7 +507,7 @@ ReplicaID public types. Top-level `README.md` quickstart.
 | 2 — Order (PartialOrder, Total, SemOrder)  | done        |
 | 3 — FailureDetection + Membership          | done (v1)   |
 | 4 — Recovery + Trim (HWM)                  | done (v1)   |
-| 5 — Public API: Cluster + Substrates       | in progress |
-| 6 — Demo apps                              | not started |
+| 5 — Public API: Cluster + Substrates       | done (v1)   |
+| 6 — Demo apps                              | in progress |
 
 Update this table as each phase moves through `in progress` and `done`.
