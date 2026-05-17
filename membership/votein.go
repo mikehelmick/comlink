@@ -193,12 +193,13 @@ func (m *Manager) checkVoteInDecision(session *voteInSession) {
 	}
 	session.committed = true
 	target := session.target
+	addr := session.addr
 	session.mu.Unlock()
 
 	// Quorum reached. Broadcast MemberAdd. The commit signal
 	// (session.completed) fires when our own pump applies the
 	// MemberAdd via handleMemberAdd.
-	bs, err := frame.MarshalMemberAdd(target)
+	bs, err := frame.MarshalMemberAdd(target, addr)
 	if err != nil {
 		m.cancelVoteInSession(target, fmt.Errorf("marshal MemberAdd: %w", err))
 		return
@@ -247,12 +248,21 @@ func (m *Manager) addToMLLocked(target *pb.ReplicaID) {
 }
 
 // notifyAdded emits an Added event for downstream layers to wire
-// up transport routing, etc. Phase 3(f) just logs; Phase 5
-// composition layer wires this into the transport.
+// up transport routing, etc. Logs unconditionally and invokes
+// Config.OnMembershipChange (if set) on a goroutine — callbacks
+// must not re-enter the Manager.
 func (m *Manager) notifyAdded(target *pb.ReplicaID, addr string) {
 	m.logger.Info("membership: replica added",
 		"target", fmt.Sprintf("%x", target.GetValue()),
 		"addr", addr)
+	if cb := m.cfg.OnMembershipChange; cb != nil {
+		event := MembershipChange{
+			Kind:    MembershipChangeAdded,
+			Replica: proto.Clone(target).(*pb.ReplicaID),
+			Addr:    addr,
+		}
+		go cb(event)
+	}
 }
 
 // ─── receive-side handlers ────────────────────────────────────────
@@ -303,12 +313,7 @@ func (m *Manager) handleMemberAdd(req *pb.MemberAdd, sender *pb.ReplicaID) {
 		// member; ignore.
 		return
 	}
-	// Sender is the proposer; their addr was originally in the
-	// VoteIn. We don't track that here — we just apply the
-	// addition. (notifyAdded is best-effort logging; callers
-	// who need the addr should subscribe to a future events
-	// channel.)
-	m.applyMemberAdd(target, "")
+	m.applyMemberAdd(target, req.GetAddr())
 	_ = sender
 }
 

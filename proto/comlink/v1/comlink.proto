@@ -50,6 +50,23 @@ message ClusterID {
   bytes value = 1;
 }
 
+// ClusterMember is one entry in the persisted cluster membership
+// state — a ReplicaID and the network address peers should use
+// to reach it. Persisted to stable.Storage as part of
+// PersistedMembership; loaded on Cluster startup to recover the
+// current cluster ML across restarts.
+message ClusterMember {
+  ReplicaID id = 1;
+  string addr = 2;
+}
+
+// PersistedMembership is the stable.Storage form of a Cluster's
+// current membership list. Updated on accepted VoteIn/VoteOut;
+// loaded on Cluster startup.
+message PersistedMembership {
+  repeated ClusterMember members = 1;
+}
+
 // ReplicaID uniquely identifies a participant (process / replica) in a
 // conversation. Stable across restarts of the same logical replica.
 message ReplicaID {

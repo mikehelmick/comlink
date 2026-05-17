@@ -99,6 +99,41 @@ type Config struct {
 	// advances, calls Log.Truncate. Should be the SAME instance
 	// passed into the underlying psync.Conversation.
 	Log clog.MessageLog
+
+	// OnMembershipChange is invoked after an accepted membership
+	// change has been applied locally (after the ML mutation and
+	// any psync reshape). Optional. The callback runs on an
+	// internal goroutine; it MUST NOT call back into the Manager
+	// (re-entrant deadlock). The intended use is to persist or
+	// propagate the change to other layers (transport routing,
+	// stable.Storage, etc).
+	//
+	// addr is populated only for MembershipChangeAdded; for
+	// MembershipChangeRemoved it is the empty string.
+	OnMembershipChange func(event MembershipChange)
+}
+
+// MembershipChangeKind enumerates the kinds of membership change
+// events fired through Config.OnMembershipChange.
+type MembershipChangeKind int
+
+const (
+	// MembershipChangeAdded indicates a replica was added via
+	// VoteIn and the MemberAdd commit message has been applied
+	// locally.
+	MembershipChangeAdded MembershipChangeKind = iota
+	// MembershipChangeRemoved indicates a replica was removed
+	// via an accepted VoteOut.
+	MembershipChangeRemoved
+)
+
+// MembershipChange is the event delivered to
+// Config.OnMembershipChange. Replica is the affected replica;
+// Addr is its network address (set only for Added).
+type MembershipChange struct {
+	Kind    MembershipChangeKind
+	Replica *pb.ReplicaID
+	Addr    string
 }
 
 // AppMessage is the unit handed to applications via Manager.Recv.

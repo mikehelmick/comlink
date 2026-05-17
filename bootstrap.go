@@ -49,6 +49,14 @@ type BootstrapConfig struct {
 	// this destroys cluster identity and any subsequent peer
 	// communication will fail the ClusterID handshake.
 	AllowOverride bool `env:"ALLOW_OVERRIDE"`
+
+	// ClusterID, when set together with Force, installs that
+	// specific ClusterID rather than minting a fresh one. Used
+	// by joiners that have learned the cluster's ID via a
+	// sponsor handshake (Phase 5(i)), and by tests that need
+	// multiple Cluster instances on the same logical cluster.
+	// Must be exactly 16 bytes if non-nil.
+	ClusterID ClusterID `env:"CLUSTER_ID"`
 }
 
 // Errors returned by bootstrap operations.
@@ -82,6 +90,10 @@ func loadOrCreateClusterID(ctx context.Context, storage stable.Storage, b Bootst
 	}
 	hasExisting := !errors.Is(err, stable.ErrNotFound)
 
+	if b.ClusterID != nil && len(b.ClusterID) != idLen {
+		return nil, fmt.Errorf("%w: BootstrapConfig.ClusterID wrong length %d", ErrInvalidID, len(b.ClusterID))
+	}
+
 	switch {
 	case hasExisting && !b.Force:
 		return existing, nil
@@ -90,10 +102,9 @@ func loadOrCreateClusterID(ctx context.Context, storage stable.Storage, b Bootst
 		return nil, ErrBootstrapWouldOverride
 
 	case hasExisting && b.Force && b.AllowOverride:
-		// Mint fresh and overwrite.
-		fresh, err := NewClusterID()
+		fresh, err := chooseClusterID(b)
 		if err != nil {
-			return nil, fmt.Errorf("comlink: generate ClusterID: %w", err)
+			return nil, err
 		}
 		if err := persistClusterID(ctx, storage, fresh); err != nil {
 			return nil, fmt.Errorf("comlink: persist ClusterID: %w", err)
@@ -101,9 +112,9 @@ func loadOrCreateClusterID(ctx context.Context, storage stable.Storage, b Bootst
 		return fresh, nil
 
 	case !hasExisting && b.Force:
-		fresh, err := NewClusterID()
+		fresh, err := chooseClusterID(b)
 		if err != nil {
-			return nil, fmt.Errorf("comlink: generate ClusterID: %w", err)
+			return nil, err
 		}
 		if err := persistClusterID(ctx, storage, fresh); err != nil {
 			return nil, fmt.Errorf("comlink: persist ClusterID: %w", err)
@@ -113,6 +124,21 @@ func loadOrCreateClusterID(ctx context.Context, storage stable.Storage, b Bootst
 	default: // !hasExisting && !b.Force
 		return nil, ErrBootstrapRequired
 	}
+}
+
+// chooseClusterID returns BootstrapConfig.ClusterID if set
+// (joiner / test path) or mints a fresh one (founder path).
+func chooseClusterID(b BootstrapConfig) (ClusterID, error) {
+	if b.ClusterID != nil {
+		out := make(ClusterID, idLen)
+		copy(out, b.ClusterID)
+		return out, nil
+	}
+	fresh, err := NewClusterID()
+	if err != nil {
+		return nil, fmt.Errorf("comlink: generate ClusterID: %w", err)
+	}
+	return fresh, nil
 }
 
 func loadClusterID(ctx context.Context, storage stable.Storage) (ClusterID, error) {

@@ -160,4 +160,9 @@ message VoteInNack {
 // in.
 message MemberAdd {
   ReplicaID target = 1;
+  // addr is the network address peers should use to reach
+  // `target`. Mirrors the addr field on the originating VoteIn
+  // — included on MemberAdd so non-proposer replicas can persist
+  // routing information without retaining VoteIn state.
+  string addr = 2;
 }

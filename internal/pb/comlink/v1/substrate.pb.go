@@ -805,8 +805,13 @@ func (x *VoteInNack) GetTarget() *ReplicaID {
 // will reference MemberAdd as a missing predecessor and pull it
 // in.
 type MemberAdd struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Target        *ReplicaID             `protobuf:"bytes,1,opt,name=target,proto3" json:"target,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Target *ReplicaID             `protobuf:"bytes,1,opt,name=target,proto3" json:"target,omitempty"`
+	// addr is the network address peers should use to reach
+	// `target`. Mirrors the addr field on the originating VoteIn
+	// — included on MemberAdd so non-proposer replicas can persist
+	// routing information without retaining VoteIn state.
+	Addr          string `protobuf:"bytes,2,opt,name=addr,proto3" json:"addr,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -846,6 +851,13 @@ func (x *MemberAdd) GetTarget() *ReplicaID {
 		return x.Target
 	}
 	return nil
+}
+
+func (x *MemberAdd) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
 }
 
 var File_comlink_v1_substrate_proto protoreflect.FileDescriptor
@@ -896,9 +908,10 @@ const file_comlink_v1_substrate_proto_rawDesc = "" +
 	"\x06target\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\x06target\";\n" +
 	"\n" +
 	"VoteInNack\x12-\n" +
-	"\x06target\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\x06target\":\n" +
+	"\x06target\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\x06target\"N\n" +
 	"\tMemberAdd\x12-\n" +
-	"\x06target\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\x06targetBAZ?github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1b\x06proto3"
+	"\x06target\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\x06target\x12\x12\n" +
+	"\x04addr\x18\x02 \x01(\tR\x04addrBAZ?github.com/mikehelmick/comlink/internal/pb/comlink/v1;comlinkv1b\x06proto3"
 
 var (
 	file_comlink_v1_substrate_proto_rawDescOnce sync.Once

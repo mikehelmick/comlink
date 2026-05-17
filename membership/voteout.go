@@ -253,10 +253,27 @@ func (m *Manager) checkVoteOutDecision(session *voteOutSession) {
 		m.maybeTrim()
 	}
 
+	m.notifyRemoved(session.target)
+
 	session.done.Do(func() {
 		session.err = nil
 		close(session.completed)
 	})
+}
+
+// notifyRemoved emits a Removed event for downstream layers
+// (transport routing teardown, stable.Storage persistence, etc).
+// Callback runs on a goroutine — must not re-enter the Manager.
+func (m *Manager) notifyRemoved(target *pb.ReplicaID) {
+	m.logger.Info("membership: replica removed",
+		"target", fmt.Sprintf("%x", target.GetValue()))
+	if cb := m.cfg.OnMembershipChange; cb != nil {
+		event := MembershipChange{
+			Kind:    MembershipChangeRemoved,
+			Replica: proto.Clone(target).(*pb.ReplicaID),
+		}
+		go cb(event)
+	}
 }
 
 // removeFromMLLocked drops target from membershipList.

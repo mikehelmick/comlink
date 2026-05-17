@@ -148,6 +148,110 @@ func (x *ClusterID) GetValue() []byte {
 	return nil
 }
 
+// ClusterMember is one entry in the persisted cluster membership
+// state — a ReplicaID and the network address peers should use
+// to reach it. Persisted to stable.Storage as part of
+// PersistedMembership; loaded on Cluster startup to recover the
+// current cluster ML across restarts.
+type ClusterMember struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            *ReplicaID             `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Addr          string                 `protobuf:"bytes,2,opt,name=addr,proto3" json:"addr,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ClusterMember) Reset() {
+	*x = ClusterMember{}
+	mi := &file_comlink_v1_comlink_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClusterMember) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClusterMember) ProtoMessage() {}
+
+func (x *ClusterMember) ProtoReflect() protoreflect.Message {
+	mi := &file_comlink_v1_comlink_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClusterMember.ProtoReflect.Descriptor instead.
+func (*ClusterMember) Descriptor() ([]byte, []int) {
+	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *ClusterMember) GetId() *ReplicaID {
+	if x != nil {
+		return x.Id
+	}
+	return nil
+}
+
+func (x *ClusterMember) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
+}
+
+// PersistedMembership is the stable.Storage form of a Cluster's
+// current membership list. Updated on accepted VoteIn/VoteOut;
+// loaded on Cluster startup.
+type PersistedMembership struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Members       []*ClusterMember       `protobuf:"bytes,1,rep,name=members,proto3" json:"members,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PersistedMembership) Reset() {
+	*x = PersistedMembership{}
+	mi := &file_comlink_v1_comlink_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PersistedMembership) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PersistedMembership) ProtoMessage() {}
+
+func (x *PersistedMembership) ProtoReflect() protoreflect.Message {
+	mi := &file_comlink_v1_comlink_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PersistedMembership.ProtoReflect.Descriptor instead.
+func (*PersistedMembership) Descriptor() ([]byte, []int) {
+	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *PersistedMembership) GetMembers() []*ClusterMember {
+	if x != nil {
+		return x.Members
+	}
+	return nil
+}
+
 // ReplicaID uniquely identifies a participant (process / replica) in a
 // conversation. Stable across restarts of the same logical replica.
 type ReplicaID struct {
@@ -159,7 +263,7 @@ type ReplicaID struct {
 
 func (x *ReplicaID) Reset() {
 	*x = ReplicaID{}
-	mi := &file_comlink_v1_comlink_proto_msgTypes[2]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -171,7 +275,7 @@ func (x *ReplicaID) String() string {
 func (*ReplicaID) ProtoMessage() {}
 
 func (x *ReplicaID) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_comlink_proto_msgTypes[2]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -184,7 +288,7 @@ func (x *ReplicaID) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicaID.ProtoReflect.Descriptor instead.
 func (*ReplicaID) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{2}
+	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ReplicaID) GetValue() []byte {
@@ -249,7 +353,7 @@ type MessageID struct {
 
 func (x *MessageID) Reset() {
 	*x = MessageID{}
-	mi := &file_comlink_v1_comlink_proto_msgTypes[3]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -261,7 +365,7 @@ func (x *MessageID) String() string {
 func (*MessageID) ProtoMessage() {}
 
 func (x *MessageID) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_comlink_proto_msgTypes[3]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -274,7 +378,7 @@ func (x *MessageID) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MessageID.ProtoReflect.Descriptor instead.
 func (*MessageID) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{3}
+	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *MessageID) GetConversationId() *ConversationID {
@@ -311,7 +415,7 @@ type Envelope struct {
 
 func (x *Envelope) Reset() {
 	*x = Envelope{}
-	mi := &file_comlink_v1_comlink_proto_msgTypes[4]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -323,7 +427,7 @@ func (x *Envelope) String() string {
 func (*Envelope) ProtoMessage() {}
 
 func (x *Envelope) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_comlink_proto_msgTypes[4]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -336,7 +440,7 @@ func (x *Envelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Envelope.ProtoReflect.Descriptor instead.
 func (*Envelope) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{4}
+	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Envelope) GetId() *MessageID {
@@ -364,7 +468,7 @@ type Hello struct {
 
 func (x *Hello) Reset() {
 	*x = Hello{}
-	mi := &file_comlink_v1_comlink_proto_msgTypes[5]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -376,7 +480,7 @@ func (x *Hello) String() string {
 func (*Hello) ProtoMessage() {}
 
 func (x *Hello) ProtoReflect() protoreflect.Message {
-	mi := &file_comlink_v1_comlink_proto_msgTypes[5]
+	mi := &file_comlink_v1_comlink_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -389,7 +493,7 @@ func (x *Hello) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Hello.ProtoReflect.Descriptor instead.
 func (*Hello) Descriptor() ([]byte, []int) {
-	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{5}
+	return file_comlink_v1_comlink_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *Hello) GetText() string {
@@ -408,7 +512,12 @@ const file_comlink_v1_comlink_proto_rawDesc = "" +
 	"\x0eConversationID\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\fR\x05value\"!\n" +
 	"\tClusterID\x12\x14\n" +
-	"\x05value\x18\x01 \x01(\fR\x05value\"!\n" +
+	"\x05value\x18\x01 \x01(\fR\x05value\"J\n" +
+	"\rClusterMember\x12%\n" +
+	"\x02id\x18\x01 \x01(\v2\x15.comlink.v1.ReplicaIDR\x02id\x12\x12\n" +
+	"\x04addr\x18\x02 \x01(\tR\x04addr\"J\n" +
+	"\x13PersistedMembership\x123\n" +
+	"\amembers\x18\x01 \x03(\v2\x19.comlink.v1.ClusterMemberR\amembers\"!\n" +
 	"\tReplicaID\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\fR\x05value\"\xa2\x01\n" +
 	"\tMessageID\x12C\n" +
@@ -433,24 +542,28 @@ func file_comlink_v1_comlink_proto_rawDescGZIP() []byte {
 	return file_comlink_v1_comlink_proto_rawDescData
 }
 
-var file_comlink_v1_comlink_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_comlink_v1_comlink_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_comlink_v1_comlink_proto_goTypes = []any{
-	(*ConversationID)(nil), // 0: comlink.v1.ConversationID
-	(*ClusterID)(nil),      // 1: comlink.v1.ClusterID
-	(*ReplicaID)(nil),      // 2: comlink.v1.ReplicaID
-	(*MessageID)(nil),      // 3: comlink.v1.MessageID
-	(*Envelope)(nil),       // 4: comlink.v1.Envelope
-	(*Hello)(nil),          // 5: comlink.v1.Hello
+	(*ConversationID)(nil),      // 0: comlink.v1.ConversationID
+	(*ClusterID)(nil),           // 1: comlink.v1.ClusterID
+	(*ClusterMember)(nil),       // 2: comlink.v1.ClusterMember
+	(*PersistedMembership)(nil), // 3: comlink.v1.PersistedMembership
+	(*ReplicaID)(nil),           // 4: comlink.v1.ReplicaID
+	(*MessageID)(nil),           // 5: comlink.v1.MessageID
+	(*Envelope)(nil),            // 6: comlink.v1.Envelope
+	(*Hello)(nil),               // 7: comlink.v1.Hello
 }
 var file_comlink_v1_comlink_proto_depIdxs = []int32{
-	0, // 0: comlink.v1.MessageID.conversation_id:type_name -> comlink.v1.ConversationID
-	2, // 1: comlink.v1.MessageID.sender:type_name -> comlink.v1.ReplicaID
-	3, // 2: comlink.v1.Envelope.id:type_name -> comlink.v1.MessageID
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	4, // 0: comlink.v1.ClusterMember.id:type_name -> comlink.v1.ReplicaID
+	2, // 1: comlink.v1.PersistedMembership.members:type_name -> comlink.v1.ClusterMember
+	0, // 2: comlink.v1.MessageID.conversation_id:type_name -> comlink.v1.ConversationID
+	4, // 3: comlink.v1.MessageID.sender:type_name -> comlink.v1.ReplicaID
+	5, // 4: comlink.v1.Envelope.id:type_name -> comlink.v1.MessageID
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_comlink_v1_comlink_proto_init() }
@@ -464,7 +577,7 @@ func file_comlink_v1_comlink_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_comlink_v1_comlink_proto_rawDesc), len(file_comlink_v1_comlink_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   6,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

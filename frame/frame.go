@@ -128,11 +128,13 @@ func MarshalVoteInNack(target *pb.ReplicaID) ([]byte, error) {
 // MarshalMemberAdd is the commit-phase message broadcast by a
 // VoteIn proposer once it has collected quorum Acks. The
 // message's vector clock anchors the partial-order point at
-// which every replica grows its psync.Membership.
-func MarshalMemberAdd(target *pb.ReplicaID) ([]byte, error) {
+// which every replica grows its psync.Membership. The addr is
+// mirrored from the originating VoteIn so non-proposer replicas
+// learn the routing entry alongside the membership change.
+func MarshalMemberAdd(target *pb.ReplicaID, addr string) ([]byte, error) {
 	return marshalMembership(&pb.MembershipEvent{
 		Event: &pb.MembershipEvent_MemberAdd{
-			MemberAdd: &pb.MemberAdd{Target: target},
+			MemberAdd: &pb.MemberAdd{Target: target, Addr: addr},
 		},
 	})
 }

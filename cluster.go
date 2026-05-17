@@ -50,6 +50,7 @@ type Cluster struct {
 	clk       clock.Clock
 
 	storage stable.Storage
+	members *memberStore
 
 	network        transport.Network
 	networkOwnedBy bool // true iff Cluster constructed the gRPC
@@ -105,6 +106,39 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 	}
 	sysConvID := SystemConversationID(clusterID)
 
+	memStore, err := loadMemberStore(ctx, storage)
+	if err != nil {
+		rollback()
+		return nil, err
+	}
+
+	// Seed the persisted ML on first startup using cfg.Members.
+	// On subsequent startups, the persisted list is authoritative
+	// — cfg.Members is treated as the bootstrap-only set.
+	if memStore.Empty() {
+		seed := make([]*pb.ClusterMember, 0, len(cfg.Members))
+		for _, m := range cfg.Members {
+			// Self gets cfg.Transport.Listen; peers get the addr
+			// from cfg.Transport.Sponsors when present, else "".
+			addr := ""
+			if m.Equal(cfg.Self) {
+				addr = cfg.Transport.Listen
+			} else {
+				for _, sp := range cfg.Transport.Sponsors {
+					if sp.ID.Equal(m) {
+						addr = sp.Addr
+						break
+					}
+				}
+			}
+			seed = append(seed, &pb.ClusterMember{Id: m.toPB(), Addr: addr})
+		}
+		if err := memStore.SetAll(ctx, seed); err != nil {
+			rollback()
+			return nil, err
+		}
+	}
+
 	network, ownedNetwork, err := buildNetwork(cfg)
 	if err != nil {
 		rollback()
@@ -127,9 +161,11 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 	}
 	cleanup = append(cleanup, func() { _ = sysLog.Close() })
 
-	members := make([]*pb.ReplicaID, len(cfg.Members))
-	for i, m := range cfg.Members {
-		members[i] = m.toPB()
+	// Initial ML for the system conv = persisted membership.
+	persisted := memStore.Members()
+	members := make([]*pb.ReplicaID, len(persisted))
+	for i, m := range persisted {
+		members[i] = m.GetId()
 	}
 
 	sysConv, err := psync.New(ctx, psync.Config{
@@ -149,21 +185,6 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 	}
 	cleanup = append(cleanup, func() { _ = sysConv.Close() })
 
-	sysMgr, err := membership.New(membership.Config{
-		Conversation:     sysConv,
-		Self:             cfg.Self.toPB(),
-		Members:          members,
-		Log:              sysLog,
-		Clock:            clk,
-		Logger:           logger.With("mgr", "system"),
-		InitialGroupSize: len(members),
-	})
-	if err != nil {
-		rollback()
-		return nil, fmt.Errorf("comlink: create system Manager: %w", err)
-	}
-	cleanup = append(cleanup, func() { _ = sysMgr.Close() })
-
 	c := &Cluster{
 		cfg:            cfg,
 		clusterID:      clusterID,
@@ -171,17 +192,34 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 		logger:         logger,
 		clk:            clk,
 		storage:        storage,
+		members:        memStore,
 		network:        network,
 		networkOwnedBy: ownedNetwork,
 		mux:            mux,
 		sysConv:        sysConv,
 		sysLog:         sysLog,
-		sysMgr:         sysMgr,
 	}
+
+	sysMgr, err := membership.New(membership.Config{
+		Conversation:       sysConv,
+		Self:               cfg.Self.toPB(),
+		Members:            members,
+		Log:                sysLog,
+		Clock:              clk,
+		Logger:             logger.With("mgr", "system"),
+		InitialGroupSize:   len(members),
+		OnMembershipChange: c.onMembershipChange,
+	})
+	if err != nil {
+		rollback()
+		return nil, fmt.Errorf("comlink: create system Manager: %w", err)
+	}
+	cleanup = append(cleanup, func() { _ = sysMgr.Close() })
+	c.sysMgr = sysMgr
 	logger.Info("comlink: cluster started",
 		"cluster_id", clusterID.String(),
 		"self", cfg.Self.String(),
-		"members", len(cfg.Members))
+		"members", len(persisted))
 	return c, nil
 }
 
@@ -247,6 +285,52 @@ func (c *Cluster) Members() []ReplicaID {
 		out[i] = replicaIDFromPB(m)
 	}
 	return out
+}
+
+// VoteIn proposes adding `target` to the cluster (PLAN §2.13).
+// The call blocks until the two-phase VoteIn completes locally
+// (quorum gate + MemberAdd commit). On success, the persisted
+// membership has been updated.
+//
+// addr is the network address peers should use to reach
+// `target` after it is admitted. It is propagated through
+// MemberAdd to every replica so they can persist routing
+// information.
+func (c *Cluster) VoteIn(ctx context.Context, target ReplicaID, addr string) error {
+	if len(target) != idLen {
+		return errors.New("comlink: VoteIn target must be 16 bytes")
+	}
+	return c.sysMgr.VoteIn(ctx, target.toPB(), addr)
+}
+
+// VoteOut proposes removing `target` from the cluster
+// (PLAN §2.13). Returns when the protocol completes (accepted,
+// nacked, or timed out).
+func (c *Cluster) VoteOut(ctx context.Context, target ReplicaID) error {
+	if len(target) != idLen {
+		return errors.New("comlink: VoteOut target must be 16 bytes")
+	}
+	return c.sysMgr.VoteOut(ctx, target.toPB())
+}
+
+// onMembershipChange is the membership.Manager callback.
+// Persists the change to stable.Storage so it survives restart.
+// Runs on a goroutine spawned by the Manager — must not call
+// back into c.sysMgr.
+func (c *Cluster) onMembershipChange(event membership.MembershipChange) {
+	ctx := context.Background()
+	var err error
+	switch event.Kind {
+	case membership.MembershipChangeAdded:
+		err = c.members.Add(ctx, event.Replica, event.Addr)
+	case membership.MembershipChangeRemoved:
+		err = c.members.Remove(ctx, event.Replica)
+	}
+	if err != nil {
+		c.logger.Error("comlink: persist membership change",
+			"kind", event.Kind, "replica", replicaIDFromPB(event.Replica).String(),
+			"err", err)
+	}
 }
 
 // Close shuts the Cluster down cleanly. Idempotent.

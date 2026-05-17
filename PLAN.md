@@ -410,19 +410,34 @@ existing `Substrate.SetWatermark(offset)` is the trim hook.
 - Persistent membership / routing state in stable.Storage.
 
 **Sub-commit plan (~12–14 commits):**
-- 5(a) ClusterID proto + generation + persistence + bootstrap discipline.
-- 5(b) Multi-conversation transport routing (ConversationID on Frame, dispatch).
-- 5(c) Vector-clock reshape on VoteIn (psync.Membership.AddSlot, in-graph reshape).
-- 5(d) Cluster scaffolding + system conversation wiring.
-- 5(e) System StateMachine (cluster membership / routing state).
-- 5(f) Cluster admin API (VoteIn/VoteOut/Members at cluster level).
-- 5(g) App Substrate via Cluster.NewSubstrate.
-- 5(h) Sponsors + bootstrap fallback.
-- 5(i) gRPC ClusterID handshake interceptor.
-- 5(j) Substrate.Submit + StateMachine wiring through chosen Order.
-- 5(k) envconfig integration + LoadConfigFromEnv helper.
-- 5(l) Determinism-violation detection test.
-- 5(m) End-to-end replicated-counter integration test on the public API.
+- 5(a) ClusterID proto + generation + persistence + bootstrap discipline. ✅
+- 5(b) Multi-conversation transport routing (ConversationID on Frame, dispatch). ✅
+- 5(c) Vector-clock reshape on VoteIn (psync.Membership.AddSlot, in-graph reshape). ✅
+- 5(d) Cluster scaffolding + system conversation wiring. ✅
+- 5(e) App Substrate via Cluster.NewSubstrate + Submit + StateMachine wiring. ✅
+- 5(f) Substrate-level heartbeats to make OrderingTotal usable without app cooperation. ✅
+- 5(g) Cluster admin API (VoteIn/VoteOut/Members at cluster level) + persistent membership state. ✅
+- 5(h) Sponsors + bootstrap fallback (joiner learns ClusterID via sponsor handshake).
+- 5(i) gRPC ClusterID handshake interceptor + transport routing updates on admit/evict.
+- 5(j) envconfig integration + LoadConfigFromEnv helper.
+- 5(k) Determinism-violation detection test.
+- 5(l) End-to-end replicated-counter integration test on the public API.
+- 5(m) README quickstart.
+
+Phase 5(g) sub-design — persistence of cluster ML:
+- The membership.Manager fires a new OnMembershipChange callback
+  after each accepted Add/Remove. Cluster's callback writes to
+  stable.Storage under "comlink.members" (a PersistedMembership
+  proto: list of ClusterMember{id, addr}).
+- On (re)start, Cluster loads the persisted set and uses it as the
+  system conv's initial Members (not cfg.Members, which becomes a
+  bootstrap-only seed). The very first startup persists cfg.Members
+  as the seed.
+- MemberAdd was extended with an `addr` field so non-proposer
+  replicas can persist routing alongside the membership change
+  without retaining VoteIn state.
+- BootstrapConfig got a ClusterID field so joiners (Phase 5(h))
+  and tests can install a specific ID rather than mint one.
 
 **Exit criterion:**
 - A new replicated state machine can be built with the public API
