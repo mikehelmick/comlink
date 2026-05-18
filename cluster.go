@@ -423,6 +423,33 @@ func (c *Cluster) ListenAddr() string {
 	return ""
 }
 
+// DataDir returns this Cluster's configured DataDir. Useful for
+// restart tests that need to reopen against the same on-disk
+// state.
+func (c *Cluster) DataDir() string { return c.cfg.DataDir }
+
+// UpdatePeerAddr updates the network address this Cluster uses
+// to reach `replica`. Persisted to stable.Storage so the new
+// address survives restart, and propagated to the gRPC routing
+// table immediately (closing any cached connection to the old
+// address). Useful after a peer has restarted on a new port
+// (e.g. ":0" assignments in tests).
+//
+// No-op for non-gRPC transports (the in-memory test escape
+// hatch), but persistence still updates.
+func (c *Cluster) UpdatePeerAddr(replica ReplicaID, addr string) error {
+	if len(replica) != idLen {
+		return errors.New("comlink: UpdatePeerAddr: replica must be 16 bytes")
+	}
+	if err := c.members.Add(context.Background(), replica.toPB(), addr); err != nil {
+		return err
+	}
+	if gn, ok := c.network.(*cgrpc.Network); ok {
+		gn.AddPeer(replica.toPB(), addr)
+	}
+	return nil
+}
+
 // Members returns a snapshot of the current cluster ML.
 func (c *Cluster) Members() []ReplicaID {
 	pbMembers := c.sysMgr.Members()

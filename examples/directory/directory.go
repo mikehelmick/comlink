@@ -63,10 +63,18 @@ type command struct {
 // classifyName hashes a name to an int — the SemOrder
 // commutativity class. Two ops are in the same class IFF they
 // target the same name.
+//
+// Class 1 is SemOrder's "always commutes" bucket — ops in class
+// 1 fire eagerly and replicas may apply them in different
+// orders. That's WRONG for our directory: same-name Insert and
+// Update don't commute. We map every name into class ≥ 2 to
+// force the wave-batched + intra-wave-sorted path, which gives
+// us deterministic same-name ordering. The +2 offset is the
+// minimal safe shift; the upper bits remain unique per name.
 func classifyName(name string) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(name))
-	return int(h.Sum32())
+	return int(h.Sum32()) + 2
 }
 
 // classifierForDirectory pulls the name out of an encoded
