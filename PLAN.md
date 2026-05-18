@@ -469,7 +469,7 @@ ReplicaID public types. Top-level `README.md` quickstart.
 - 6(d) examples/directory: directory data model + SemOrder ops (insert / update / delete by name). ✅
 - 6(e) examples/directory: SemOrder commutativity end-to-end test (concurrent inserts to disjoint names commute; same-name conflicts resolve deterministically). ✅
 - 6(f) Restart recovery test: cluster identity + ML persist across restart; restarted replica processes new writes. ✅ (SM state recovery deferred to Phase 7)
-- 6(g) examples/kvstore/cmd: CLI entrypoint for hand-on-keyboard cluster smoke-testing.
+- 6(g) examples/kvstore/cmd: CLI entrypoint for hand-on-keyboard cluster smoke-testing. ✅
 
 **Known issues surfaced in Phase 6:**
 - TestDirectoryUpdateSemantics is currently skipped: inserter
@@ -521,6 +521,6 @@ ReplicaID public types. Top-level `README.md` quickstart.
 | 3 — FailureDetection + Membership          | done (v1)   |
 | 4 — Recovery + Trim (HWM)                  | done (v1)   |
 | 5 — Public API: Cluster + Substrates       | done (v1)   |
-| 6 — Demo apps                              | nearly done |
+| 6 — Demo apps                              | done (v1)   |
 
 Update this table as each phase moves through `in progress` and `done`.
