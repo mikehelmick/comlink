@@ -387,6 +387,23 @@ func (s *Substrate) Members() []ReplicaID {
 	return out
 }
 
+// FreezeMember marks `replica`'s slot as frozen in this
+// Substrate's psync membership — the ordering layer will no
+// longer wait for this replica's messages. The replica is NOT
+// removed (the slot is kept for vector-clock alignment).
+//
+// Intended use: an application learns that a replica is dead at
+// the cluster level (e.g. via Cluster.VoteOut) and must mirror
+// the eviction on each app substrate to unblock total-order
+// wave completion. Currently this is a manual step; Phase 7 may
+// automate cluster→substrate membership propagation.
+//
+// Re-freezing a frozen replica returns an error from psync;
+// callers can typically ignore it.
+func (s *Substrate) FreezeMember(replica ReplicaID) error {
+	return s.conv.FreezeMember(replica.toPB())
+}
+
 // ConversationID returns this substrate's conversation id.
 func (s *Substrate) ConversationID() ConversationID { return s.cfg.ConversationID }
 

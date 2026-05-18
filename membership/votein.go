@@ -230,6 +230,10 @@ func (m *Manager) applyMemberAdd(target *pb.ReplicaID, addr string) {
 			"target", fmt.Sprintf("%x", target.GetValue()), "err", err)
 	}
 
+	// Start tracking heartbeats from the new replica so the FD
+	// can detect failures going forward.
+	m.fd.AddMember(target)
+
 	m.notifyAdded(target, addr)
 
 	if session != nil {

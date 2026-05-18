@@ -171,6 +171,33 @@ func (d *Detector) Suspected(replica *pb.ReplicaID) bool {
 	return ok
 }
 
+// AddMember starts tracking replica. Called by the membership
+// layer when a new replica is admitted via VoteIn — without
+// this, the FD would not expect heartbeats from the new replica
+// and would never suspect it if it failed.
+//
+// Initializes lastReceived to now so the new replica gets a
+// full SuspicionInterval grace period before being suspected.
+// Idempotent — re-adding a tracked replica resets its grace
+// period, which is the desired behavior on a re-VoteIn.
+func (d *Detector) AddMember(replica *pb.ReplicaID) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if bytes.Equal(replica.GetValue(), d.cfg.Self.GetValue()) {
+		return
+	}
+	key := string(replica.GetValue())
+	for _, mb := range d.memberByteForms {
+		if bytes.Equal(mb, replica.GetValue()) {
+			d.lastReceived[key] = d.cfg.Clock.Now()
+			delete(d.suspected, key)
+			return
+		}
+	}
+	d.memberByteForms = append(d.memberByteForms, bytes.Clone(replica.GetValue()))
+	d.lastReceived[key] = d.cfg.Clock.Now()
+}
+
 // RemoveMember stops tracking replica entirely — used after a
 // VoteOut concludes the replica is permanently removed from the
 // conversation. Subsequent ticks will not check for suspicion of

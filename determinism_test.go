@@ -208,24 +208,29 @@ func runDeterminismScenario(t *testing.T, factory func() snapshottableSM) [][]by
 	}
 	wg.Wait()
 
-	// Wait for every replica to have at least applied the
-	// expected number of messages. For OrderingTotal +
-	// heartbeats this happens within ~hundreds of ms.
+	// Wait for every replica to have applied the same number of
+	// messages — snapshot comparison requires they're at the
+	// SAME point in the ordered stream, not just past some
+	// threshold.
 	want := realRounds * len(nodes)
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for {
-		allReady := true
-		for _, n := range nodes {
-			if appliedCount(n.sm) < want {
-				allReady = false
-				break
+		counts := make([]int, len(nodes))
+		minC, maxC := -1, -1
+		for i, n := range nodes {
+			counts[i] = appliedCount(n.sm)
+			if minC < 0 || counts[i] < minC {
+				minC = counts[i]
+			}
+			if counts[i] > maxC {
+				maxC = counts[i]
 			}
 		}
-		if allReady {
+		if minC >= want && minC == maxC {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Logf("warning: not all replicas reached %d applies", want)
+			t.Logf("warning: counts %v did not converge to == within deadline", counts)
 			break
 		}
 		time.Sleep(10 * time.Millisecond)

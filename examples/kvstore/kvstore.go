@@ -152,6 +152,21 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 	return s, nil
 }
 
+// FreezeMember propagates a cluster-level eviction down to the
+// Store's underlying Substrate. The substrate will stop waiting
+// for `replica`'s messages, unblocking total-order wave
+// completion. Idempotent in practice — the caller should not
+// require strict error semantics if `replica` is already
+// frozen or absent.
+//
+// Typical use: after Cluster.VoteOut(replica) succeeds at the
+// system level, call store.FreezeMember(replica) on every
+// surviving replica so the app substrate also evicts the dead
+// node.
+func (s *Store) FreezeMember(replica comlink.ReplicaID) error {
+	return s.sub.FreezeMember(replica)
+}
+
 // Close tears down the backing Substrate and closes every
 // active Watch channel. Subsequent Set / Delete / Watch return
 // errors via the Substrate.
