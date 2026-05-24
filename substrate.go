@@ -344,17 +344,30 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 	})
 	cleanup = append(cleanup, func() { _ = s.hb.Close() })
 
+	// If the SM implements Snapshotter, register the substrate as
+	// the snapshot source for its conversation. This lets the
+	// Cluster's StreamSnapshot RPC serve snapshots from this
+	// substrate to joiners pulling state.
+	if _, ok := cfg.StateMachine.(Snapshotter); ok {
+		c.registerSnapshotSource(s)
+		cleanup = append(cleanup, func() { c.unregisterSnapshotSource(cfg.ConversationID) })
+	}
+
 	// Install the initial snapshot BEFORE the apply pump starts
 	// — Restore must complete before any Apply could fire.
 	if cfg.InitialSnapshot != nil {
 		snap := cfg.InitialSnapshot
-		if err := cfg.StateMachine.(Snapshotter).Restore(snap.Bytes); err != nil {
+		r := snap.reader()
+		if r == nil {
+			rollback()
+			return nil, errors.New("comlink: InitialSnapshot has neither Bytes nor Reader set")
+		}
+		if err := cfg.StateMachine.(Snapshotter).Restore(r); err != nil {
 			rollback()
 			return nil, fmt.Errorf("comlink: StateMachine.Restore: %w", err)
 		}
 		logger.Info("substrate: restored from snapshot",
-			"through_offset", snap.ThroughOffset,
-			"size_bytes", len(snap.Bytes))
+			"through_offset", snap.ThroughOffset)
 	}
 
 	go s.applyPump()

@@ -14,7 +14,10 @@
 
 package comlink
 
-import "sync/atomic"
+import (
+	"io"
+	"sync/atomic"
+)
 
 // Snapshotter is the OPTIONAL capability a StateMachine can
 // implement to participate in comlink's snapshot protocol
@@ -50,35 +53,101 @@ type Snapshotter interface {
 	// of the latest Apply included in the snapshot, OR zero if
 	// no Apply has happened yet.
 	//
+	// Apps with huge state should consider a future
+	// StreamingSnapshotter (Phase 11+) that writes to an
+	// io.Writer instead of returning bytes; for Phase 10 the
+	// byte-slice form is the only producer-side API and apps
+	// with multi-GB state should handle the memory budget
+	// themselves (e.g., gzip + chunked encoding inside the
+	// returned []byte, or use the streaming Persist API once
+	// added).
+	//
 	// Implementations must be safe to call from any goroutine.
-	// The substrate guarantees no Apply is in-flight on the
-	// caller goroutine — but Snapshot CAN race with peer Submits
-	// applying on a different goroutine, so apps that need a
-	// consistent point-in-time view should snapshot under their
-	// own internal lock (typically the same lock Apply uses).
+	// Snapshot CAN race with peer Submits applying on a
+	// different goroutine, so apps that need a consistent
+	// point-in-time view should snapshot under their own
+	// internal lock (typically the same lock Apply uses).
 	Snapshot() (bytes []byte, throughOffset uint64, err error)
 
-	// Restore re-installs SM state from snapshot bytes. Called
-	// exactly once at Substrate construction time if a snapshot
-	// is supplied via SubstrateConfig.InitialSnapshot.
+	// Restore re-installs SM state from a snapshot reader.
+	// Called exactly once at Substrate construction time if a
+	// snapshot is supplied via SubstrateConfig.InitialSnapshot.
+	//
+	// io.Reader (not []byte) because the wire transfer is
+	// chunked (Phase 10(c) StreamSnapshot RPC) and joiners
+	// stage chunks to disk: passing the reassembled file as a
+	// Reader avoids holding multi-GB snapshots in memory.
+	// Implementations may io.ReadAll if their state is small.
 	//
 	// After Restore returns, the substrate plays Apply for
 	// messages whose Offset is STRICTLY GREATER than the
 	// snapshot's throughOffset. Apps must finish installing the
-	// state synchronously before returning.
-	Restore(bytes []byte) error
+	// state synchronously before returning. The caller closes
+	// any underlying file after Restore returns.
+	Restore(r io.Reader) error
 }
 
-// Snapshot is the wire-form pair (opaque bytes, throughOffset)
-// that travels between snapshotter calls and substrate config.
+// Snapshot is the wire-form pair (opaque source, throughOffset)
+// passed to SubstrateConfig.InitialSnapshot. Bytes OR Reader
+// must be set (Reader takes precedence) — the substrate calls
+// SM.Restore(reader) where reader is either Reader directly or
+// a bytes.NewReader(Bytes) wrapper.
+//
+// The Reader form is what the streaming join handshake uses
+// (Phase 10(d)) — joiners stream chunks to a temp file in the
+// DataDir, then open it as the reader. Apps loading their own
+// persisted snapshots can use either form.
 type Snapshot struct {
-	// Bytes is the SM's serialized state. Opaque to comlink.
+	// Bytes is the SM's serialized state, in memory. For small
+	// snapshots. Either Bytes or Reader must be non-nil.
 	Bytes []byte
+	// Reader is a stream over the snapshot's serialized state.
+	// For large snapshots that shouldn't be held in memory.
+	// Either Bytes or Reader must be non-nil; if both, Reader
+	// wins. The substrate does NOT close it — caller owns
+	// lifecycle.
+	Reader io.Reader
 	// ThroughOffset is the log offset of the last Apply included
 	// in this snapshot. Apply messages with Offset > ThroughOffset
 	// are still pending and will be replayed by the substrate
 	// after Restore.
 	ThroughOffset uint64
+}
+
+// reader returns an io.Reader over the snapshot's bytes, using
+// the Reader field if set and otherwise wrapping Bytes.
+// Returns nil if neither is set.
+func (s *Snapshot) reader() io.Reader {
+	if s == nil {
+		return nil
+	}
+	if s.Reader != nil {
+		return s.Reader
+	}
+	if s.Bytes != nil {
+		return bytesReader(s.Bytes)
+	}
+	return nil
+}
+
+// bytesReader is the trivial bytes-to-Reader adapter, kept as
+// a helper so the import stays inside snapshot.go.
+func bytesReader(b []byte) io.Reader {
+	return &byteSliceReader{b: b}
+}
+
+type byteSliceReader struct {
+	b []byte
+	i int
+}
+
+func (r *byteSliceReader) Read(p []byte) (int, error) {
+	if r.i >= len(r.b) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.b[r.i:])
+	r.i += n
+	return n, nil
 }
 
 // snapshotWatermark is the per-substrate tracker for "this

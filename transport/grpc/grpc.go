@@ -59,7 +59,8 @@ const ClusterIDMetadataKey = "x-comlink-cluster-id"
 // bypass — a joiner uses Join to LEARN the ClusterID and can't
 // possibly send it on the way in.
 var ExemptHandshakeMethods = map[string]bool{
-	"/comlink.v1.Cluster/Join": true,
+	"/comlink.v1.Cluster/Join":           true,
+	"/comlink.v1.Cluster/StreamSnapshot": true,
 }
 
 // Peer is a routing-table entry mapping a ReplicaID to a network

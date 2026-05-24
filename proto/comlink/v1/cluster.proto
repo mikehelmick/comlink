@@ -43,6 +43,25 @@ service Cluster {
   // membership. Returns an error (codes.FailedPrecondition,
   // codes.PermissionDenied, etc) if VoteIn was rejected.
   rpc Join(JoinRequest) returns (JoinResponse);
+
+  // StreamSnapshot streams a snapshot of one Substrate's state
+  // from the sponsor to the joiner (PLAN §10(c)). Server-
+  // streaming so multi-GB snapshots don't have to fit in a
+  // single gRPC message.
+  //
+  // The sponsor calls its local app's Snapshotter.Snapshot() to
+  // produce the snapshot bytes + the through-offset, then
+  // chunks the bytes for transmission. The joiner accumulates
+  // chunks (typically to a temp file in DataDir/snapshots/<conv>/)
+  // and calls Snapshotter.Restore once with a Reader over the
+  // reassembled file.
+  //
+  // Exempt from the ClusterID handshake interceptor (a joiner
+  // making this call IS already known to the cluster via Join,
+  // but the gRPC interceptor is set up at connection time and
+  // we keep things uniform — see transport/grpc.
+  // ExemptHandshakeMethods).
+  rpc StreamSnapshot(SnapshotRequest) returns (stream SnapshotChunk);
 }
 
 message JoinRequest {
@@ -62,4 +81,47 @@ message JoinResponse {
   // members is the cluster's membership list AFTER the joiner
   // has been admitted (so it includes the joiner).
   repeated ClusterMember members = 2;
+}
+
+// SnapshotRequest identifies WHICH substrate the joiner is
+// asking for a snapshot of.
+message SnapshotRequest {
+  // conversation_id of the substrate whose snapshot is
+  // requested. The sponsor must have a Substrate bound to this
+  // conv via Cluster.RegisterSnapshotSource (10(d)).
+  ConversationID conversation_id = 1;
+  // requester is informational — used by the sponsor's logs /
+  // metrics to identify who's pulling.
+  ReplicaID requester = 2;
+}
+
+// SnapshotChunk is one piece of a streamed snapshot.
+//
+// Wire discipline:
+//   - The FIRST chunk MUST have header set (carries through_offset
+//     and total_size_hint). Subsequent chunks have header unset.
+//   - chunk_index starts at 0 and MUST increment monotonically.
+//   - The LAST chunk MUST have last = true.
+//   - data may be empty on a chunk if the snapshot is empty
+//     (header-only first chunk with last=true).
+message SnapshotChunk {
+  SnapshotHeader header = 1;        // present only on chunk 0
+  uint64 chunk_index = 2;
+  bytes data = 3;
+  bool last = 4;
+}
+
+// SnapshotHeader carries metadata that's only needed once per
+// stream — sent inline on the first SnapshotChunk so the
+// receiver can stage / size-check from the start.
+message SnapshotHeader {
+  // through_offset: the log offset of the last Apply included
+  // in this snapshot. The joiner installs this snapshot as
+  // InitialSnapshot.ThroughOffset so its Substrate's apply
+  // pump suppresses double-applies.
+  uint64 through_offset = 1;
+  // total_size_bytes hint: the full snapshot's serialized size
+  // if known. Zero = unknown / streaming production. Useful for
+  // progress reporting.
+  uint64 total_size_bytes = 2;
 }

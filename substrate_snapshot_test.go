@@ -17,6 +17,7 @@ package comlink_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"sync"
 	"testing"
 
@@ -72,9 +73,13 @@ func (s *snapshotterSM) Snapshot() ([]byte, uint64, error) {
 	return bs, s.maxOff, err
 }
 
-func (s *snapshotterSM) Restore(bytes []byte) error {
+func (s *snapshotterSM) Restore(r io.Reader) error {
+	bs, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
 	var p snapshotPayload
-	if err := json.Unmarshal(bytes, &p); err != nil {
+	if err := json.Unmarshal(bs, &p); err != nil {
 		return err
 	}
 	s.mu.Lock()

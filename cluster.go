@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"sync"
+	"sync" //nolint:gci
 
 	"github.com/mikehelmick/comlink/clock"
 	pb "github.com/mikehelmick/comlink/internal/pb/comlink/v1"
@@ -59,6 +59,14 @@ type Cluster struct {
 	sysConv *psync.Conversation
 	sysLog  clog.MessageLog
 	sysMgr  *membership.Manager
+
+	// snapshotSources tracks per-conversation snapshot producers
+	// (one per Substrate that opts in). When a joiner asks for
+	// the snapshot of conv X via StreamSnapshot, the sponsor
+	// looks up the source here and streams its output.
+	// Phase 10(c)+(d).
+	snapshotMu      sync.Mutex
+	snapshotSources map[string]*Substrate
 
 	// runCtx is the Cluster's own lifetime context, cancelled by
 	// Close. Internal goroutines (psync pumps, membership pump,
@@ -216,20 +224,21 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 	cleanup = append(cleanup, func() { _ = sysConv.Close() })
 
 	c := &Cluster{
-		cfg:            cfg,
-		clusterID:      clusterID,
-		sysConvID:      sysConvID,
-		logger:         logger,
-		clk:            clk,
-		storage:        storage,
-		members:        memStore,
-		network:        network,
-		networkOwnedBy: ownedNetwork,
-		mux:            mux,
-		sysConv:        sysConv,
-		sysLog:         sysLog,
-		runCtx:         runCtx,
-		runCancel:      runCancel,
+		cfg:             cfg,
+		clusterID:       clusterID,
+		sysConvID:       sysConvID,
+		logger:          logger,
+		clk:             clk,
+		storage:         storage,
+		members:         memStore,
+		network:         network,
+		networkOwnedBy:  ownedNetwork,
+		mux:             mux,
+		sysConv:         sysConv,
+		sysLog:          sysLog,
+		runCtx:          runCtx,
+		runCancel:       runCancel,
+		snapshotSources: make(map[string]*Substrate),
 	}
 
 	sysMgr, err := membership.New(membership.Config{
@@ -438,6 +447,30 @@ func (c *Cluster) ListenAddr() string {
 // restart tests that need to reopen against the same on-disk
 // state.
 func (c *Cluster) DataDir() string { return c.cfg.DataDir }
+
+// registerSnapshotSource wires a Substrate up as the source of
+// snapshots for its ConversationID. Called from NewSubstrate
+// when the SM implements Snapshotter — only then can the
+// substrate respond to a StreamSnapshot RPC.
+//
+// Internal API; not user-callable.
+func (c *Cluster) registerSnapshotSource(sub *Substrate) {
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	c.snapshotSources[string(sub.cfg.ConversationID)] = sub
+}
+
+func (c *Cluster) unregisterSnapshotSource(convID ConversationID) {
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	delete(c.snapshotSources, string(convID))
+}
+
+func (c *Cluster) lookupSnapshotSource(convID ConversationID) *Substrate {
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	return c.snapshotSources[string(convID)]
+}
 
 // UpdatePeerAddr updates the network address this Cluster uses
 // to reach `replica`. Persisted to stable.Storage so the new
