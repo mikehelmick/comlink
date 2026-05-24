@@ -63,6 +63,7 @@ import (
 
 	"github.com/mikehelmick/comlink"
 	"github.com/mikehelmick/comlink/examples/kvstore"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -258,6 +259,15 @@ func newRouter(cluster *comlink.Cluster, store *kvstore.Store, logger *slog.Logg
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
+
+	// Prometheus scrape endpoint. Exposes both comlink-library
+	// metrics (cluster size, substrate submit/apply counts &
+	// latencies, membership votes) and kvstore-specific ones
+	// (set/get/delete rate, key count, watcher count).
+	mux.Handle("GET /metrics", promhttp.HandlerFor(
+		comlink.MetricsRegistry(),
+		promhttp.HandlerOpts{},
+	))
 
 	mux.HandleFunc("GET /cluster/info", func(w http.ResponseWriter, r *http.Request) {
 		members := cluster.Members()

@@ -265,6 +265,8 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 		gn.Start()
 	}
 
+	c.refreshMembersGauge()
+
 	logger.Info("comlink: cluster started",
 		"cluster_id", clusterID.String(),
 		"self", cfg.Self.String(),
@@ -469,6 +471,24 @@ func (c *Cluster) Members() []ReplicaID {
 	return out
 }
 
+// voteOutcomeLabel maps a VoteIn/Out result into a stable
+// Prometheus label value. nil → "accepted".
+func voteOutcomeLabel(err error) string {
+	if err == nil {
+		return "accepted"
+	}
+	if errors.Is(err, membership.ErrVoteInNacked) || errors.Is(err, membership.ErrVoteOutNacked) {
+		return "nacked"
+	}
+	if errors.Is(err, membership.ErrVoteInTimeout) || errors.Is(err, membership.ErrVoteOutTimeout) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "error"
+}
+
 // VoteIn proposes adding `target` to the cluster (PLAN §2.13).
 // The call blocks until the two-phase VoteIn completes locally
 // (quorum gate + MemberAdd commit). On success, the persisted
@@ -482,7 +502,9 @@ func (c *Cluster) VoteIn(ctx context.Context, target ReplicaID, addr string) err
 	if len(target) != idLen {
 		return errors.New("comlink: VoteIn target must be 16 bytes")
 	}
-	return c.sysMgr.VoteIn(ctx, target.toPB(), addr)
+	err := c.sysMgr.VoteIn(ctx, target.toPB(), addr)
+	metricMembershipVoteIn.WithLabelValues(voteOutcomeLabel(err)).Inc()
+	return err
 }
 
 // VoteOut proposes removing `target` from the cluster
@@ -492,7 +514,9 @@ func (c *Cluster) VoteOut(ctx context.Context, target ReplicaID) error {
 	if len(target) != idLen {
 		return errors.New("comlink: VoteOut target must be 16 bytes")
 	}
-	return c.sysMgr.VoteOut(ctx, target.toPB())
+	err := c.sysMgr.VoteOut(ctx, target.toPB())
+	metricMembershipVoteOut.WithLabelValues(voteOutcomeLabel(err)).Inc()
+	return err
 }
 
 // onMembershipChange is the membership.Manager callback.
@@ -510,17 +534,33 @@ func (c *Cluster) onMembershipChange(event membership.MembershipChange) {
 		if gn, ok := c.network.(*cgrpc.Network); ok && event.Addr != "" {
 			gn.AddPeer(event.Replica, event.Addr)
 		}
+		metricMembershipChange.WithLabelValues("added").Inc()
 	case membership.MembershipChangeRemoved:
 		err = c.members.Remove(ctx, event.Replica)
 		if gn, ok := c.network.(*cgrpc.Network); ok {
 			gn.RemovePeer(event.Replica)
 		}
+		metricMembershipChange.WithLabelValues("removed").Inc()
 	}
 	if err != nil {
 		c.logger.Error("comlink: persist membership change",
 			"kind", event.Kind, "replica", replicaIDFromPB(event.Replica).String(),
 			"err", err)
 	}
+	// Refresh the cluster-members gauge so dashboards reflect the
+	// new size. sysMgr.Members() is the live view.
+	c.refreshMembersGauge()
+}
+
+// refreshMembersGauge updates the comlink_cluster_members gauge
+// to the current ML size. Called on construction and after every
+// membership change. Idempotent.
+func (c *Cluster) refreshMembersGauge() {
+	if c.sysMgr == nil {
+		return
+	}
+	metricClusterMembers.WithLabelValues(c.clusterID.String()).
+		Set(float64(len(c.sysMgr.Members())))
 }
 
 // Close shuts the Cluster down cleanly. Idempotent.

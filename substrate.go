@@ -325,6 +325,11 @@ func buildOrder(conv *psync.Conversation, cfg SubstrateConfig) (order.Order, err
 // The same payload will be applied at every replica in the
 // substrate's chosen ordering — all replicas converge.
 func (s *Substrate) Submit(ctx context.Context, payload []byte) error {
+	submitStart := time.Now()
+	convLabel := shortConvID(s.cfg.ConversationID)
+	defer func() {
+		metricSubstrateSubmitDuration.WithLabelValues(convLabel).Observe(time.Since(submitStart).Seconds())
+	}()
 	wrapped, err := frame.MarshalApp(payload)
 	if err != nil {
 		return fmt.Errorf("comlink: Submit: wrap: %w", err)
@@ -333,6 +338,7 @@ func (s *Substrate) Submit(ctx context.Context, payload []byte) error {
 	if err != nil {
 		return fmt.Errorf("comlink: Submit: send: %w", err)
 	}
+	metricSubstrateSubmitted.WithLabelValues(convLabel).Inc()
 	s.hb.NoteSent()
 	// Compute sender_seq from the returned MessageID + our known
 	// member list. Self's slot index is its position in cfg.Members.
@@ -517,7 +523,11 @@ func (s *Substrate) handleApplied(ctx context.Context, applied order.Applied) {
 		Offset:  offset,
 		Wave:    waveOfVC(vc),
 	}
+	convLabel := shortConvID(s.cfg.ConversationID)
+	applyStart := time.Now()
 	s.cfg.StateMachine.Apply(ctx, msg)
+	metricSubstrateApplyDuration.WithLabelValues(convLabel).Observe(time.Since(applyStart).Seconds())
+	metricSubstrateApplied.WithLabelValues(convLabel).Inc()
 
 	// Signal any matching Submit waiter, OR record that this
 	// sender_seq has been applied so a soon-to-register Submit

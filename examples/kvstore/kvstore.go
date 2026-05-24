@@ -45,6 +45,52 @@ import (
 	"sync"
 
 	"github.com/mikehelmick/comlink"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+// Phase 8(e) — kvstore Prometheus metrics. Registered on the
+// comlink-shared registry so apps that expose /metrics via
+// comlink.MetricsRegistry() pick them up automatically.
+var (
+	metricKVSet = promauto.With(comlink.MetricsRegistry()).NewCounter(
+		prometheus.CounterOpts{
+			Name: "kvstore_set_total",
+			Help: "Number of Store.Set calls accepted at this replica.",
+		},
+	)
+	metricKVDelete = promauto.With(comlink.MetricsRegistry()).NewCounter(
+		prometheus.CounterOpts{
+			Name: "kvstore_delete_total",
+			Help: "Number of Store.Delete calls accepted at this replica.",
+		},
+	)
+	metricKVGet = promauto.With(comlink.MetricsRegistry()).NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "kvstore_get_total",
+			Help: "Number of Store.Get calls served from local state.",
+		},
+		[]string{"result"}, // "hit" | "miss"
+	)
+	metricKVKeys = promauto.With(comlink.MetricsRegistry()).NewGauge(
+		prometheus.GaugeOpts{
+			Name: "kvstore_keys",
+			Help: "Number of keys currently present at this replica.",
+		},
+	)
+	metricKVWatchers = promauto.With(comlink.MetricsRegistry()).NewGauge(
+		prometheus.GaugeOpts{
+			Name: "kvstore_watchers",
+			Help: "Number of active Watch subscriptions at this replica.",
+		},
+	)
+	metricKVApply = promauto.With(comlink.MetricsRegistry()).NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "kvstore_apply_total",
+			Help: "Operations applied to the local Store via StateMachine.Apply.",
+		},
+		[]string{"op"}, // "set" | "del" | "malformed"
+	)
 )
 
 // ─── command schema ─────────────────────────────────────────────
@@ -99,8 +145,9 @@ type Store struct {
 	mu   sync.RWMutex
 	data map[string]string
 
-	watchMu  sync.Mutex
-	watchers map[string]map[*watcher]struct{}
+	watchMu       sync.Mutex
+	watchers      map[string]map[*watcher]struct{}
+	totalWatchers int
 }
 
 // watcher is the internal handle for one Watch call. Channel
@@ -187,6 +234,7 @@ func (s *Store) Close() error {
 func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
 	var c command
 	if err := json.Unmarshal(msg.Payload, &c); err != nil {
+		metricKVApply.WithLabelValues("malformed").Inc()
 		return // malformed command — ignore deterministically.
 	}
 	s.mu.Lock()
@@ -195,12 +243,15 @@ func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
 	switch c.Op {
 	case opSet:
 		s.data[c.K] = c.V
+		metricKVApply.WithLabelValues("set").Inc()
 	case opDelete:
 		delete(s.data, c.K)
+		metricKVApply.WithLabelValues("del").Inc()
 	default:
 		s.mu.Unlock()
 		return
 	}
+	metricKVKeys.Set(float64(len(s.data)))
 	s.mu.Unlock()
 
 	// Fan out to watchers AFTER releasing the data lock so a
@@ -221,8 +272,13 @@ func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
 // by the network roundtrip + ordering pipeline.
 func (s *Store) Get(key string) (string, bool) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	v, ok := s.data[key]
+	s.mu.RUnlock()
+	if ok {
+		metricKVGet.WithLabelValues("hit").Inc()
+	} else {
+		metricKVGet.WithLabelValues("miss").Inc()
+	}
 	return v, ok
 }
 
@@ -235,6 +291,7 @@ func (s *Store) Set(ctx context.Context, key, value string) error {
 	if err != nil {
 		return fmt.Errorf("kvstore: marshal Set: %w", err)
 	}
+	metricKVSet.Inc()
 	return s.sub.Submit(ctx, bs)
 }
 
@@ -245,6 +302,7 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 	if err != nil {
 		return fmt.Errorf("kvstore: marshal Delete: %w", err)
 	}
+	metricKVDelete.Inc()
 	return s.sub.Submit(ctx, bs)
 }
 
@@ -263,6 +321,8 @@ func (s *Store) Watch(key string) (<-chan Event, func()) {
 		s.watchers[key] = bucket
 	}
 	bucket[w] = struct{}{}
+	s.totalWatchers++
+	metricKVWatchers.Set(float64(s.totalWatchers))
 	s.watchMu.Unlock()
 	cancel := func() {
 		s.watchMu.Lock()
@@ -278,6 +338,8 @@ func (s *Store) Watch(key string) (<-chan Event, func()) {
 		if len(bucket) == 0 {
 			delete(s.watchers, key)
 		}
+		s.totalWatchers--
+		metricKVWatchers.Set(float64(s.totalWatchers))
 		close(w.ch)
 	}
 	return w.ch, cancel

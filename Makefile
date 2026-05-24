@@ -84,6 +84,14 @@ k8s-up:
 k8s-down:
 	./deploy/local/down.sh
 
+.PHONY: k8s-apply
+k8s-apply:
+	kubectl apply -k deploy/manifests/app/
+
+.PHONY: k8s-smoke
+k8s-smoke:
+	./deploy/local/smoke-test.sh
+
 # Generate Go code from .proto files. Outputs land under $(PROTO_OUT).
 # Requires: protoc, protoc-gen-go, protoc-gen-go-grpc.
 .PHONY: proto
