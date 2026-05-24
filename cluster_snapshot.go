@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -125,6 +126,39 @@ func streamSnapshotChunks(stream pb.Cluster_StreamSnapshotServer, snapBytes []by
 		idx++
 	}
 	return nil
+}
+
+// maybeAutoBootstrapSnapshot is called from Substrate.NewSubstrate
+// when cfg.AutoBootstrapFromSponsor is true. Returns a non-nil
+// *Snapshot only when a pull was attempted AND succeeded.
+//
+// Skip conditions (return nil, nil):
+//   - cfg.Transport.Sponsors is empty (founder mode — no peer
+//     to pull from).
+//   - the substrate's local log already contains entries (this
+//     is a restart, not a first-time join — Phase 7(b) log
+//     replay handles it).
+//
+// On true error (pull was attempted but the gRPC stream
+// failed): returns nil, err. Caller logs warn + continues
+// without a snapshot.
+func (c *Cluster) maybeAutoBootstrapSnapshot(ctx context.Context, cfg SubstrateConfig, logger *slog.Logger, logIsEmpty bool) (*Snapshot, error) {
+	if len(c.cfg.Transport.Sponsors) == 0 {
+		// Founder; nothing to pull from.
+		return nil, nil
+	}
+	if !logIsEmpty {
+		logger.Debug("substrate: auto-bootstrap skipped (local log non-empty)",
+			"conv", cfg.ConversationID.String()[:8])
+		return nil, nil
+	}
+	// First sponsor for now. Future: try sponsors in order on
+	// per-sponsor failure.
+	sponsor := c.cfg.Transport.Sponsors[0]
+	logger.Info("substrate: auto-bootstrap pulling snapshot",
+		"conv", cfg.ConversationID.String()[:8],
+		"sponsor", sponsor.Addr)
+	return c.PullSnapshot(ctx, sponsor.Addr, cfg.ConversationID)
 }
 
 // PullSnapshot is the joiner-side helper: dials a peer, calls

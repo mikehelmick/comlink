@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"sync"
@@ -120,10 +121,37 @@ type SubstrateConfig struct {
 	// StateMachine to implement Snapshotter; if it doesn't, the
 	// config is rejected at NewSubstrate.
 	//
-	// Phase 10(b): apps load this from their own persistent
-	// storage on startup. Phase 10(d) extends sponsor handshake
-	// to deliver a snapshot for joiners.
+	// Mutually exclusive with AutoBootstrapFromSponsor — set
+	// one or the other, not both.
 	InitialSnapshot *Snapshot
+
+	// AutoBootstrapFromSponsor, when true, makes NewSubstrate
+	// automatically call Cluster.PullSnapshot against the
+	// cluster's sponsor (cfg.Transport.Sponsors[0]) when the
+	// substrate's local log is empty AND the SM implements
+	// Snapshotter. The pulled snapshot is then installed as
+	// InitialSnapshot.
+	//
+	// Convenience for the joiner-bootstrap path: an app that
+	// joins an existing cluster via Sponsors and creates a
+	// substrate for a conv that's been running (and possibly
+	// trimmed) on the founder. Without this, the app would have
+	// to call PullSnapshot itself and pass the result via
+	// InitialSnapshot — workable, but boilerplate.
+	//
+	// No-op when:
+	//   - cfg.Transport.Sponsors is empty (founder mode),
+	//   - the substrate's local log already has entries
+	//     (restart, not first-time join), or
+	//   - the SM doesn't implement Snapshotter.
+	//
+	// On pull failure: logged at warn level but NOT fatal.
+	// The substrate starts empty and the lost-message protocol
+	// catches up — assuming the cluster hasn't trimmed past
+	// what's needed (Phase 10(e) trim safety).
+	//
+	// Mutually exclusive with InitialSnapshot.
+	AutoBootstrapFromSponsor bool
 
 	// AutoEvict, when non-nil, enables substrate-level failure
 	// detection: if a peer's heartbeats stop for longer than
@@ -253,11 +281,41 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 	for i, m := range cfg.Members {
 		pbMembers[i] = m.toPB()
 	}
-	// Validate InitialSnapshot before allocating anything else:
-	// it's a fast caller-error check.
+	// Validate snapshot config before allocating anything else:
+	// fast caller-error checks.
+	if cfg.InitialSnapshot != nil && cfg.AutoBootstrapFromSponsor {
+		return nil, errors.New("comlink: SubstrateConfig: InitialSnapshot and AutoBootstrapFromSponsor are mutually exclusive")
+	}
 	if cfg.InitialSnapshot != nil {
 		if _, ok := cfg.StateMachine.(Snapshotter); !ok {
 			return nil, errors.New("comlink: SubstrateConfig.InitialSnapshot set but StateMachine does not implement Snapshotter")
+		}
+	}
+	if cfg.AutoBootstrapFromSponsor {
+		if _, ok := cfg.StateMachine.(Snapshotter); !ok {
+			return nil, errors.New("comlink: SubstrateConfig.AutoBootstrapFromSponsor set but StateMachine does not implement Snapshotter")
+		}
+	}
+
+	// Resolve auto-bootstrap into a concrete InitialSnapshot
+	// BEFORE proceeding with substrate setup. PullSnapshot is a
+	// gRPC round-trip; we do it inline so any Restore happens
+	// before the apply pump starts. Uses the log's own
+	// FirstOffset/NextOffset to determine emptiness — checking
+	// the filesystem directly gave false positives because
+	// clog.OpenFile writes metadata even for fresh logs.
+	initialSnap := cfg.InitialSnapshot
+	if cfg.AutoBootstrapFromSponsor && initialSnap == nil {
+		logIsEmpty := mlog.NextOffset() == mlog.FirstOffset()
+		pulled, err := c.maybeAutoBootstrapSnapshot(ctx, cfg, logger, logIsEmpty)
+		if err != nil {
+			// Logged as a warning by maybeAutoBootstrap... — we
+			// don't fail here so the substrate can still come up
+			// and try lost-message recovery.
+			logger.Warn("substrate: auto-bootstrap snapshot pull failed; continuing without snapshot",
+				"conv", cfg.ConversationID.String()[:8], "err", err)
+		} else if pulled != nil {
+			initialSnap = pulled
 		}
 	}
 
@@ -274,9 +332,9 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 		pendingApplies: make(map[indexKey]chan struct{}),
 		appliedSelf:    make(map[indexKey]struct{}),
 	}
-	if cfg.InitialSnapshot != nil {
-		s.snapshotThrough = cfg.InitialSnapshot.ThroughOffset
-		s.snapshotWmk.advance(cfg.InitialSnapshot.ThroughOffset)
+	if initialSnap != nil {
+		s.snapshotThrough = initialSnap.ThroughOffset
+		s.snapshotWmk.advance(initialSnap.ThroughOffset)
 	}
 
 	// Bind psync to the Cluster's lifetime ctx, NOT the caller's
@@ -355,9 +413,8 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 
 	// Install the initial snapshot BEFORE the apply pump starts
 	// — Restore must complete before any Apply could fire.
-	if cfg.InitialSnapshot != nil {
-		snap := cfg.InitialSnapshot
-		r := snap.reader()
+	if initialSnap != nil {
+		r := initialSnap.reader()
 		if r == nil {
 			rollback()
 			return nil, errors.New("comlink: InitialSnapshot has neither Bytes nor Reader set")
@@ -366,8 +423,14 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 			rollback()
 			return nil, fmt.Errorf("comlink: StateMachine.Restore: %w", err)
 		}
+		// Close the underlying file (and remove the staged temp
+		// file) if the Reader was a PullSnapshot stage. Bytes-
+		// based snapshots don't implement Closer.
+		if c, ok := initialSnap.Reader.(io.Closer); ok {
+			_ = c.Close()
+		}
 		logger.Info("substrate: restored from snapshot",
-			"through_offset", snap.ThroughOffset)
+			"through_offset", initialSnap.ThroughOffset)
 	}
 
 	go s.applyPump()

@@ -147,6 +147,147 @@ func TestPullSnapshotEndToEnd(t *testing.T) {
 	}
 }
 
+// TestAutoBootstrapFromSponsor (Phase 10(d)): a substrate
+// constructed with AutoBootstrapFromSponsor=true on a joiner
+// Cluster (sponsors set) auto-pulls a snapshot during
+// NewSubstrate and Restores the SM — no manual PullSnapshot
+// call from the app code.
+func TestAutoBootstrapFromSponsor(t *testing.T) {
+	ctx := context.Background()
+	alice := id16("alice")
+	bob := id16("bob")
+	clusterID, _ := comlink.NewClusterID()
+
+	// Alice founds with a known ClusterID so bob can join.
+	aliceCluster, err := comlink.NewCluster(ctx, comlink.ClusterConfig{
+		Self:    alice,
+		Members: []comlink.ReplicaID{alice, bob}, // pre-known so VoteIn isn't needed
+		DataDir: t.TempDir(),
+		Bootstrap: &comlink.BootstrapConfig{
+			Force:     true,
+			ClusterID: clusterID,
+		},
+		Transport: comlink.TransportConfig{Listen: "127.0.0.1:0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer aliceCluster.Close()
+
+	convID, _ := comlink.NewConversationID()
+	aliceSM := newPullableSM()
+	aliceSub, err := aliceCluster.NewSubstrate(ctx, comlink.SubstrateConfig{
+		ConversationID: convID,
+		Members:        []comlink.ReplicaID{alice, bob},
+		Ordering:       comlink.OrderingPartial,
+		StateMachine:   aliceSM,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer aliceSub.Close()
+
+	// Populate alice's state.
+	want := map[string]string{}
+	for i := 0; i < 25; i++ {
+		k := fmt.Sprintf("k%02d", i)
+		v := fmt.Sprintf("v%02d", i)
+		want[k] = v
+		op, _ := json.Marshal(pullableOp{K: k, V: v})
+		if err := aliceSub.Submit(ctx, op); err != nil {
+			t.Fatalf("alice Submit %d: %v", i, err)
+		}
+	}
+
+	// Bob — joiner Cluster with alice as sponsor + same ClusterID.
+	bobCluster, err := comlink.NewCluster(ctx, comlink.ClusterConfig{
+		Self:    bob,
+		Members: []comlink.ReplicaID{alice, bob},
+		DataDir: t.TempDir(),
+		Bootstrap: &comlink.BootstrapConfig{
+			Force:     true,
+			ClusterID: clusterID,
+		},
+		Transport: comlink.TransportConfig{
+			Listen: "127.0.0.1:0",
+			Sponsors: []comlink.Sponsor{
+				{ID: alice, Addr: aliceCluster.ListenAddr()},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bobCluster.Close()
+
+	// Build bob's substrate with AutoBootstrapFromSponsor — no
+	// manual PullSnapshot call. The substrate should pull,
+	// Restore, and come up with alice's state already installed.
+	bobSM := newPullableSM()
+	bobSub, err := bobCluster.NewSubstrate(ctx, comlink.SubstrateConfig{
+		ConversationID:           convID,
+		Members:                  []comlink.ReplicaID{alice, bob},
+		Ordering:                 comlink.OrderingPartial,
+		StateMachine:             bobSM,
+		AutoBootstrapFromSponsor: true,
+	})
+	if err != nil {
+		t.Fatalf("bob NewSubstrate w/ AutoBootstrapFromSponsor: %v", err)
+	}
+	defer bobSub.Close()
+
+	got, restored := bobSM.snapshot()
+	if !restored {
+		t.Fatal("AutoBootstrapFromSponsor: SM.Restore was not called")
+	}
+	if len(got) != len(want) {
+		t.Fatalf("AutoBootstrapFromSponsor: len(state) = %d, want %d", len(got), len(want))
+	}
+	for k, v := range want {
+		if g := got[k]; g != v {
+			t.Errorf("bob[%q] = %q, want %q", k, g, v)
+		}
+	}
+}
+
+// TestAutoBootstrapFromSponsorFounderIsNoOp: AutoBootstrapFromSponsor
+// on a founder (no sponsors configured) is a silent no-op — the
+// substrate comes up empty as expected for the founder role.
+func TestAutoBootstrapFromSponsorFounderIsNoOp(t *testing.T) {
+	ctx := context.Background()
+	alice := id16("alice")
+	aliceCluster, err := comlink.NewCluster(ctx, comlink.ClusterConfig{
+		Self:      alice,
+		Members:   []comlink.ReplicaID{alice},
+		DataDir:   t.TempDir(),
+		Bootstrap: &comlink.BootstrapConfig{Force: true},
+		Transport: comlink.TransportConfig{Listen: "127.0.0.1:0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer aliceCluster.Close()
+
+	convID, _ := comlink.NewConversationID()
+	sm := newPullableSM()
+	sub, err := aliceCluster.NewSubstrate(ctx, comlink.SubstrateConfig{
+		ConversationID:           convID,
+		Members:                  []comlink.ReplicaID{alice},
+		Ordering:                 comlink.OrderingPartial,
+		StateMachine:             sm,
+		AutoBootstrapFromSponsor: true,
+	})
+	if err != nil {
+		t.Fatalf("founder NewSubstrate w/ AutoBootstrap: %v", err)
+	}
+	defer sub.Close()
+
+	_, restored := sm.snapshot()
+	if restored {
+		t.Error("founder: Restore was called but there's no sponsor to pull from")
+	}
+}
+
 // TestPullSnapshotMissingSource: pulling for an unknown conv
 // returns a gRPC NotFound from the server.
 func TestPullSnapshotMissingSource(t *testing.T) {
