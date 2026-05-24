@@ -1,0 +1,47 @@
+# Minimal Prometheus config. Two scrape jobs:
+#   - comlink-kvd-pods: discovers pods via the comlink namespace
+#     with annotation prometheus.io/scrape=true and pulls
+#     /metrics from the port named "http".
+#   - prometheus-self: standard self-monitoring.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: comlink
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      - job_name: prometheus
+        static_configs:
+          - targets: ['localhost:9090']
+
+      - job_name: comlink-kvd
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [comlink]
+        relabel_configs:
+          # Only scrape pods explicitly opted in.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: 'true'
+          # Use the pod's declared scrape port if set.
+          - source_labels:
+              - __address__
+              - __meta_kubernetes_pod_annotation_prometheus_io_port
+            action: replace
+            regex: '([^:]+)(?::\d+)?;(\d+)'
+            replacement: '$1:$2'
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
