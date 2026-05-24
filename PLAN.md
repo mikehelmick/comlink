@@ -526,20 +526,39 @@ ReplicaID public types. Top-level `README.md` quickstart.
     + post-snapshot lost-message replay without errors.
 
 **Sub-commit plan:**
-- 10(a) Substrate `AutoEvictConfig` + auto-freeze on suspicion.
-  Wired into the kvd binary via a new env var.
-- 10(b) `Snapshotter` interface (opt-in); Substrate persists
-  snapshots to stable.Storage on a configurable cadence.
-- 10(c) On restart, Substrate restores from latest snapshot
-  BEFORE log replay; replay then resumes from the snapshot's
-  offset forward.
-- 10(d) Snapshot-aware sponsor handshake: JoinResponse carries
-  the sponsor's latest snapshot (or a reference). Joiner installs
-  + resumes.
-- 10(e) Trim safety: a message is safe to trim only when every
-  member's persisted snapshot covers it. Today's trim watermark
-  protocol is extended with a `snapshot_through_offset` field.
-- 10(f) End-to-end test: trim-then-join recovery scenario.
+- 10(a) Substrate `AutoEvictConfig` + auto-freeze on suspicion. ✅
+- 10(b) `Snapshotter` interface (app-owned). Apps provide:
+  `Snapshot() (bytes, throughOffset, error)` and
+  `Restore(bytes) error`. Substrate calls into these — the
+  library only sees opaque bytes + an offset boundary, never
+  the snapshot's internal format or storage.
+- 10(c) Snapshot watermark plumbed into the trim protocol: a
+  log offset is safe to trim only when every member has both
+  applied past it AND has a persisted snapshot covering it.
+  Apps tell comlink "I've snapshotted through offset N" via
+  a new `Substrate.AdvanceSnapshotWatermark(N)` call.
+- 10(d) Snapshot-aware join handshake: JoinResponse gains an
+  optional snapshot blob + throughOffset. The joiner's app
+  receives it via `StateMachine.Restore` before any Apply
+  fires. Joiner's substrate then resumes lost-message
+  catch-up from throughOffset, NOT from the beginning.
+- 10(e) End-to-end test: trim-then-join recovery scenario
+  in the kvstore example. App-side snapshot is just
+  json.Marshal/Unmarshal of the map; demonstrates the full
+  protocol with a realistic (if simple) app implementation.
+
+**Design boundary (per Phase 10 design discussion):**
+The application owns ALL of:
+  - snapshot serialization format
+  - snapshot durable storage
+  - snapshot cadence
+  - snapshot size / compression / versioning
+Comlink owns ONLY:
+  - the protocol coordinator role (when to ask, when to apply)
+  - the wire format for transferring snapshot bytes during
+    sponsor handshake
+  - the trim-safety invariant tying snapshot coverage to log
+    truncation
 
 **Bugs the soak surfaced (and which are now fixed):**
 - `psync.handleReplay` pushed to the deliver channel WHILE
