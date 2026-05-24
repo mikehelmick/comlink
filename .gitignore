@@ -38,3 +38,4 @@ go.work.sum
 # OS junk
 .DS_Store
 
+/comlink-soak
