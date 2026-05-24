@@ -49,6 +49,19 @@ tidy:
 .PHONY: ci
 ci: vet test
 
+# Stress-loop the previously-flaky tests under -race. Used to verify
+# Phase 7 hardening — any one of these tripping again is a regression.
+# Tunable: STRESS_COUNT (default 10). On a typical laptop:
+#   STRESS_COUNT=10  →  ~2  min
+#   STRESS_COUNT=50  →  ~10 min
+STRESS_COUNT ?= 10
+STRESS_TESTS := TestDirectoryUpdateSemantics|TestSubstrateMultiReplicaConverges|TestDeterministicSMReplicasConverge|TestKVStoreFiveReplica|TestKVStoreReplicaRestart
+STRESS_PKGS  := . ./examples/directory/ ./examples/kvstore/
+
+.PHONY: stress
+stress:
+	$(GO) test -race -count=$(STRESS_COUNT) -timeout=1800s -run '$(STRESS_TESTS)' $(STRESS_PKGS)
+
 # Generate Go code from .proto files. Outputs land under $(PROTO_OUT).
 # Requires: protoc, protoc-gen-go, protoc-gen-go-grpc.
 .PHONY: proto

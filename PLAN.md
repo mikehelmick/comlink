@@ -470,9 +470,9 @@ ReplicaID public types. Top-level `README.md` quickstart.
 
 **Sub-commit plan:**
 - 7(a) Diagnose & fix SemOrder Insert→Update propagation gap; same root cause fixed in Total. ✅
-- 7(b) Substrate auto-recover from local log on construction — rebuild SM state by replaying through the Order layer.
-- 7(c) End-to-end restart test verifying pre-crash SM state recovery (validates 7b).
-- 7(d) Stress-loop CI helper (a small test harness that runs the flaky tests repeatedly to verify they're now stable).
+- 7(b) Substrate auto-recover from local log on construction — rebuild SM state by replaying through the Order layer. ✅
+- 7(c) End-to-end restart test verifying pre-crash SM state recovery (validates 7b). ✅
+- 7(d) `make stress` target — runs all previously-flaky tests in a loop, used to detect regressions. ✅
 
 **Phase 7(a) findings:**
 Three bugs combined to make TestDirectoryUpdateSemantics flake:
@@ -551,6 +551,6 @@ explicit "settle" messages added.
 | 4 — Recovery + Trim (HWM)                  | done (v1)   |
 | 5 — Public API: Cluster + Substrates       | done (v1)   |
 | 6 — Demo apps                              | done (v1)   |
-| 7 — Correctness hardening                  | in progress |
+| 7 — Correctness hardening                  | done (v1)   |
 
 Update this table as each phase moves through `in progress` and `done`.

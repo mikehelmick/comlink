@@ -246,6 +246,27 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 	cleanup = append(cleanup, func() { _ = s.hb.Close() })
 
 	go s.applyPump()
+
+	// Phase 7(b): replay the local log so the StateMachine
+	// rebuilds pre-crash state. Each replayed envelope is pushed
+	// to the deliver channel and flows through Order → SM exactly
+	// as if it had just been received. No-op for fresh substrates
+	// (log is empty).
+	//
+	// This runs INLINE before returning so callers that issue
+	// Submit immediately after NewSubstrate see a recovered SM —
+	// not a half-recovered one mid-replay. Note: we don't wait for
+	// SM.Apply to actually fire for every replayed message; the
+	// Order layer's wave gates may defer some applies until live
+	// peer heartbeats catch up. Callers that need full convergence
+	// should poll their own SM state.
+	replayed, err := conv.ReplayLog(c.runCtx)
+	if err != nil {
+		logger.Warn("substrate: log replay error", "err", err)
+	} else if replayed > 0 {
+		logger.Info("substrate: replayed log entries", "count", replayed)
+	}
+
 	return s, nil
 }
 

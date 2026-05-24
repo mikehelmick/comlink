@@ -149,7 +149,15 @@ type maskRequest struct {
 	replica *pb.ReplicaID
 	ctx     context.Context
 }
-type replayLogRequest struct{}
+type replayLogRequest struct {
+	// deliver controls whether each successfully-inserted envelope
+	// is also pushed to the deliver channel. Restart (peer catch-up
+	// protocol) sets false — it only rebuilds the graph so we can
+	// answer LostMessageRequest queries. Substrate's auto-recover
+	// path (ReplayLog) sets true so messages re-flow through Order
+	// → SM, rebuilding SM state from scratch.
+	deliver bool
+}
 type waveCompleteRequest struct{ wave uint64 }
 type messagesInWaveRequest struct{ wave uint64 }
 type stableMessageIDsRequest struct{}
@@ -253,7 +261,7 @@ func (s *serverImpl) HandleCall(req request, st *state) (response, *state) {
 		}
 		return maskResponse{err: err}, st
 	case replayLogRequest:
-		n, err := s.handleReplay(st)
+		n, err := s.handleReplay(st, r.deliver)
 		return replayLogResponse{inserted: n, err: err}, st
 	case waveCompleteRequest:
 		return waveCompleteResponse{
@@ -442,6 +450,29 @@ func (c *Conversation) Maskout(ctx context.Context, replica *pb.ReplicaID) error
 func (c *Conversation) Maskin(ctx context.Context, replica *pb.ReplicaID) error {
 	resp := c.srv.Call(maskRequest{in: true, replica: replica, ctx: ctx})
 	return resp.(maskResponse).err
+}
+
+// ReplayLog replays every entry in the local message log: each
+// envelope is inserted into the in-memory graph AND pushed to the
+// deliver channel. Used by Substrate.NewSubstrate to rebuild
+// StateMachine state on restart — replayed envelopes flow through
+// the Order layer exactly as if they had just been received,
+// giving the SM the same prefix it had pre-crash.
+//
+// Returns the number of envelopes successfully replayed. Safe to
+// call once during construction; calling it after live traffic has
+// begun is allowed but most callers won't want to (everything in
+// the log is already in the graph by then, so all inserts dedup
+// and nothing is delivered).
+//
+// Caveat: replay pushes to the (buffered) deliver channel. If the
+// Order layer is not actively draining, the genserver Call will
+// block until it does. Callers must have the Order pump running
+// before invoking ReplayLog.
+func (c *Conversation) ReplayLog(ctx context.Context) (int, error) {
+	resp := c.srv.Call(replayLogRequest{deliver: true})
+	rr := resp.(replayLogResponse)
+	return rr.inserted, rr.err
 }
 
 // Membership returns this conversation's LIVE membership view —
@@ -722,13 +753,16 @@ func (s *serverImpl) processNewlyAvailable(st *state, senderBytes []byte, seq ui
 // post-replay leaf-set + lost-message exchange recovers them via
 // peers per PLAN §1 pruned-region invariant.
 //
-// Replayed entries are NOT pushed to the application's Recv
-// channel: re-delivery is the application's concern (Phase 4 will
-// add a checkpoint mechanism so the application can know what was
-// already applied pre-crash).
+// When deliverReplayed is true, each successfully-inserted
+// envelope is also pushed to the deliver channel so Order →
+// StateMachine pipelines can rebuild SM state during restart
+// (Phase 7(b)). When false (Restart's peer-catchup path), the
+// graph is rebuilt but the SM is not re-driven — the caller is
+// expected to recover SM state via some other means (e.g.,
+// application-level checkpoints).
 //
 // Returns the number of entries successfully inserted.
-func (s *serverImpl) handleReplay(st *state) (int, error) {
+func (s *serverImpl) handleReplay(st *state, deliverReplayed bool) (int, error) {
 	ctx := context.Background()
 	inserted := 0
 	for entry, err := range s.log.Range(ctx, s.log.FirstOffset(), clog.EndOfLog) {
@@ -752,6 +786,10 @@ func (s *serverImpl) handleReplay(st *state) (int, error) {
 		switch {
 		case err == nil:
 			inserted++
+			if deliverReplayed {
+				node := st.graph.Lookup(env.GetId().GetSender().GetValue(), senderSeq)
+				s.deliver <- Delivery{Envelope: env, Node: node}
+			}
 		case errors.Is(err, ErrMissingParents):
 			// Pruned predecessor; will be recovered by leaf
 			// exchange + lost-message protocol after replay.

@@ -52,7 +52,7 @@ var ErrRestartTimedOut = errors.New("psync: restart timed out without any peer a
 // the Conversation is closed.
 func (c *Conversation) Restart(ctx context.Context) error {
 	// 1. Replay local log into the graph.
-	resp := c.srv.Call(replayLogRequest{})
+	resp := c.srv.Call(replayLogRequest{deliver: false})
 	if rr := resp.(replayLogResponse); rr.err != nil {
 		return fmt.Errorf("psync: Restart: log replay: %w", rr.err)
 	}

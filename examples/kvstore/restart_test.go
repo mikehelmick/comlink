@@ -23,6 +23,114 @@ import (
 	"github.com/mikehelmick/comlink/examples/kvstore"
 )
 
+// TestKVStoreReplicaRestartRecoversSMState (Phase 7(c)): a
+// restarted replica's StateMachine recovers its pre-crash state
+// from the local log via Substrate.NewSubstrate's auto-replay
+// (Phase 7(b)).
+//
+// Flow:
+//   1. 3 replicas via sponsor handshake.
+//   2. Each writes one key. All converge.
+//   3. r2 closed (clean crash).
+//   4. r2 reopened on same DataDir, kvstore re-created.
+//   5. WITHOUT any new writes from peers, r2's local Get for
+//      each pre-crash key returns the recovered value.
+func TestKVStoreReplicaRestartRecoversSMState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("gRPC restart test is heavy; skip in -short")
+	}
+	ctx := context.Background()
+
+	replicas := []string{"r0", "r1", "r2"}
+	clusters := startSponsorJoinedCluster(t, replicas)
+	expect := []comlink.ReplicaID{id16("r0"), id16("r1"), id16("r2")}
+	allReplicasReady(t, clusters, expect, 5*time.Second)
+
+	convID, _ := comlink.NewConversationID()
+	nodes := startStoresOnClusters(t, clusters, convID, expect)
+
+	// Phase 1 — three writes, one per replica.
+	want := map[string]string{
+		"from-r0": "alpha",
+		"from-r1": "beta",
+		"from-r2": "gamma",
+	}
+	for i, n := range nodes {
+		wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		key := []string{"from-r0", "from-r1", "from-r2"}[i]
+		val := want[key]
+		if err := n.store.Set(wctx, key, val); err != nil {
+			cancel()
+			t.Fatalf("pre-crash Set on r%d: %v", i, err)
+		}
+		cancel()
+	}
+	waitConvergeStores(t, nodes, want, 10*time.Second)
+
+	r2DataDir := clusters[2].DataDir()
+	r2Self := clusters[2].Self()
+
+	// Phase 2 — crash r2.
+	t.Log("crashing r2 after full converge")
+	if err := nodes[2].store.Close(); err != nil {
+		t.Errorf("r2 store Close: %v", err)
+	}
+	if err := clusters[2].Close(); err != nil {
+		t.Errorf("r2 cluster Close: %v", err)
+	}
+
+	// Phase 3 — restart r2 from disk.
+	t.Log("restarting r2 from persisted state")
+	restartedR2, err := comlink.NewCluster(ctx, comlink.ClusterConfig{
+		Self:    r2Self,
+		DataDir: r2DataDir,
+		Transport: comlink.TransportConfig{
+			Listen: "127.0.0.1:0",
+		},
+	})
+	if err != nil {
+		t.Fatalf("restart r2: %v", err)
+	}
+	defer restartedR2.Close()
+
+	restartedStore, err := kvstore.New(ctx, kvstore.Config{
+		Cluster:        restartedR2,
+		ConversationID: convID,
+		Members:        expect,
+	})
+	if err != nil {
+		t.Fatalf("create restarted r2 store: %v", err)
+	}
+	defer restartedStore.Close()
+
+	// Phase 4 — local Get on the restarted r2 returns the
+	// pre-crash values WITHOUT any peer interaction. This is the
+	// 7(b) auto-replay-from-log guarantee.
+	//
+	// The replay happens inline in NewSubstrate, but the resulting
+	// SM.Apply calls run async through Order's wave gates. Poll
+	// briefly to allow the recovery to settle.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ok := true
+		for k, v := range want {
+			got, present := restartedStore.Get(k)
+			if !present || got != v {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			snap := restartedStore.Snapshot()
+			t.Fatalf("r2 SM did not recover from log: snapshot=%v want=%v", snap, want)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // TestKVStoreReplicaRestartRejoinsCluster: demonstrates that a
 // replica's cluster-level identity survives a clean process
 // restart (same DataDir). Specifically:
