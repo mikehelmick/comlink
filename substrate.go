@@ -112,6 +112,49 @@ type SubstrateConfig struct {
 	Logger *slog.Logger
 	// Clock; defaults to the parent Cluster's clock.
 	Clock clock.Clock
+
+	// AutoEvict, when non-nil, enables substrate-level failure
+	// detection: if a peer's heartbeats stop for longer than
+	// SuspicionInterval, the substrate freezes that peer's slot
+	// (Substrate.FreezeMember) so the Order layer's wave gates
+	// can continue to make progress without waiting for the dead
+	// peer. Eviction is permanent for the lifetime of this
+	// Substrate — a re-joining replica would need to come back
+	// via a fresh Substrate (e.g. through Cluster.VoteIn +
+	// substrate re-creation).
+	//
+	// nil (default) preserves the historical behavior: the
+	// substrate's heartbeats fire but suspicion is effectively
+	// disabled, and Submits block on wave completion across the
+	// full original membership.
+	AutoEvict *AutoEvictConfig
+}
+
+// AutoEvictConfig configures Substrate.AutoEvict.
+//
+// The substrate's heartbeat-only failure detector emits a
+// ConvFrame.heartbeat every QuietInterval of local-send silence.
+// On the receive side, if no message arrives from a peer for
+// SuspicionInterval, the substrate freezes that peer's slot
+// in its psync.Membership.
+type AutoEvictConfig struct {
+	// QuietInterval — emit a heartbeat after this much local
+	// outbound silence. Should be << SuspicionInterval so peers
+	// see liveness signals well before timing out. Default 150ms.
+	QuietInterval time.Duration
+
+	// SuspicionInterval — declare a peer dead after this much
+	// silence and freeze its slot. Default 10s. Tune to your
+	// fault model: too short and a transient network hiccup
+	// causes a permanent eviction; too long and write
+	// availability suffers during pod restarts.
+	SuspicionInterval time.Duration
+
+	// OnEvict is invoked synchronously when this Substrate
+	// auto-freezes `peer`. The local Members snapshot is the
+	// post-freeze view. Optional — useful for application-level
+	// metrics or logging.
+	OnEvict func(peer ReplicaID, members []ReplicaID)
 }
 
 // Substrate is one application's handle to a replicated state
@@ -186,6 +229,20 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 	for i, m := range cfg.Members {
 		pbMembers[i] = m.toPB()
 	}
+	// Construct the Substrate skeleton FIRST so we can wire its
+	// noteReceive method into psync's OnReceive callback. The
+	// hb field is filled in below; noteReceive guards on nil.
+	s := &Substrate{
+		cfg:            cfg,
+		cluster:        c,
+		logger:         logger,
+		log:            mlog,
+		stopped:        make(chan struct{}),
+		pumpDone:       make(chan struct{}),
+		pendingApplies: make(map[indexKey]chan struct{}),
+		appliedSelf:    make(map[indexKey]struct{}),
+	}
+
 	// Bind psync to the Cluster's lifetime ctx, NOT the caller's
 	// NewSubstrate ctx — the latter is typically a short-lived
 	// bootstrap context that would otherwise kill the conv's pumps
@@ -200,6 +257,9 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 		Logger:          logger,
 		Clock:           clk,
 		DeliveryBufSize: 1024,
+		// Receive-path liveness signal — keeps the FD's view of
+		// peers fresh even when the Order wave gate is stalled.
+		OnReceive: s.noteReceive,
 	})
 	if err != nil {
 		rollback()
@@ -214,34 +274,37 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 	}
 	cleanup = append(cleanup, func() { _ = ord.Close() })
 
-	s := &Substrate{
-		cfg:            cfg,
-		cluster:        c,
-		logger:         logger,
-		conv:           conv,
-		log:            mlog,
-		ord:            ord,
-		stopped:        make(chan struct{}),
-		pumpDone:       make(chan struct{}),
-		pendingApplies: make(map[indexKey]chan struct{}),
-		appliedSelf:    make(map[indexKey]struct{}),
-	}
+	s.conv = conv
+	s.ord = ord
 	s.close = rollback
 
-	// Heartbeat-only failure.Detector: emits ConvFrame.heartbeat
-	// when this conversation has been quiet, advancing stability
-	// for the Order layer. Suspicion is disabled (interval set
-	// effectively-infinite, OnSuspect is no-op) — peer liveness
-	// is the system conv's responsibility, not this substrate's.
+	// Heartbeat-only failure.Detector. When AutoEvict is nil
+	// (default) suspicion is disabled and the substrate waits
+	// for every original member to advance the wave gate. When
+	// AutoEvict is set, on-suspicion the substrate freezes the
+	// peer's slot so the Order layer can keep making progress.
+	quietInterval := 150 * time.Millisecond
+	suspInterval := 100 * 365 * 24 * time.Hour // ~"never"
+	onSuspect := func(*pb.ReplicaID) {}
+	if cfg.AutoEvict != nil {
+		if cfg.AutoEvict.QuietInterval > 0 {
+			quietInterval = cfg.AutoEvict.QuietInterval
+		}
+		suspInterval = 10 * time.Second
+		if cfg.AutoEvict.SuspicionInterval > 0 {
+			suspInterval = cfg.AutoEvict.SuspicionInterval
+		}
+		onSuspect = s.handleAutoEvict
+	}
 	s.hb = failure.New(failure.Config{
 		Self:              c.cfg.Self.toPB(),
 		Members:           pbMembers,
 		Clock:             clk,
-		QuietInterval:     150 * time.Millisecond,
-		SuspicionInterval: 100 * 365 * 24 * time.Hour,
+		QuietInterval:     quietInterval,
+		SuspicionInterval: suspInterval,
 		TickInterval:      25 * time.Millisecond,
 		SendHeartbeat:     s.sendHeartbeat,
-		OnSuspect:         func(*pb.ReplicaID) {},
+		OnSuspect:         onSuspect,
 	})
 	cleanup = append(cleanup, func() { _ = s.hb.Close() })
 
@@ -271,6 +334,48 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 	}()
 
 	return s, nil
+}
+
+// noteReceive is wired into psync as OnReceive. Fires on every
+// successfully-decoded inbound frame, regardless of whether
+// the Order wave gate is open. Phase 10(a): keeps FD's
+// lastReceived for the peer fresh so auto-evict doesn't fire
+// spuriously when waves are stalled.
+//
+// Tolerates s.hb being nil during the narrow construction
+// window between Substrate skeleton creation and FD wiring.
+func (s *Substrate) noteReceive(from *pb.ReplicaID) {
+	if s.hb != nil {
+		s.hb.NoteReceived(from)
+	}
+}
+
+// handleAutoEvict fires (synchronously, from the FD tick
+// goroutine) on every alive→suspected transition when AutoEvict
+// is configured. It freezes the peer's slot in psync so the
+// Order layer's wave gates can advance without it, and removes
+// the peer from the substrate's own FD member set so we don't
+// re-fire on the same transition.
+//
+// Idempotent: psync.Membership.Freeze on an already-frozen
+// slot returns a non-nil error which we log-and-swallow.
+func (s *Substrate) handleAutoEvict(peer *pb.ReplicaID) {
+	peerID := replicaIDFromPB(peer)
+	if err := s.conv.FreezeMember(peer); err != nil {
+		// Likely "already frozen" on a duplicate fire; quiet.
+		s.logger.Debug("substrate: auto-evict freeze (likely already frozen)",
+			"peer", peerID.String(), "err", err)
+	} else {
+		s.logger.Warn("substrate: auto-evicting silent peer",
+			"peer", peerID.String(),
+			"suspicion_interval", s.cfg.AutoEvict.SuspicionInterval)
+	}
+	// Stop watching the peer so we don't re-fire.
+	s.hb.RemoveMember(peer)
+	if cb := s.cfg.AutoEvict.OnEvict; cb != nil {
+		cb(peerID, s.Members())
+	}
+	metricSubstrateAutoEvict.WithLabelValues(shortConvID(s.cfg.ConversationID)).Inc()
 }
 
 // sendHeartbeat emits a ConvFrame.heartbeat through the

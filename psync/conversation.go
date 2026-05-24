@@ -73,6 +73,18 @@ type Config struct {
 	// clock.NewSystem(). Tests use clock.Manual to drive restart
 	// retries deterministically.
 	Clock clock.Clock
+
+	// OnReceive, if non-nil, is called on EVERY successfully-
+	// decoded inbound envelope, BEFORE any graph-Insert /
+	// deferral / dedup. Hook for liveness signals that must
+	// survive Order-layer back-pressure: even if the Order
+	// wave gate is closed and deliveries are stalled, a peer's
+	// heartbeats can still keep the receiver's failure detector
+	// happy.
+	//
+	// Runs synchronously in the pump goroutine. Must be fast
+	// and non-blocking — no I/O, no genserver re-entry.
+	OnReceive func(from *pb.ReplicaID)
 }
 
 // Conversation is one replica's view of a Psync conversation.
@@ -243,6 +255,11 @@ type serverImpl struct {
 	// Stored as a func to avoid coupling serverImpl to Conversation
 	// directly.
 	onRestartAck func(*pb.RestartAck)
+	// onReceive, if non-nil, fires on every successfully-decoded
+	// inbound frame BEFORE graph/deferral logic. Phase 10(a):
+	// substrates wire this to FD.NoteReceived so peer liveness
+	// signals survive Order back-pressure.
+	onReceive func(from *pb.ReplicaID)
 }
 
 // Init creates the initial mutable state.
@@ -358,6 +375,7 @@ func New(ctx context.Context, cfg Config) (*Conversation, error) {
 		mask:       mask,
 		deliver:    deliver,
 		logger:     logger,
+		onReceive:  cfg.OnReceive,
 	}
 
 	c := &Conversation{
@@ -630,6 +648,13 @@ func (s *serverImpl) handleIncoming(st *state, from *pb.ReplicaID, data []byte) 
 	if err != nil {
 		s.logger.Warn("psync: unmarshal wire", "err", err)
 		return
+	}
+	// Fire the liveness callback BEFORE any graph / deferral
+	// logic so heartbeats keep peer FDs happy even when the
+	// Order wave gate is stalled. Substrates wire this to their
+	// failure.Detector.NoteReceived (Phase 10(a)).
+	if s.onReceive != nil {
+		s.onReceive(from)
 	}
 	switch {
 	case got.Envelope != nil:

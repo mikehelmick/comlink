@@ -139,6 +139,17 @@ var (
 		},
 		[]string{"kind"}, // "added", "removed"
 	)
+
+	// metricSubstrateAutoEvict counts substrate-level
+	// auto-evictions (Phase 10(a)) — a peer was silent for too
+	// long and its slot was frozen so wave gates could advance.
+	metricSubstrateAutoEvict = promauto.With(metricsRegistry).NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "comlink_substrate_auto_evict_total",
+			Help: "Auto-evictions performed at the substrate level (peer silence > SuspicionInterval).",
+		},
+		[]string{"conv_id"},
+	)
 )
 
 // shortConvID returns the first 8 hex chars of a conversation ID

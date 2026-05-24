@@ -501,6 +501,46 @@ ReplicaID public types. Top-level `README.md` quickstart.
 - 9(a) The `comlink-soak` binary itself: load generators (writers + readers), chaos goroutine, periodic + final reporting. ✅
 - 9(b) Makefile `make k8s-soak` target + brief documentation in deploy/README.md. ✅
 
+---
+
+### Phase 10 — Auto-eviction + snapshot recovery
+**Scope:** Close the two open holes Phase 9 surfaced (or honestly named):
+  1. **Auto-eviction**: a configurable substrate-level failure detector
+     that, when a peer goes silent for too long, freezes its slot so
+     the Order layer's wave gates can keep making progress without
+     it. Today only manual `Cluster.VoteOut` + `Substrate.FreezeMember`
+     evict, leaving writes blocked during pod restarts.
+  2. **Snapshot recovery**: SMs can opt into a `Snapshotter` interface
+     that periodically serializes their state to stable.Storage.
+     Trim becomes safe once every member's snapshot covers a message.
+     A new joiner — even one bootstrapping after the cluster has
+     trimmed messages it would otherwise need — gets a recent snapshot
+     from its sponsor and replays only what's newer.
+
+**Exit criteria:**
+  - Soak driver runs `make k8s-soak SOAK_RESTART_EVERY=30s` without
+    permanently wedging writes (auto-eviction kicks in within
+    seconds of a pod going silent).
+  - End-to-end test: start cluster, do enough writes to trigger
+    trim, then VoteIn a fresh replica — it catches up via snapshot
+    + post-snapshot lost-message replay without errors.
+
+**Sub-commit plan:**
+- 10(a) Substrate `AutoEvictConfig` + auto-freeze on suspicion.
+  Wired into the kvd binary via a new env var.
+- 10(b) `Snapshotter` interface (opt-in); Substrate persists
+  snapshots to stable.Storage on a configurable cadence.
+- 10(c) On restart, Substrate restores from latest snapshot
+  BEFORE log replay; replay then resumes from the snapshot's
+  offset forward.
+- 10(d) Snapshot-aware sponsor handshake: JoinResponse carries
+  the sponsor's latest snapshot (or a reference). Joiner installs
+  + resumes.
+- 10(e) Trim safety: a message is safe to trim only when every
+  member's persisted snapshot covers it. Today's trim watermark
+  protocol is extended with a `snapshot_through_offset` field.
+- 10(f) End-to-end test: trim-then-join recovery scenario.
+
 **Bugs the soak surfaced (and which are now fixed):**
 - `psync.handleReplay` pushed to the deliver channel WHILE
   holding the genserver mutex. If deliver was full (Order
@@ -611,5 +651,6 @@ explicit "settle" messages added.
 | 7 — Correctness hardening                  | done (v1)   |
 | 8 — Local Kubernetes deployment            | done (v1)   |
 | 9 — Soak / chaos test driver               | done (v1)   |
+| 10 — Auto-eviction + snapshot recovery     | in progress |
 
 Update this table as each phase moves through `in progress` and `done`.
