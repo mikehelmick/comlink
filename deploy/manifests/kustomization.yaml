@@ -1,0 +1,11 @@
+# Umbrella kustomization — applies the application, Prometheus,
+# Grafana, and OpenTelemetry collector in one shot. Apply with
+# `make k8s-apply-all` or `kubectl apply -k deploy/manifests/`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - app/
+  - prometheus/
+  - grafana/
+  - otel/

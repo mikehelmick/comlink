@@ -88,6 +88,10 @@ k8s-down:
 k8s-apply:
 	kubectl apply -k deploy/manifests/app/
 
+.PHONY: k8s-apply-all
+k8s-apply-all:
+	kubectl apply -k deploy/manifests/
+
 .PHONY: k8s-smoke
 k8s-smoke:
 	./deploy/local/smoke-test.sh

@@ -481,14 +481,26 @@ ReplicaID public types. Top-level `README.md` quickstart.
 **Exit criterion:** `make k8s-up` brings up a working 3-replica comlink-kvd cluster on a fresh kind cluster. `make k8s-smoke-test` exercises Set/Get across replicas. Grafana shows live metrics from the running pods. Tear-down via `make k8s-down`.
 
 **Sub-commit plan:**
-- 8(a) Dockerfile for comlink-kvd + `make docker` target. Multi-stage build.
-- 8(b) `deploy/local/` — kind cluster config (3 workers) + `up.sh` / `down.sh`.
-- 8(c) `deploy/manifests/app/` — Namespace, StatefulSet, headless + ClusterIP services, PVCs, ConfigMap with the entrypoint script that derives `COMLINK_SELF` from hostname and bootstraps pod-0 as founder / pod-N≥1 as sponsor-joiners.
-- 8(d) Smoke test: a script that hits Set on pod-0 and Get on pod-1/pod-2 to verify cross-replica convergence.
-- 8(e) `/metrics` Prometheus endpoint on comlink-kvd + Prometheus deploy + scrape config.
-- 8(f) Grafana deploy + a simple dashboard showing cluster size, set/get rate, apply latency.
-- 8(g) OpenTelemetry collector (receives OTLP, fans out to Prometheus / debug exporter; OTLP emission from the app is a follow-up).
-- 8(h) `deploy/README.md` — operator quickstart.
+- 8(a) Dockerfile for comlink-kvd + `make docker` target. Multi-stage build. ✅
+- 8(b) `deploy/local/` — kind cluster config (3 workers) + `up.sh` / `down.sh`. ✅
+- 8(c) `deploy/manifests/app/` — Namespace, StatefulSet, headless + ClusterIP services, PVCs, ConfigMap entrypoint. ✅
+- 8(d) Smoke test: cross-replica Set / Get / Delete. ✅
+- 8(e) Prometheus instrumentation in comlink + kvstore + `/metrics` endpoint. ✅
+- 8(f) Prometheus deploy + kubernetes_sd_configs pod scrape. ✅
+- 8(g) Grafana deploy + provisioned "Comlink kvstore overview" dashboard. ✅
+- 8(h) OpenTelemetry collector (receivers: OTLP+prometheus, exporters: debug+prometheus). ✅
+- 8(i) `deploy/README.md` + umbrella kustomization + `make k8s-apply-all`. ✅
+
+**Bugs surfaced and fixed during Phase 8 wiring:**
+- `TransportConfig.Advertise` added so bind addr (`0.0.0.0:N`)
+  and advertise addr (stable pod DNS) can differ.
+- Substrate auto-replay from log (Phase 7(b)) was synchronous
+  and could deadlock when all pods cold-start together — moved
+  to a goroutine.
+- `comlink-kvd` got `COMLINK_KV_MEMBERS` env so every replica's
+  substrate sees the same Members list (using `cluster.Members()`
+  at substrate construction was wrong: founder sees `{self}`,
+  joiner sees `{founder, self}`).
 
 **Phase 7(a) findings:**
 Three bugs combined to make TestDirectoryUpdateSemantics flake:
@@ -568,6 +580,6 @@ explicit "settle" messages added.
 | 5 — Public API: Cluster + Substrates       | done (v1)   |
 | 6 — Demo apps                              | done (v1)   |
 | 7 — Correctness hardening                  | done (v1)   |
-| 8 — Local Kubernetes deployment            | in progress |
+| 8 — Local Kubernetes deployment            | done (v1)   |
 
 Update this table as each phase moves through `in progress` and `done`.
