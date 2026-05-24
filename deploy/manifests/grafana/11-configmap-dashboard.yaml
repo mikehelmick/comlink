@@ -1,0 +1,107 @@
+# Provisioned dashboard JSON. Six panels covering the most
+# useful comlink + kvstore signals:
+#   1. Cluster membership (size)
+#   2. kvstore key count
+#   3. Submit/Apply throughput
+#   4. Submit latency (p50/p95/p99)
+#   5. Apply latency (p50/p95/p99)
+#   6. Get hit/miss rate
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: comlink
+data:
+  comlink-overview.json: |
+    {
+      "title": "Comlink kvstore overview",
+      "uid": "comlink-overview",
+      "schemaVersion": 38,
+      "refresh": "5s",
+      "time": {"from": "now-15m", "to": "now"},
+      "panels": [
+        {
+          "id": 1, "type": "stat", "title": "Cluster members",
+          "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+          "targets": [{
+            "expr": "max(comlink_cluster_members)",
+            "refId": "A"
+          }],
+          "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}}
+        },
+        {
+          "id": 2, "type": "stat", "title": "Keys (max replica)",
+          "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+          "targets": [{
+            "expr": "max(kvstore_keys)",
+            "refId": "A"
+          }],
+          "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}}
+        },
+        {
+          "id": 3, "type": "stat", "title": "Watchers",
+          "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+          "targets": [{
+            "expr": "sum(kvstore_watchers)",
+            "refId": "A"
+          }],
+          "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}}
+        },
+        {
+          "id": 4, "type": "stat", "title": "VoteIn accepted",
+          "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+          "targets": [{
+            "expr": "sum(comlink_membership_votein_total{outcome=\"accepted\"})",
+            "refId": "A"
+          }]
+        },
+        {
+          "id": 5, "type": "timeseries", "title": "Substrate Submit / Apply (per replica)",
+          "gridPos": {"x": 0, "y": 4, "w": 12, "h": 7},
+          "targets": [
+            {
+              "expr": "rate(comlink_substrate_messages_submitted_total[30s])",
+              "refId": "A",
+              "legendFormat": "submit · {{pod}}"
+            },
+            {
+              "expr": "rate(comlink_substrate_messages_applied_total[30s])",
+              "refId": "B",
+              "legendFormat": "apply · {{pod}}"
+            }
+          ],
+          "fieldConfig": {"defaults": {"unit": "ops"}}
+        },
+        {
+          "id": 6, "type": "timeseries", "title": "kvstore ops / sec",
+          "gridPos": {"x": 12, "y": 4, "w": 12, "h": 7},
+          "targets": [
+            {"expr": "sum(rate(kvstore_set_total[30s]))", "refId": "A", "legendFormat": "set"},
+            {"expr": "sum(rate(kvstore_delete_total[30s]))", "refId": "B", "legendFormat": "delete"},
+            {"expr": "sum(rate(kvstore_get_total{result=\"hit\"}[30s]))", "refId": "C", "legendFormat": "get hit"},
+            {"expr": "sum(rate(kvstore_get_total{result=\"miss\"}[30s]))", "refId": "D", "legendFormat": "get miss"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "ops"}}
+        },
+        {
+          "id": 7, "type": "timeseries", "title": "Submit latency",
+          "gridPos": {"x": 0, "y": 11, "w": 12, "h": 7},
+          "targets": [
+            {"expr": "histogram_quantile(0.50, sum(rate(comlink_substrate_submit_duration_seconds_bucket[1m])) by (le))", "refId": "A", "legendFormat": "p50"},
+            {"expr": "histogram_quantile(0.95, sum(rate(comlink_substrate_submit_duration_seconds_bucket[1m])) by (le))", "refId": "B", "legendFormat": "p95"},
+            {"expr": "histogram_quantile(0.99, sum(rate(comlink_substrate_submit_duration_seconds_bucket[1m])) by (le))", "refId": "C", "legendFormat": "p99"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "s"}}
+        },
+        {
+          "id": 8, "type": "timeseries", "title": "Apply latency",
+          "gridPos": {"x": 12, "y": 11, "w": 12, "h": 7},
+          "targets": [
+            {"expr": "histogram_quantile(0.50, sum(rate(comlink_substrate_apply_duration_seconds_bucket[1m])) by (le))", "refId": "A", "legendFormat": "p50"},
+            {"expr": "histogram_quantile(0.95, sum(rate(comlink_substrate_apply_duration_seconds_bucket[1m])) by (le))", "refId": "B", "legendFormat": "p95"},
+            {"expr": "histogram_quantile(0.99, sum(rate(comlink_substrate_apply_duration_seconds_bucket[1m])) by (le))", "refId": "C", "legendFormat": "p99"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "s"}}
+        }
+      ]
+    }
