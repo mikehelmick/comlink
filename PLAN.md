@@ -474,6 +474,22 @@ ReplicaID public types. Top-level `README.md` quickstart.
 - 7(c) End-to-end restart test verifying pre-crash SM state recovery (validates 7b). ✅
 - 7(d) `make stress` target — runs all previously-flaky tests in a loop, used to detect regressions. ✅
 
+---
+
+### Phase 8 — Local Kubernetes deployment of comlink-kvd
+**Scope:** A complete local-first Kubernetes deployment of the kvstore demo: 3-replica StatefulSet with PVCs, init-container identity derivation, headless + ClusterIP services, Prometheus + Grafana + OpenTelemetry collector with a basic dashboard, and a one-command kind-based bring-up. No helm chart, no published images, no production hardening yet — those come in a later phase once the local story is solid.
+**Exit criterion:** `make k8s-up` brings up a working 3-replica comlink-kvd cluster on a fresh kind cluster. `make k8s-smoke-test` exercises Set/Get across replicas. Grafana shows live metrics from the running pods. Tear-down via `make k8s-down`.
+
+**Sub-commit plan:**
+- 8(a) Dockerfile for comlink-kvd + `make docker` target. Multi-stage build.
+- 8(b) `deploy/local/` — kind cluster config (3 workers) + `up.sh` / `down.sh`.
+- 8(c) `deploy/manifests/app/` — Namespace, StatefulSet, headless + ClusterIP services, PVCs, ConfigMap with the entrypoint script that derives `COMLINK_SELF` from hostname and bootstraps pod-0 as founder / pod-N≥1 as sponsor-joiners.
+- 8(d) Smoke test: a script that hits Set on pod-0 and Get on pod-1/pod-2 to verify cross-replica convergence.
+- 8(e) `/metrics` Prometheus endpoint on comlink-kvd + Prometheus deploy + scrape config.
+- 8(f) Grafana deploy + a simple dashboard showing cluster size, set/get rate, apply latency.
+- 8(g) OpenTelemetry collector (receives OTLP, fans out to Prometheus / debug exporter; OTLP emission from the app is a follow-up).
+- 8(h) `deploy/README.md` — operator quickstart.
+
 **Phase 7(a) findings:**
 Three bugs combined to make TestDirectoryUpdateSemantics flake:
   1. `Conversation.Membership()` returned `NewMembership(cfg.Members)` on every
@@ -552,5 +568,6 @@ explicit "settle" messages added.
 | 5 — Public API: Cluster + Substrates       | done (v1)   |
 | 6 — Demo apps                              | done (v1)   |
 | 7 — Correctness hardening                  | done (v1)   |
+| 8 — Local Kubernetes deployment            | in progress |
 
 Update this table as each phase moves through `in progress` and `done`.

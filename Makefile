@@ -62,6 +62,20 @@ STRESS_PKGS  := . ./examples/directory/ ./examples/kvstore/
 stress:
 	$(GO) test -race -count=$(STRESS_COUNT) -timeout=1800s -run '$(STRESS_TESTS)' $(STRESS_PKGS)
 
+# ─── Phase 8: Local Kubernetes deployment ─────────────────────────
+# All of these target a kind cluster created by `make k8s-up`. The
+# image is built locally and `kind load`-ed into the cluster's
+# containerd — no registry needed.
+
+DOCKER         ?= docker
+IMAGE_NAME     ?= comlink-kvd
+IMAGE_TAG      ?= dev
+IMAGE          := $(IMAGE_NAME):$(IMAGE_TAG)
+
+.PHONY: docker
+docker:
+	$(DOCKER) build -f deploy/images/comlink-kvd/Dockerfile -t $(IMAGE) .
+
 # Generate Go code from .proto files. Outputs land under $(PROTO_OUT).
 # Requires: protoc, protoc-gen-go, protoc-gen-go-grpc.
 .PHONY: proto
