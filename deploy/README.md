@@ -117,6 +117,37 @@ file-provisioned with 8 panels:
 Two exporters: `debug` (basic logging) and `prometheus` server
 on :8889 (in-cluster), so any pipeline output is also scrapable.
 
+## Soak / chaos testing
+
+`comlink-soak` runs sustained load while periodically restarting
+pods one at a time:
+
+```sh
+# Defaults: 5min total, restart a pod every 90s, 4 writers + 8
+# readers, 50-key working set.
+make k8s-soak
+
+# Skip chaos for a pure load test.
+make k8s-soak SOAK_RESTART_EVERY=999h
+
+# Tune the cadence.
+make k8s-soak SOAK_DURATION=10m SOAK_RESTART_EVERY=2m
+```
+
+The driver prints per-10s status lines, a final summary, and
+runs a cross-replica convergence check at the end (writes a
+canary key, polls each pod via `kubectl exec` for agreement).
+
+**Known limitation surfaced by the soak**: under `OrderingTotal`
+(what kvstore uses), every Submit needs wave completion which
+needs every member to advance. A single pod restart causes a
+~10–30 s availability window for writes; back-to-back restarts
+can compound and the cluster may take minutes to recover write
+availability (reads always keep working since they're local).
+This is a real consequence of the current design — see PLAN.md
+§9 for the planned fix (auto-eviction of unhealthy pods at the
+substrate level).
+
 ## Tear down
 
 ```sh

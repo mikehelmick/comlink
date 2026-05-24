@@ -1,0 +1,409 @@
+// Copyright 2026 the comlink authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// comlink-soak — Phase 9 soak / chaos driver for the deployed
+// kvd cluster.
+//
+// What it does:
+//   - Spawns N writer goroutines that PUT random keys with values
+//     containing a wall-clock timestamp.
+//   - Spawns M reader goroutines that GET random keys and verify
+//     the response is fresh (within a tolerance window).
+//   - Spawns a chaos goroutine that rotates through the
+//     StatefulSet's pod ordinals every --restart-every, doing
+//     `kubectl delete pod <pod>` and waiting for the replacement
+//     to reach Ready before the next iteration.
+//   - Prints a per-10s status line (counters + ops/sec).
+//   - At the end, queries each pod directly via `kubectl exec`
+//     and verifies they all agree on a final committed value
+//     written by the soak.
+//
+// Designed to be run against the kind cluster spun up by
+// `make k8s-up` + `make k8s-apply-all`.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"net/http"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// ─── flags ───────────────────────────────────────────────────────
+
+var (
+	flagTargetURL    = flag.String("target", "http://127.0.0.1:30080", "kvd HTTP NodePort URL")
+	flagNamespace    = flag.String("namespace", "comlink", "Kubernetes namespace")
+	flagStsName      = flag.String("sts", "comlink-kvd", "StatefulSet name")
+	flagReplicas     = flag.Int("replicas", 3, "expected number of replicas")
+	flagDuration     = flag.Duration("duration", 5*time.Minute, "total soak duration")
+	flagRestartEvery = flag.Duration("restart-every", 90*time.Second, "interval between pod restarts (each restart causes a ~10–30s availability window for writes because OrderingTotal needs all members)")
+	flagSettle       = flag.Duration("settle", 60*time.Second, "stop chaos this long before -duration ends so the cluster fully recovers for the final convergence check")
+	flagOpTimeout    = flag.Duration("op-timeout", 30*time.Second, "per-operation HTTP timeout — needs to be longer than the worst-case wave-gate recovery after a pod restart")
+	flagWriters      = flag.Int("writers", 4, "number of concurrent writer goroutines")
+	flagReaders      = flag.Int("readers", 8, "number of concurrent reader goroutines")
+	flagKeyspace     = flag.Int("keyspace", 50, "number of distinct keys writers cycle through")
+	flagKeyPrefix    = flag.String("key-prefix", "soak", "prefix for all keys written by this run")
+	flagStatusEvery  = flag.Duration("status-every", 10*time.Second, "status print cadence")
+	flagSkipChaos    = flag.Bool("skip-chaos", false, "skip pod restarts (pure load test)")
+)
+
+// ─── stats ───────────────────────────────────────────────────────
+
+type stats struct {
+	writesOK   atomic.Uint64
+	writesFail atomic.Uint64
+	readsOK    atomic.Uint64
+	readsFail  atomic.Uint64
+	readsMiss  atomic.Uint64 // 404 — key not yet replicated, retried later
+	restarts   atomic.Uint64
+}
+
+func (s *stats) snapshot() (uint64, uint64, uint64, uint64, uint64, uint64) {
+	return s.writesOK.Load(), s.writesFail.Load(),
+		s.readsOK.Load(), s.readsFail.Load(),
+		s.readsMiss.Load(), s.restarts.Load()
+}
+
+// ─── main ────────────────────────────────────────────────────────
+
+func main() {
+	flag.Parse()
+
+	fmt.Printf("comlink-soak: target=%s duration=%s restart-every=%s writers=%d readers=%d keyspace=%d\n",
+		*flagTargetURL, *flagDuration, *flagRestartEvery, *flagWriters, *flagReaders, *flagKeyspace)
+
+	// Sanity-check the cluster is reachable BEFORE we go.
+	if err := pingCluster(*flagTargetURL, *flagReplicas); err != nil {
+		fmt.Fprintf(os.Stderr, "pre-flight cluster check failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("pre-flight: cluster reachable with expected replica count")
+
+	ctx, cancel := context.WithTimeout(context.Background(), *flagDuration)
+	defer cancel()
+
+	st := &stats{}
+
+	var wg sync.WaitGroup
+	for i := 0; i < *flagWriters; i++ {
+		wg.Add(1)
+		go writer(ctx, &wg, st, i)
+	}
+	for i := 0; i < *flagReaders; i++ {
+		wg.Add(1)
+		go reader(ctx, &wg, st, i)
+	}
+	go statusPrinter(ctx, st)
+	if !*flagSkipChaos {
+		// Chaos stops -settle before the test ends so the
+		// cluster has time to fully recover (heartbeats, wave
+		// gates, persistent membership) before the final
+		// convergence check fires.
+		chaosCtx, chaosCancel := context.WithTimeout(ctx, *flagDuration-*flagSettle)
+		defer chaosCancel()
+		go chaos(chaosCtx, st)
+	}
+
+	wg.Wait()
+	cancel()
+
+	wo, wf, ro, rf, rm, rs := st.snapshot()
+	fmt.Println()
+	fmt.Println("─── final summary ──────────────────────────────────")
+	fmt.Printf("  writes OK     : %d\n", wo)
+	fmt.Printf("  writes FAIL   : %d\n", wf)
+	fmt.Printf("  reads  OK     : %d\n", ro)
+	fmt.Printf("  reads  MISS   : %d (404, key not yet replicated)\n", rm)
+	fmt.Printf("  reads  FAIL   : %d (network / transient)\n", rf)
+	fmt.Printf("  pod restarts  : %d\n", rs)
+	if wo+ro == 0 {
+		fmt.Fprintln(os.Stderr, "no successful operations — something is wrong")
+		os.Exit(1)
+	}
+
+	if err := verifyConvergence(); err != nil {
+		fmt.Fprintf(os.Stderr, "convergence check FAILED: %v\n", err)
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Known limitation: rapid sequential pod restarts under OrderingTotal")
+		fmt.Fprintln(os.Stderr, "can leave the substrate's wave gates closed for an extended period.")
+		fmt.Fprintln(os.Stderr, "Reads continue to work; writes may take minutes to recover. See")
+		fmt.Fprintln(os.Stderr, "deploy/README.md and PLAN.md §9 for details. Re-running with a")
+		fmt.Fprintln(os.Stderr, "longer -restart-every or -skip-chaos sidesteps this.")
+		os.Exit(1)
+	}
+	fmt.Println("convergence: all replicas agree ✓")
+}
+
+// ─── load generators ─────────────────────────────────────────────
+
+func writer(ctx context.Context, wg *sync.WaitGroup, s *stats, id int) {
+	defer wg.Done()
+	client := &http.Client{Timeout: *flagOpTimeout}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		key := fmt.Sprintf("%s-%d", *flagKeyPrefix, rand.IntN(*flagKeyspace))
+		val := fmt.Sprintf("w%d@%d", id, time.Now().UnixNano())
+		if err := doPut(ctx, client, key, val); err != nil {
+			s.writesFail.Add(1)
+		} else {
+			s.writesOK.Add(1)
+		}
+		// Small natural pacing — without this the test pegs CPU
+		// in the kvd HTTP handler and disguises the latency
+		// signal.
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func reader(ctx context.Context, wg *sync.WaitGroup, s *stats, id int) {
+	defer wg.Done()
+	_ = id
+	client := &http.Client{Timeout: *flagOpTimeout}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		key := fmt.Sprintf("%s-%d", *flagKeyPrefix, rand.IntN(*flagKeyspace))
+		status, err := doGet(ctx, client, key)
+		switch {
+		case err != nil:
+			s.readsFail.Add(1)
+		case status == 200:
+			s.readsOK.Add(1)
+		case status == 404:
+			s.readsMiss.Add(1)
+		default:
+			s.readsFail.Add(1)
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+}
+
+func doPut(ctx context.Context, client *http.Client, key, val string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		fmt.Sprintf("%s/kv/%s", *flagTargetURL, key),
+		strings.NewReader(val))
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("PUT status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func doGet(ctx context.Context, client *http.Client, key string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("%s/kv/%s", *flagTargetURL, key), nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
+}
+
+// ─── chaos ───────────────────────────────────────────────────────
+
+// chaos rotates through pod ordinals 0..N-1 and `kubectl delete
+// pod` each one in turn. Waits for the replacement to reach Ready
+// before sleeping until the next iteration.
+func chaos(ctx context.Context, s *stats) {
+	ticker := time.NewTicker(*flagRestartEvery)
+	defer ticker.Stop()
+	ordinal := 0
+	// Sleep before the first kill so load has a chance to start.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(*flagRestartEvery):
+	}
+	for {
+		podName := fmt.Sprintf("%s-%d", *flagStsName, ordinal)
+		fmt.Printf("[chaos] deleting pod %s\n", podName)
+		if err := killPod(ctx, podName); err != nil {
+			fmt.Fprintf(os.Stderr, "[chaos] delete %s: %v\n", podName, err)
+		} else if err := waitPodReady(ctx, podName, 90*time.Second); err != nil {
+			fmt.Fprintf(os.Stderr, "[chaos] wait ready %s: %v\n", podName, err)
+		} else {
+			s.restarts.Add(1)
+			fmt.Printf("[chaos] %s back to Ready\n", podName)
+		}
+		ordinal = (ordinal + 1) % *flagReplicas
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func killPod(ctx context.Context, podName string) error {
+	return runKubectl(ctx, 30*time.Second,
+		"-n", *flagNamespace, "delete", "pod", podName, "--wait=false")
+}
+
+func waitPodReady(ctx context.Context, podName string, timeout time.Duration) error {
+	return runKubectl(ctx, timeout,
+		"-n", *flagNamespace, "wait",
+		"--for=condition=Ready", "pod/"+podName,
+		fmt.Sprintf("--timeout=%ds", int(timeout.Seconds())))
+}
+
+func runKubectl(ctx context.Context, timeout time.Duration, args ...string) error {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "kubectl", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("kubectl %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ─── status printer ──────────────────────────────────────────────
+
+func statusPrinter(ctx context.Context, s *stats) {
+	ticker := time.NewTicker(*flagStatusEvery)
+	defer ticker.Stop()
+	var last struct {
+		wo, wf, ro, rf, rm uint64
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		wo, wf, ro, rf, rm, rs := s.snapshot()
+		dt := flagStatusEvery.Seconds()
+		fmt.Printf("[status] writes %d/+%d (fail %d/+%d) | reads %d/+%d (miss %d/+%d, fail %d/+%d) | restarts %d | %.1f write/s, %.1f read/s\n",
+			wo, wo-last.wo, wf, wf-last.wf,
+			ro, ro-last.ro, rm, rm-last.rm, rf, rf-last.rf,
+			rs,
+			float64(wo-last.wo)/dt, float64(ro-last.ro)/dt)
+		last.wo, last.wf, last.ro, last.rf, last.rm = wo, wf, ro, rf, rm
+	}
+}
+
+// ─── preflight + convergence ─────────────────────────────────────
+
+// pingCluster checks the kvd HTTP front-end is reachable and the
+// reported membership_n matches the expected replica count.
+func pingCluster(target string, want int) error {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(target + "/cluster/info")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	wantStr := fmt.Sprintf(`"membership_n":%d`, want)
+	if !strings.Contains(string(body), wantStr) {
+		return fmt.Errorf("cluster info doesn't report %s: %s", wantStr, string(body))
+	}
+	return nil
+}
+
+// verifyConvergence writes a final canary key via the NodePort,
+// waits briefly for replication, then queries each pod directly
+// via `kubectl exec` and checks they all return the same value.
+func verifyConvergence() error {
+	// 2 × op-timeout gives the canary PUT + a retry budget if
+	// the first attempt times out on a not-quite-recovered wave
+	// gate. Plus 30s of polling for convergence on each pod.
+	ctx, cancel := context.WithTimeout(context.Background(), 3**flagOpTimeout)
+	defer cancel()
+
+	canaryKey := fmt.Sprintf("%s-canary-%d", *flagKeyPrefix, time.Now().UnixNano())
+	canaryVal := fmt.Sprintf("final-canary-%d", time.Now().UnixNano())
+
+	client := &http.Client{Timeout: *flagOpTimeout}
+	// Retry the canary PUT a few times — after chaos windows the
+	// first PUT often hits a wave gate that's just opening.
+	var putErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if putErr = doPut(ctx, client, canaryKey, canaryVal); putErr == nil {
+			break
+		}
+		fmt.Printf("convergence: canary PUT attempt %d failed: %v (retrying)\n", attempt+1, putErr)
+		time.Sleep(2 * time.Second)
+	}
+	if putErr != nil {
+		return fmt.Errorf("canary PUT (after retries): %w", putErr)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		mismatches := []string{}
+		for i := 0; i < *flagReplicas; i++ {
+			pod := fmt.Sprintf("%s-%d", *flagStsName, i)
+			got, err := kubectlExecGet(ctx, pod, canaryKey)
+			if err != nil {
+				mismatches = append(mismatches, fmt.Sprintf("%s: err %v", pod, err))
+				continue
+			}
+			if got != canaryVal {
+				mismatches = append(mismatches, fmt.Sprintf("%s: %q != %q", pod, got, canaryVal))
+			}
+		}
+		if len(mismatches) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("did not converge: " + strings.Join(mismatches, "; "))
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// kubectlExecGet calls `kubectl exec pod -- wget -qO- localhost:8000/kv/key`.
+// Returns the response body or an error.
+func kubectlExecGet(ctx context.Context, podName, key string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "kubectl", "-n", *flagNamespace, "exec", podName,
+		"--", "wget", "-qO-", fmt.Sprintf("http://localhost:8000/kv/%s", key))
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}

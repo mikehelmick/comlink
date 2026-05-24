@@ -186,6 +186,15 @@ type maskResponse struct{ err error }
 type replayLogResponse struct {
 	inserted int
 	err      error
+	// envelopes is the in-order set of replayed envelopes that
+	// the caller should re-deliver to the application's Order
+	// layer. Populated only when replayLogRequest.deliver is
+	// true. ReplayLog drains this on a separate goroutine
+	// AFTER the genserver returns, so the genserver is not
+	// blocked while the deliver channel might be full (which
+	// could starve concurrent Sends — see Phase 9 bug
+	// investigation).
+	envelopes []*pb.Envelope
 }
 type waveCompleteResponse struct{ complete bool }
 type messagesInWaveResponse struct {
@@ -261,8 +270,8 @@ func (s *serverImpl) HandleCall(req request, st *state) (response, *state) {
 		}
 		return maskResponse{err: err}, st
 	case replayLogRequest:
-		n, err := s.handleReplay(st, r.deliver)
-		return replayLogResponse{inserted: n, err: err}, st
+		n, envs, err := s.handleReplay(st, r.deliver)
+		return replayLogResponse{inserted: n, err: err, envelopes: envs}, st
 	case waveCompleteRequest:
 		return waveCompleteResponse{
 			complete: WaveComplete(st.graph, r.wave, StandardChecker{}),
@@ -472,7 +481,27 @@ func (c *Conversation) Maskin(ctx context.Context, replica *pb.ReplicaID) error 
 func (c *Conversation) ReplayLog(ctx context.Context) (int, error) {
 	resp := c.srv.Call(replayLogRequest{deliver: true})
 	rr := resp.(replayLogResponse)
-	return rr.inserted, rr.err
+	if rr.err != nil {
+		return rr.inserted, rr.err
+	}
+	// Drain the replayed envelopes into the deliver channel on a
+	// goroutine — pushing here would block this call if deliver
+	// is full, but the genserver is already free (we got our
+	// response). The goroutine binds to ctx so it cleans up on
+	// Conversation Close. Per-envelope push with select-on-ctx
+	// avoids stranded goroutines if the deliver channel is
+	// blocked indefinitely (the Order layer's gates haven't
+	// opened, etc).
+	go func(envs []*pb.Envelope) {
+		for _, env := range envs {
+			select {
+			case c.deliver <- Delivery{Envelope: env}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}(rr.envelopes)
+	return rr.inserted, nil
 }
 
 // Membership returns this conversation's LIVE membership view —
@@ -753,21 +782,24 @@ func (s *serverImpl) processNewlyAvailable(st *state, senderBytes []byte, seq ui
 // post-replay leaf-set + lost-message exchange recovers them via
 // peers per PLAN §1 pruned-region invariant.
 //
-// When deliverReplayed is true, each successfully-inserted
-// envelope is also pushed to the deliver channel so Order →
-// StateMachine pipelines can rebuild SM state during restart
-// (Phase 7(b)). When false (Restart's peer-catchup path), the
-// graph is rebuilt but the SM is not re-driven — the caller is
-// expected to recover SM state via some other means (e.g.,
-// application-level checkpoints).
+// When deliverReplayed is true, successfully-inserted envelopes
+// are COLLECTED INTO A SLICE for the caller to drain into the
+// deliver channel separately (after the genserver returns).
+// Pushing to deliver directly here would block the genserver
+// if the deliver channel is full — that starves concurrent
+// Sends and was the root cause of the Phase 9 soak hang:
+// pod restarts → replay → genserver stuck → no heartbeats →
+// no wave progress → no Sends → deliver never drains →
+// deadlock.
 //
-// Returns the number of entries successfully inserted.
-func (s *serverImpl) handleReplay(st *state, deliverReplayed bool) (int, error) {
+// Returns (inserted_count, replayed_envelopes_for_redelivery, err).
+func (s *serverImpl) handleReplay(st *state, deliverReplayed bool) (int, []*pb.Envelope, error) {
 	ctx := context.Background()
 	inserted := 0
+	var envelopes []*pb.Envelope
 	for entry, err := range s.log.Range(ctx, s.log.FirstOffset(), clog.EndOfLog) {
 		if err != nil {
-			return inserted, err
+			return inserted, envelopes, err
 		}
 		env := entry.Envelope
 		if env.GetId().GetSender() == nil {
@@ -787,8 +819,7 @@ func (s *serverImpl) handleReplay(st *state, deliverReplayed bool) (int, error) 
 		case err == nil:
 			inserted++
 			if deliverReplayed {
-				node := st.graph.Lookup(env.GetId().GetSender().GetValue(), senderSeq)
-				s.deliver <- Delivery{Envelope: env, Node: node}
+				envelopes = append(envelopes, env)
 			}
 		case errors.Is(err, ErrMissingParents):
 			// Pruned predecessor; will be recovered by leaf
@@ -802,7 +833,7 @@ func (s *serverImpl) handleReplay(st *state, deliverReplayed bool) (int, error) 
 			s.logger.Warn("psync: replay: insert error", "err", err)
 		}
 	}
-	return inserted, nil
+	return inserted, envelopes, nil
 }
 
 // currentView returns the conversation-wide vector clock from this

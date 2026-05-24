@@ -491,6 +491,35 @@ ReplicaID public types. Top-level `README.md` quickstart.
 - 8(h) OpenTelemetry collector (receivers: OTLP+prometheus, exporters: debug+prometheus). ✅
 - 8(i) `deploy/README.md` + umbrella kustomization + `make k8s-apply-all`. ✅
 
+---
+
+### Phase 9 — Soak / chaos test driver
+**Scope:** A standalone Go binary `comlink-soak` that runs sustained load against the deployed kvd cluster while periodically restarting pods one at a time (`kubectl delete pod`). The binary tracks per-second write / read success rates and prints a final summary; at the end it verifies all surviving pods agree on a known key.
+**Exit criterion:** `make k8s-soak` runs against a live kind cluster for a configurable duration (default 5 min), tolerates rolling pod restarts, and reports >0 successful writes/reads/restarts with cross-replica convergence verified.
+
+**Sub-commit plan:**
+- 9(a) The `comlink-soak` binary itself: load generators (writers + readers), chaos goroutine, periodic + final reporting. ✅
+- 9(b) Makefile `make k8s-soak` target + brief documentation in deploy/README.md. ✅
+
+**Bugs the soak surfaced (and which are now fixed):**
+- `psync.handleReplay` pushed to the deliver channel WHILE
+  holding the genserver mutex. If deliver was full (Order
+  layer not draining fast enough — common during chaos), the
+  genserver blocked, all subsequent Sends queued behind it,
+  and the cluster wedged. Fixed: handleReplay now collects
+  envelopes into a slice; ReplayLog drains them in a separate
+  goroutine after the genserver returns.
+
+**Limitations the soak surfaced (open, planned for later):**
+- OrderingTotal blocks Submits whenever any member is
+  unhealthy (wave gate needs all to advance). Single pod
+  restart → ~10–30s write outage. Back-to-back restarts can
+  leave the cluster in a write-degraded state for minutes
+  even after pods recover. Reads always continue working.
+  Planned fix: auto-eviction of suspected members at the
+  substrate level (currently only Cluster-level VoteOut
+  evicts, and only when explicitly invoked).
+
 **Bugs surfaced and fixed during Phase 8 wiring:**
 - `TransportConfig.Advertise` added so bind addr (`0.0.0.0:N`)
   and advertise addr (stable pod DNS) can differ.
@@ -581,5 +610,6 @@ explicit "settle" messages added.
 | 6 — Demo apps                              | done (v1)   |
 | 7 — Correctness hardening                  | done (v1)   |
 | 8 — Local Kubernetes deployment            | done (v1)   |
+| 9 — Soak / chaos test driver               | done (v1)   |
 
 Update this table as each phase moves through `in progress` and `done`.

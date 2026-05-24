@@ -96,6 +96,19 @@ k8s-apply-all:
 k8s-smoke:
 	./deploy/local/smoke-test.sh
 
+# Soak / chaos test. Tunable via SOAK_* env vars.
+SOAK_DURATION      ?= 5m
+SOAK_RESTART_EVERY ?= 45s
+SOAK_WRITERS       ?= 4
+SOAK_READERS       ?= 8
+.PHONY: k8s-soak
+k8s-soak:
+	$(GO) run ./examples/kvstore/cmd/comlink-soak \
+		-duration=$(SOAK_DURATION) \
+		-restart-every=$(SOAK_RESTART_EVERY) \
+		-writers=$(SOAK_WRITERS) \
+		-readers=$(SOAK_READERS)
+
 # Generate Go code from .proto files. Outputs land under $(PROTO_OUT).
 # Requires: protoc, protoc-gen-go, protoc-gen-go-grpc.
 .PHONY: proto
