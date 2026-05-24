@@ -462,6 +462,35 @@ ReplicaID public types. Top-level `README.md` quickstart.
 **Exit criterion:** both apps run on 3- and 5-replica clusters under the gRPC transport, survive single and concurrent failures, and recover correctly when failed nodes restart.
 **Artifacts:** `examples/directory/`, `examples/kvstore/`, integration tests under `examples/*/test/`.
 
+---
+
+### Phase 7 — Correctness hardening
+**Scope:** Fix the three known-issue items surfaced during Phase 6 demo work.
+**Exit criterion:** All currently-skipped tests pass under `-race -count=10`; SM state recovers on restart; OrderingTotal no longer flakes under parallel load.
+
+**Sub-commit plan:**
+- 7(a) Diagnose & fix SemOrder Insert→Update propagation gap; same root cause fixed in Total. ✅
+- 7(b) Substrate auto-recover from local log on construction — rebuild SM state by replaying through the Order layer.
+- 7(c) End-to-end restart test verifying pre-crash SM state recovery (validates 7b).
+- 7(d) Stress-loop CI helper (a small test harness that runs the flaky tests repeatedly to verify they're now stable).
+
+**Phase 7(a) findings:**
+Three bugs combined to make TestDirectoryUpdateSemantics flake:
+  1. `Conversation.Membership()` returned `NewMembership(cfg.Members)` on every
+     call — a fresh, unfrozen copy. Order layers querying for frozen state
+     never saw any freezes. Fixed by adding `Membership.Clone()` and a
+     `membershipRequest` Call that returns the live (snapshotted) view.
+  2. SemOrder's `continuationProperty` allowed `waveOf(latest) >= currentWave`,
+     which doesn't guarantee no more wave-W messages can arrive (a replica
+     at exactly waveOf == W can still send more wave-W messages). Tightened
+     to strict-greater.
+  3. Total had no continuation gate at all — same late-arrival risk.
+     Added `latestWave` tracking + strict-greater gate, matching SemOrder.
+
+Cost: each wave now requires one extra heartbeat per replica before draining
+(typically ~150ms). Bare-Order tests that didn't have heartbeats needed
+explicit "settle" messages added.
+
 **Sub-commit plan (~6–8 commits):**
 - 6(a) examples/kvstore: Store package (Get/Set/Delete/Watch) on a Substrate; in-process unit tests.
 - 6(b) examples/kvstore: 3-replica gRPC integration test (founder + 2 sponsor-joined replicas).
@@ -522,5 +551,6 @@ ReplicaID public types. Top-level `README.md` quickstart.
 | 4 — Recovery + Trim (HWM)                  | done (v1)   |
 | 5 — Public API: Cluster + Substrates       | done (v1)   |
 | 6 — Demo apps                              | done (v1)   |
+| 7 — Correctness hardening                  | in progress |
 
 Update this table as each phase moves through `in progress` and `done`.

@@ -154,6 +154,7 @@ type waveCompleteRequest struct{ wave uint64 }
 type messagesInWaveRequest struct{ wave uint64 }
 type stableMessageIDsRequest struct{}
 type freezeMemberRequest struct{ replica *pb.ReplicaID }
+type membershipRequest struct{}
 type addMemberRequest struct{ replica *pb.ReplicaID }
 
 func (sendRequest) isRequest()             {}
@@ -164,6 +165,7 @@ func (waveCompleteRequest) isRequest()     {}
 func (messagesInWaveRequest) isRequest()   {}
 func (stableMessageIDsRequest) isRequest() {}
 func (freezeMemberRequest) isRequest()     {}
+func (membershipRequest) isRequest()       {}
 func (addMemberRequest) isRequest()        {}
 
 type response interface{ isResponse() }
@@ -185,6 +187,7 @@ type stableMessageIDsResponse struct {
 	ids []*pb.MessageID
 }
 type freezeMemberResponse struct{ err error }
+type membershipResponse struct{ membership *Membership }
 type addMemberResponse struct {
 	slot int
 	err  error
@@ -198,6 +201,7 @@ func (waveCompleteResponse) isResponse()     {}
 func (messagesInWaveResponse) isResponse()   {}
 func (stableMessageIDsResponse) isResponse() {}
 func (freezeMemberResponse) isResponse()     {}
+func (membershipResponse) isResponse()       {}
 func (addMemberResponse) isResponse()        {}
 func (emptyResponse) isResponse()            {}
 
@@ -272,6 +276,8 @@ func (s *serverImpl) HandleCall(req request, st *state) (response, *state) {
 	case freezeMemberRequest:
 		err := s.membership.Freeze(r.replica)
 		return freezeMemberResponse{err: err}, st
+	case membershipRequest:
+		return membershipResponse{membership: s.membership.Clone()}, st
 	case addMemberRequest:
 		slot, err := s.membership.Add(r.replica)
 		return addMemberResponse{slot: slot, err: err}, st
@@ -438,11 +444,21 @@ func (c *Conversation) Maskin(ctx context.Context, replica *pb.ReplicaID) error 
 	return resp.(maskResponse).err
 }
 
-// Membership returns this conversation's sorted membership view.
-// Phase 1 assumes static membership; the returned object reflects
-// the (immutable) Members from Config.
+// Membership returns this conversation's LIVE membership view —
+// reflecting any post-construction FreezeMember / AddMember
+// mutations. Internally synchronized via a genserver Call so the
+// returned snapshot is always consistent with the conversation's
+// internal state (Phase 7(a) fix: earlier versions returned a
+// fresh NewMembership(cfg.Members) here, which never reflected
+// freezes and led to Order layers stalling on stale membership).
+//
+// The returned Membership is a SNAPSHOT — safe to read but not
+// mutated by the caller; subsequent Freeze/Add do not retroactively
+// update returned snapshots. Callers that need a live view should
+// re-call this method.
 func (c *Conversation) Membership() *Membership {
-	return NewMembership(c.cfg.Members)
+	resp := c.srv.Call(membershipRequest{}).(membershipResponse)
+	return resp.membership
 }
 
 // WaveComplete reports whether wave w meets the standard wave-

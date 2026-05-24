@@ -195,7 +195,11 @@ func TestTotalRespectsCausalOrder(t *testing.T) {
 	tb := order.NewTotal(b)
 	defer tb.Close()
 
-	// alice sends, bob replies, alice again, bob settles.
+	// alice sends, bob replies, alice again, bob settles. Phase 7(a)
+	// hardened Total's continuation gate to strict-greater
+	// (every replica must produce a wave > N message before wave
+	// N is drained), so the original 4-message scenario needed
+	// extra settle messages.
 	_, _ = a.Send([]byte("a-1"))
 	f.drive(5)
 	_, _ = b.Send([]byte("b-1")) // b-1 depends on a-1
@@ -203,13 +207,17 @@ func TestTotalRespectsCausalOrder(t *testing.T) {
 	_, _ = a.Send([]byte("a-2")) // a-2 depends on b-1
 	f.drive(5)
 	_, _ = b.Send([]byte("b-2")) // settle: acks a-2 so wave 2 is complete
+	f.drive(5)
+	_, _ = a.Send([]byte("a-3")) // push alice past wave 2
+	f.drive(5)
+	_, _ = b.Send([]byte("b-3")) // push bob past wave 2
 	f.drive(10)
 
 	for _, ord := range []order.Order{ta, tb} {
-		// Drain the first 3 — that's our assertion target. The 4th
-		// (b-2) may or may not be applied yet, depending on whether
-		// wave 2 has been wave-completed; either way we don't
-		// inspect it.
+		// Drain the first 3 — that's our assertion target. Later
+		// messages may or may not be applied yet, depending on
+		// whether their wave has been wave-completed; we don't
+		// inspect them.
 		got := collectApplied(t, ord, 3, 3*time.Second)
 		seq := payloadsOf(got)
 		want := []string{"a-1", "b-1", "a-2"}
@@ -242,8 +250,13 @@ func TestTotalWaitsForWaveCompletion(t *testing.T) {
 	// bob sends — that's an implicit ack of alice's wave-1 message.
 	_, _ = b.Send([]byte("b-1"))
 	f.drive(8)
+	// Phase 7(a) requires both replicas to produce a wave > 1
+	// message before wave 1 drains. Push both forward.
+	_, _ = a.Send([]byte("a-2"))
+	_, _ = b.Send([]byte("b-2"))
+	f.drive(8)
 
-	// Now Total should apply both.
+	// Now Total should apply both wave-1 messages.
 	got := collectApplied(t, ta, 2, time.Second)
 	seq := payloadsOf(got)
 	want := []string{"a-1", "b-1"}

@@ -358,10 +358,20 @@ func (o *SemOrder) isMessageStableLocal(m *pb.Envelope) bool {
 	return true
 }
 
-// continuationProperty is the §3 gate: every active replica has at
-// least one observed message at currentWave or beyond. Without
-// this we can't be sure no MORE class-≥2 ops will land in
-// currentWave.
+// continuationProperty is the §3 gate: we can be sure no MORE
+// class-≥2 ops will land in currentWave on any replica. This
+// requires every active replica's latest observed vector to have
+// waveOf STRICTLY GREATER than currentWave — if any replica r
+// is still at waveOf(latest) == currentWave, r could send
+// another message that also lands in currentWave (its vector
+// could stay at max=currentWave through several sends),
+// stranding the late-arriving op below the wave gate.
+//
+// Earlier versions allowed >= currentWave, which caused
+// TestDirectoryUpdateSemantics to flake: r1's late-arriving
+// Update would arrive at r0/r2 AFTER they'd already advanced
+// past wave-W, leaving the Update permanently un-applied.
+// See Phase 7(a).
 func (o *SemOrder) continuationProperty() bool {
 	st := &o.state
 	for _, r := range st.membership.Replicas() {
@@ -369,7 +379,7 @@ func (o *SemOrder) continuationProperty() bool {
 		if !present {
 			return false
 		}
-		if waveOf(latest) < st.currentWave {
+		if waveOf(latest) <= st.currentWave {
 			return false
 		}
 	}

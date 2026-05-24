@@ -117,6 +117,26 @@ func (m *Membership) Freeze(r *pb.ReplicaID) error {
 	return nil
 }
 
+// Clone returns a deep copy of this Membership — same slot
+// order, same frozen flags. Safe for the caller to mutate
+// independently. Used by Conversation.Membership to hand out
+// snapshots from the genserver.
+func (m *Membership) Clone() *Membership {
+	out := &Membership{
+		replicas:  make([]*pb.ReplicaID, len(m.replicas)),
+		slotIndex: make(map[string]int, len(m.slotIndex)),
+		frozen:    make([]bool, len(m.frozen)),
+	}
+	for i, r := range m.replicas {
+		out.replicas[i] = proto.Clone(r).(*pb.ReplicaID)
+	}
+	for k, v := range m.slotIndex {
+		out.slotIndex[k] = v
+	}
+	copy(out.frozen, m.frozen)
+	return out
+}
+
 // Replicas returns clones of the active (non-frozen) replicas in
 // slot order.
 func (m *Membership) Replicas() []*pb.ReplicaID {

@@ -109,7 +109,7 @@ func TestKVStoreFiveReplicaSurvivesNodeLoss(t *testing.T) {
 	// every survivor unblocks total-order wave completion.
 	for i, n := range survivors {
 		if err := n.store.FreezeMember(id16("r4")); err != nil {
-			t.Errorf("survivor %d FreezeMember r4: %v", i, err)
+			t.Fatalf("survivor %d FreezeMember r4: %v", i, err)
 		}
 	}
 

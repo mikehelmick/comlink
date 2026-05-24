@@ -176,9 +176,16 @@ func TestSemOrderClass1OpsCanInterleaveDifferently(t *testing.T) {
 	for _, key := range []string{"c", "d"} {
 		_, _ = b.Send(fmt.Appendf(nil, "delete:%s", key))
 	}
-	// Settle.
+	// Settle. Two rounds of cross-acks to satisfy the strict
+	// continuation-property gate (waveOf > currentWave on every
+	// replica) — Phase 7(a) hardened SemOrder so each replica
+	// must produce a message at a strictly higher wave before
+	// currentWave class-≥2 ops are processed.
 	_, _ = a.Send([]byte("delete:nonexistent-a"))
 	_, _ = b.Send([]byte("delete:nonexistent-b"))
+	f.drive(15)
+	_, _ = a.Send([]byte("delete:nonexistent-a2"))
+	_, _ = b.Send([]byte("delete:nonexistent-b2"))
 	f.drive(15)
 
 	// Drain whatever applied. The final state at each replica

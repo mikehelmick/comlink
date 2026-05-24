@@ -19,6 +19,7 @@ import (
 	"sort"
 	"sync"
 
+	pb "github.com/mikehelmick/comlink/internal/pb/comlink/v1"
 	"github.com/mikehelmick/comlink/psync"
 )
 
@@ -44,15 +45,24 @@ type Total struct {
 	nextWave uint64
 	stopOnce sync.Once
 	stopped  chan struct{}
+
+	// latestWave[replica_id_str] is the highest waveOf any message
+	// this Total has observed from that replica. Used as the
+	// continuation-property gate (Phase 7(a)): wave W can only be
+	// drained when every replica has produced a message at waveOf
+	// > W — otherwise a late-arriving wave-W message could land
+	// after wave W has been drained, stranding it forever.
+	latestWave map[string]uint64
 }
 
 // NewTotal constructs a Total order bound to conv.
 func NewTotal(conv *psync.Conversation) *Total {
 	t := &Total{
-		conv:     conv,
-		apply:    make(chan Applied, 256),
-		nextWave: 1, // wave numbers start at 1 (waveOf = max(vector); first sends increment a slot to 1)
-		stopped:  make(chan struct{}),
+		conv:       conv,
+		apply:      make(chan Applied, 256),
+		nextWave:   1, // wave numbers start at 1 (waveOf = max(vector); first sends increment a slot to 1)
+		stopped:    make(chan struct{}),
+		latestWave: make(map[string]uint64),
 	}
 	go t.pump()
 	return t
@@ -62,10 +72,11 @@ func (t *Total) pump() {
 	defer close(t.apply)
 	for {
 		select {
-		case _, ok := <-t.conv.Recv():
+		case d, ok := <-t.conv.Recv():
 			if !ok {
 				return
 			}
+			t.noteObservedWave(d.Envelope)
 			// A new delivery may have advanced wave completion. Try
 			// to drain as many newly-complete waves as possible.
 			t.drainCompleteWaves()
@@ -75,11 +86,40 @@ func (t *Total) pump() {
 	}
 }
 
+// noteObservedWave records the highest waveOf this Total has seen
+// from each sender, feeding the continuation-property gate.
+func (t *Total) noteObservedWave(env *pb.Envelope) {
+	sender := string(env.GetId().GetSender().GetValue())
+	w := waveOf(env.GetId().GetVectorClock())
+	if cur, ok := t.latestWave[sender]; !ok || w > cur {
+		t.latestWave[sender] = w
+	}
+}
+
+// continuationProperty: every replica has produced a message at
+// waveOf strictly greater than `wave`. Without this, a late-
+// arriving wave-`wave` message could land after we've drained
+// wave `wave`, stranding it forever (PLAN §7(a)).
+func (t *Total) continuationProperty(wave uint64) bool {
+	mem := t.conv.Membership()
+	for slot := 0; slot < mem.Len(); slot++ {
+		if mem.IsFrozen(slot) {
+			continue
+		}
+		r := mem.Replica(slot)
+		w, ok := t.latestWave[string(r.GetValue())]
+		if !ok || w <= wave {
+			return false
+		}
+	}
+	return true
+}
+
 // drainCompleteWaves emits every consecutively-complete wave
 // starting at nextWave. Stops when the next pending wave is not
-// yet complete.
+// yet complete or the continuation gate isn't satisfied.
 func (t *Total) drainCompleteWaves() {
-	for t.conv.WaveComplete(t.nextWave) {
+	for t.conv.WaveComplete(t.nextWave) && t.continuationProperty(t.nextWave) {
 		envs := t.conv.MessagesInWave(t.nextWave)
 		sort.Slice(envs, func(i, j int) bool {
 			return bytes.Compare(

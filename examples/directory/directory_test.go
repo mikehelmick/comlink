@@ -190,7 +190,6 @@ func TestDirectoryInsertSemantics(t *testing.T) {
 // Insert-then-Update semantics across replicas should use
 // OrderingTotal instead.
 func TestDirectoryUpdateSemantics(t *testing.T) {
-	t.Skip("known SemOrder Insert→Update bug — see Phase 6 commit message")
 	nodes, stop := buildClusterWithDirectory(t)
 	defer stop()
 
