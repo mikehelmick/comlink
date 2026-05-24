@@ -547,6 +547,37 @@ ReplicaID public types. Top-level `README.md` quickstart.
   json.Marshal/Unmarshal of the map; demonstrates the full
   protocol with a realistic (if simple) app implementation.
 
+**Forward-looking architectural items captured during Phase 10
+design discussion. Tracked here so they don't get lost; will be
+sequenced as their own phase(s) AFTER Phase 10 wraps:**
+
+- **Per-conversation join / membership protocol.** Today
+  `membership.Manager` exists only for the cluster's system
+  conv. Substrates inherit static membership from
+  `SubstrateConfig.Members`. A truly multi-tenant model needs
+  each substrate to run its own membership protocol — including
+  per-conv VoteIn, per-conv VoteOut, per-conv member persistence.
+  Cluster.Join becomes JoinConversation(convID, sponsor, ...).
+  The Cluster becomes a thin "shared transport + ClusterID gate
+  + conversation registry" rather than a membership-managed
+  entity in its own right.
+
+- **Application-level conversation lifecycle API.** Apps need
+  `Cluster.ListConversations()`, `Cluster.CreateConversation(...)`,
+  `Cluster.DeleteConversation(convID)` etc. Today
+  `NewSubstrate` is implicit create-or-join. Apps need explicit
+  control AND a way for peers to be notified when a conversation
+  is created or deleted cluster-wide. Apps should NEVER use the
+  cluster's system conv — that's library-internal.
+
+- **kvstore demo refactor.** The current `comlink-kvd` binary
+  hardcodes a single `COMLINK_KV_CONVID` and binds the kvstore
+  to it. A multi-tenant demo would expose HTTP routes like
+  `POST /stores/<name>` (create a fresh conv), `DELETE
+  /stores/<name>` (tear down), `/stores/<name>/kv/<key>` (per-
+  conv ops). Demonstrates many independent keyspaces on the
+  same node sharing one transport.
+
 **Design boundary (per Phase 10 design discussion):**
 The application owns ALL of:
   - snapshot serialization format
