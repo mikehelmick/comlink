@@ -1,0 +1,33 @@
+# Local kind cluster for the comlink-kvd demo (PLAN §8).
+#
+# Layout:
+#   1 control-plane node (kube-apiserver, scheduler, etcd, etc.)
+#   3 worker nodes — the StatefulSet has 3 replicas with
+#     podAntiAffinity, so we need at least 3 workers for each
+#     pod to land on its own node.
+#
+# Port-map: the host's 30080 (NodePort range) maps to the kind
+# control plane's 30080 so a developer can curl the kvd HTTP
+# front-end from outside the cluster without `kubectl
+# port-forward`. The NodePort itself is declared in the
+# kvd-http Service manifest.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+
+name: comlink
+
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+        protocol: TCP
+      - containerPort: 30090
+        hostPort: 30090
+        protocol: TCP
+      - containerPort: 30030
+        hostPort: 30030
+        protocol: TCP
+  - role: worker
+  - role: worker
+  - role: worker

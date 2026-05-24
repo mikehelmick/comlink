@@ -104,6 +104,17 @@ type TransportConfig struct {
 	// proxyless gRPC) for transport security.
 	Listen string `env:"COMLINK_TRANSPORT_LISTEN"`
 
+	// Advertise is the network address peers should use to dial
+	// this replica. Falls back to the actual listen address when
+	// empty. Required for any deployment where the bind address
+	// is not also a usable peer address — e.g. Kubernetes pods
+	// that bind 0.0.0.0:7000 but advertise their stable DNS name
+	// "<pod>.<headless-svc>.<ns>.svc.cluster.local:7000".
+	// Without this, joiners would hand over "0.0.0.0:7000" as
+	// their JoinerAddr and every other replica would dial its
+	// own loopback when trying to reach them.
+	Advertise string `env:"COMLINK_TRANSPORT_ADVERTISE"`
+
 	// Sponsors is the bootstrap routing table — a small set of
 	// (ReplicaID, addr) entries sufficient to make first contact
 	// with the cluster. After bootstrap, full peer routing

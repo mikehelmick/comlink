@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: comlink
+  labels:
+    app.kubernetes.io/name: comlink
+    app.kubernetes.io/part-of: comlink-demo

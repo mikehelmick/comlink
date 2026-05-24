@@ -1,0 +1,22 @@
+# Headless Service for the StatefulSet — gives each pod a stable
+# DNS name of the form <sts>-<ordinal>.<svc>.<ns>.svc.cluster.local.
+# The entrypoint script uses this to compute the sponsor address
+# for joiner pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: comlink-kvd-peers
+  namespace: comlink
+  labels:
+    app.kubernetes.io/name: comlink-kvd
+    app.kubernetes.io/component: peer-discovery
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: comlink-kvd
+  ports:
+    - name: cluster
+      port: 7000
+      targetPort: cluster
+      protocol: TCP

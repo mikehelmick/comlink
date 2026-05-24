@@ -273,11 +273,20 @@ func NewCluster(ctx context.Context, cfg ClusterConfig) (*Cluster, error) {
 }
 
 // networkAddr returns the local network address for use in
-// sponsor handshakes. For the gRPC Network, it's the actual
-// listener addr (resolved if ":0"); otherwise it's whatever
-// cfg.Transport.Listen contained, which may be empty for the
-// in-memory escape hatch (sponsor handshake won't work there).
+// sponsor handshakes and persisted self-addr. Preference order:
+//
+//   1. cfg.Transport.Advertise — explicit override for
+//      deployments where the bind address (0.0.0.0:N) isn't a
+//      usable peer address. K8s deployments set this to the
+//      pod's stable DNS name.
+//   2. For the gRPC Network, the actual listener addr (resolved
+//      if ":0").
+//   3. cfg.Transport.Listen — fallback for non-gRPC networks /
+//      tests that bind to a usable address directly.
 func networkAddr(n transport.Network, cfg ClusterConfig) string {
+	if cfg.Transport.Advertise != "" {
+		return cfg.Transport.Advertise
+	}
 	if gn, ok := n.(*cgrpc.Network); ok {
 		return gn.Addr()
 	}

@@ -76,6 +76,14 @@ IMAGE          := $(IMAGE_NAME):$(IMAGE_TAG)
 docker:
 	$(DOCKER) build -f deploy/images/comlink-kvd/Dockerfile -t $(IMAGE) .
 
+.PHONY: k8s-up
+k8s-up:
+	./deploy/local/up.sh
+
+.PHONY: k8s-down
+k8s-down:
+	./deploy/local/down.sh
+
 # Generate Go code from .proto files. Outputs land under $(PROTO_OUT).
 # Requires: protoc, protoc-gen-go, protoc-gen-go-grpc.
 .PHONY: proto

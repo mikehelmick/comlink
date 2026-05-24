@@ -57,9 +57,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
+	"strings"
 
 	"github.com/mikehelmick/comlink"
 	"github.com/mikehelmick/comlink/examples/kvstore"
@@ -76,6 +76,15 @@ const (
 	// (they'd have a different substrate ID). For multi-replica
 	// runs, set this to the same value on every replica.
 	envKVConvID = "COMLINK_KV_CONVID"
+	// envKVMembers is a comma-separated list of hex ReplicaIDs
+	// that ARE in the kvstore Substrate. Required for multi-
+	// replica deployments — every replica must agree on the
+	// same Members list at substrate construction time, and
+	// Cluster.Members() is the WRONG value to use (a joiner sees
+	// a different snapshot than the founder did, etc).
+	// If empty, defaults to cluster.Members() — usable only for
+	// single-node demos.
+	envKVMembers = "COMLINK_KV_MEMBERS"
 )
 
 func main() {
@@ -125,10 +134,17 @@ func run() error {
 		"listen", cluster.ListenAddr(),
 		"members", len(cluster.Members()))
 
+	members, err := membersFromEnv()
+	if err != nil {
+		return err
+	}
+	if len(members) == 0 {
+		members = cluster.Members()
+	}
 	store, err := kvstore.New(ctx, kvstore.Config{
 		Cluster:        cluster,
 		ConversationID: convID,
-		Members:        cluster.Members(),
+		Members:        members,
 	})
 	if err != nil {
 		return fmt.Errorf("kvstore.New: %w", err)
@@ -162,6 +178,30 @@ func run() error {
 		logger.Warn("http shutdown error", "err", err)
 	}
 	return nil
+}
+
+// membersFromEnv parses COMLINK_KV_MEMBERS (comma-separated
+// hex ReplicaIDs). Empty / unset → empty slice → caller falls
+// back to cluster.Members().
+func membersFromEnv() ([]comlink.ReplicaID, error) {
+	raw := strings.TrimSpace(os.Getenv(envKVMembers))
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]comlink.ReplicaID, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		id, err := comlink.ParseReplicaID(p)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", envKVMembers, err)
+		}
+		out = append(out, id)
+	}
+	return out, nil
 }
 
 // convIDFromEnv parses COMLINK_KV_CONVID. Defaults to an

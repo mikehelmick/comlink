@@ -1,0 +1,99 @@
+# comlink-kvd StatefulSet — 3 replicas, each with its own PVC.
+# Pod ordinal drives identity (entrypoint.sh derives COMLINK_SELF
+# from the hostname). Pod-0 is the founder; pod-1 and pod-2 join
+# via sponsor handshake against pod-0.
+#
+# Restart policy: kubelet's default. On a pod restart, PVC is
+# preserved, ClusterID + persisted ML are recovered from disk,
+# and the Substrate auto-replays its local log to rebuild the
+# StateMachine (Phase 7(b)).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: comlink-kvd
+  namespace: comlink
+  labels:
+    app.kubernetes.io/name: comlink-kvd
+spec:
+  serviceName: comlink-kvd-peers
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: comlink-kvd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: comlink-kvd
+    spec:
+      # One pod per node — without this two replicas could land
+      # on the same kind worker and the "node failure" story is
+      # broken. kind-config.yaml provisions 3 workers exactly so
+      # this fits.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: comlink-kvd
+              topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: kvd
+          image: comlink-kvd:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: cluster
+              containerPort: 7000
+              protocol: TCP
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            # Per-pod identity inputs consumed by entrypoint.sh.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HEADLESS_SVC
+              value: comlink-kvd-peers
+            # Matches `replicas:` above. The entrypoint hardcodes
+            # the substrate's Members list from sha256(<sts>-<i>)
+            # for i in 0..STS_REPLICAS-1.
+            - name: STS_REPLICAS
+              value: "3"
+
+            # comlink config not derived from pod identity.
+            - name: COMLINK_DATA_DIR
+              value: /var/lib/comlink
+            - name: COMLINK_TRANSPORT_LISTEN
+              value: 0.0.0.0:7000
+            - name: COMLINK_KV_HTTP
+              value: 0.0.0.0:8000
+            # ConversationID for the kvstore substrate — shared
+            # across all replicas. Hardcoded for the demo so we
+            # don't need a CR / ConfigMap dance to share it.
+            - name: COMLINK_KV_CONVID
+              value: "0000000000000000000000000000abcd"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/comlink
+          # Resource requests deliberately modest for the local
+          # kind cluster.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: comlink-kvd
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

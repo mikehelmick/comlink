@@ -22,6 +22,7 @@ set -eu
 POD_HOST="$(hostname)"
 ORDINAL="${POD_HOST##*-}"
 STS_NAME="${POD_HOST%-*}"
+POD_DNS="${POD_HOST}.${HEADLESS_SVC}.${POD_NAMESPACE}.svc.cluster.local"
 
 # Deterministic 16-byte (32-hex-char) ReplicaID derived from the
 # full pod hostname.
@@ -30,6 +31,33 @@ self_for() {
 }
 
 export COMLINK_SELF="$(self_for "$POD_HOST")"
+
+# Advertise to peers using the pod's stable DNS name — the bind
+# is on 0.0.0.0 but other pods need a routable address, and the
+# DNS name survives pod IP changes across restarts.
+export COMLINK_TRANSPORT_ADVERTISE="${POD_DNS}:7000"
+
+# Hardcoded substrate membership: every replica must agree on
+# the same Members list for the kvstore Substrate, and
+# cluster.Members() can't be used (founder sees {self} only at
+# substrate construction; joiners see {founder, self}).
+# Compute the full set deterministically from the StatefulSet's
+# 0..(N-1) ordinals.
+#
+# STS_REPLICAS defaults to 3 — set by the manifest's env.
+: "${STS_REPLICAS:=3}"
+KV_MEMBERS=""
+i=0
+while [ "$i" -lt "$STS_REPLICAS" ]; do
+    mem="$(self_for "${STS_NAME}-${i}")"
+    if [ -z "$KV_MEMBERS" ]; then
+        KV_MEMBERS="$mem"
+    else
+        KV_MEMBERS="$KV_MEMBERS,$mem"
+    fi
+    i=$((i + 1))
+done
+export COMLINK_KV_MEMBERS="$KV_MEMBERS"
 
 if [ "$ORDINAL" = "0" ]; then
     # Founder pod. Force-bootstrap a fresh cluster on first start;
