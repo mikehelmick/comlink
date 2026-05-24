@@ -113,6 +113,18 @@ type SubstrateConfig struct {
 	// Clock; defaults to the parent Cluster's clock.
 	Clock clock.Clock
 
+	// InitialSnapshot, when non-nil, is installed via the SM's
+	// Restore method before the apply pump starts. Apply for
+	// messages whose Offset is <= InitialSnapshot.ThroughOffset
+	// is suppressed (already covered by the snapshot). Requires
+	// StateMachine to implement Snapshotter; if it doesn't, the
+	// config is rejected at NewSubstrate.
+	//
+	// Phase 10(b): apps load this from their own persistent
+	// storage on startup. Phase 10(d) extends sponsor handshake
+	// to deliver a snapshot for joiners.
+	InitialSnapshot *Snapshot
+
 	// AutoEvict, when non-nil, enables substrate-level failure
 	// detection: if a peer's heartbeats stop for longer than
 	// SuspicionInterval, the substrate freezes that peer's slot
@@ -175,6 +187,18 @@ type Substrate struct {
 	pumpDone  chan struct{}
 	closeOnce sync.Once
 
+	// snapshotThrough is the offset boundary for SM Apply
+	// suppression. Apply is skipped for any message whose log
+	// Offset is <= this value. Initialized from
+	// SubstrateConfig.InitialSnapshot at construction; never
+	// mutates after.
+	snapshotThrough uint64
+
+	// snapshotWatermark tracks how far the app has DURABLY
+	// snapshotted (via AdvanceSnapshotWatermark). Published to
+	// peers via the trim protocol (Phase 10(c)).
+	snapshotWmk snapshotWatermark
+
 	// Submit waiter machinery. Submit may register its waiter
 	// AFTER the apply pump has already fired for that
 	// sender_seq (the conv's deliver channel is faster than the
@@ -229,6 +253,14 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 	for i, m := range cfg.Members {
 		pbMembers[i] = m.toPB()
 	}
+	// Validate InitialSnapshot before allocating anything else:
+	// it's a fast caller-error check.
+	if cfg.InitialSnapshot != nil {
+		if _, ok := cfg.StateMachine.(Snapshotter); !ok {
+			return nil, errors.New("comlink: SubstrateConfig.InitialSnapshot set but StateMachine does not implement Snapshotter")
+		}
+	}
+
 	// Construct the Substrate skeleton FIRST so we can wire its
 	// noteReceive method into psync's OnReceive callback. The
 	// hb field is filled in below; noteReceive guards on nil.
@@ -241,6 +273,10 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 		pumpDone:       make(chan struct{}),
 		pendingApplies: make(map[indexKey]chan struct{}),
 		appliedSelf:    make(map[indexKey]struct{}),
+	}
+	if cfg.InitialSnapshot != nil {
+		s.snapshotThrough = cfg.InitialSnapshot.ThroughOffset
+		s.snapshotWmk.advance(cfg.InitialSnapshot.ThroughOffset)
 	}
 
 	// Bind psync to the Cluster's lifetime ctx, NOT the caller's
@@ -307,6 +343,19 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 		OnSuspect:         onSuspect,
 	})
 	cleanup = append(cleanup, func() { _ = s.hb.Close() })
+
+	// Install the initial snapshot BEFORE the apply pump starts
+	// — Restore must complete before any Apply could fire.
+	if cfg.InitialSnapshot != nil {
+		snap := cfg.InitialSnapshot
+		if err := cfg.StateMachine.(Snapshotter).Restore(snap.Bytes); err != nil {
+			rollback()
+			return nil, fmt.Errorf("comlink: StateMachine.Restore: %w", err)
+		}
+		logger.Info("substrate: restored from snapshot",
+			"through_offset", snap.ThroughOffset,
+			"size_bytes", len(snap.Bytes))
+	}
 
 	go s.applyPump()
 
@@ -522,6 +571,34 @@ func (s *Substrate) Members() []ReplicaID {
 	return out
 }
 
+// AdvanceSnapshotWatermark informs the substrate that the
+// application has DURABLY persisted a snapshot through log
+// offset `through`. The substrate uses this:
+//
+//   - To extend the trim safe-frontier so older log entries
+//     can be compacted (Phase 10(c) — not yet wired through to
+//     trim itself).
+//   - To answer sponsor-handshake snapshot requests with a
+//     pointer to the latest covered offset (Phase 10(d)).
+//
+// Monotonic — calls with a lower offset than the current
+// watermark are silently ignored. Safe to call concurrently
+// with everything else (atomic update).
+//
+// Apps should call this AFTER fsync of their snapshot bytes
+// completes. Calling it earlier risks losing snapshotted
+// data on crash and re-needing log entries that the cluster
+// has since trimmed.
+func (s *Substrate) AdvanceSnapshotWatermark(through uint64) {
+	s.snapshotWmk.advance(through)
+}
+
+// SnapshotWatermark returns the most recent offset the
+// application has reported as durably snapshotted.
+func (s *Substrate) SnapshotWatermark() uint64 {
+	return s.snapshotWmk.get()
+}
+
 // FreezeMember marks `replica`'s slot as frozen in this
 // Substrate's psync membership — the ordering layer will no
 // longer wait for this replica's messages. The replica is NOT
@@ -632,10 +709,18 @@ func (s *Substrate) handleApplied(ctx context.Context, applied order.Applied) {
 		Wave:    waveOfVC(vc),
 	}
 	convLabel := shortConvID(s.cfg.ConversationID)
-	applyStart := time.Now()
-	s.cfg.StateMachine.Apply(ctx, msg)
-	metricSubstrateApplyDuration.WithLabelValues(convLabel).Observe(time.Since(applyStart).Seconds())
-	metricSubstrateApplied.WithLabelValues(convLabel).Inc()
+	// Skip apply for messages already covered by the initial
+	// snapshot (Phase 10(b)). The Order layer / log still
+	// processes them for graph / stability bookkeeping, but the
+	// SM doesn't double-apply.
+	if msg.Offset != 0 && msg.Offset <= s.snapshotThrough {
+		metricSubstrateApplySkipped.WithLabelValues(convLabel).Inc()
+	} else {
+		applyStart := time.Now()
+		s.cfg.StateMachine.Apply(ctx, msg)
+		metricSubstrateApplyDuration.WithLabelValues(convLabel).Observe(time.Since(applyStart).Seconds())
+		metricSubstrateApplied.WithLabelValues(convLabel).Inc()
+	}
 
 	// Signal any matching Submit waiter, OR record that this
 	// sender_seq has been applied so a soon-to-register Submit

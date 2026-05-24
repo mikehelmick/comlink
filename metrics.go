@@ -140,6 +140,18 @@ var (
 		[]string{"kind"}, // "added", "removed"
 	)
 
+	// metricSubstrateApplySkipped counts Apply calls suppressed
+	// because the message's Offset is already covered by an
+	// initial snapshot (Phase 10(b)). Useful for observing
+	// joiner-bootstrap behavior.
+	metricSubstrateApplySkipped = promauto.With(metricsRegistry).NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "comlink_substrate_apply_skipped_total",
+			Help: "Apply calls suppressed because the message offset is covered by the InitialSnapshot.",
+		},
+		[]string{"conv_id"},
+	)
+
 	// metricSubstrateAutoEvict counts substrate-level
 	// auto-evictions (Phase 10(a)) — a peer was silent for too
 	// long and its slot was frozen so wave gates could advance.
