@@ -154,12 +154,25 @@ func run() error {
 	// no on-disk snapshot exists yet, pull the snapshot from
 	// the sponsor instead of starting empty.
 	bootstrap := len(cfg.Transport.Sponsors) > 0
+	ackCfg := kvstore.AckConfig{
+		Disabled: os.Getenv("COMLINK_KV_ACK_DISABLED") == "true",
+	}
+	if v := os.Getenv("COMLINK_KV_ACK_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			ackCfg.Interval = d
+		}
+	}
+	batchCfg := kvstore.BatchingConfig{
+		Disabled: os.Getenv("COMLINK_KV_BATCH_DISABLED") == "true",
+	}
 	store, err := kvstore.New(ctx, kvstore.Config{
 		Cluster:              cluster,
 		ConversationID:       convID,
 		Members:              members,
 		SnapshotDir:          snapDir,
 		BootstrapFromSponsor: bootstrap,
+		Ack:                  ackCfg,
+		Batching:             batchCfg,
 	})
 	if err != nil {
 		return fmt.Errorf("kvstore.New: %w", err)

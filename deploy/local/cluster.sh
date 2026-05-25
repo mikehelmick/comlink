@@ -139,6 +139,14 @@ start_one() {
     [ -n "$COMLINK_GOGC_DEFAULT" ]       && gogc_env="GOGC=$COMLINK_GOGC_DEFAULT"
     [ -n "$COMLINK_GOMEMLIMIT_DEFAULT" ] && gomemlimit_env="GOMEMLIMIT=$COMLINK_GOMEMLIMIT_DEFAULT"
 
+    # Propagate any operator-set COMLINK_KV_* env into each
+    # replica. Lets the soak driver / debug session toggle
+    # batching, ack interval, etc. without script changes.
+    local passthrough_env=""
+    [ -n "${COMLINK_KV_ACK_INTERVAL:-}" ] && passthrough_env="$passthrough_env COMLINK_KV_ACK_INTERVAL=$COMLINK_KV_ACK_INTERVAL"
+    [ -n "${COMLINK_KV_ACK_DISABLED:-}" ] && passthrough_env="$passthrough_env COMLINK_KV_ACK_DISABLED=$COMLINK_KV_ACK_DISABLED"
+    [ -n "${COMLINK_KV_BATCH_DISABLED:-}" ] && passthrough_env="$passthrough_env COMLINK_KV_BATCH_DISABLED=$COMLINK_KV_BATCH_DISABLED"
+
     env \
         COMLINK_SELF="$self" \
         COMLINK_DATA_DIR="$data" \
@@ -152,6 +160,7 @@ start_one() {
         $gomaxprocs_env \
         $gogc_env \
         $gomemlimit_env \
+        $passthrough_env \
         "$KVD_BIN" >>"$log" 2>&1 &
 
     local pid=$!

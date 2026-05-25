@@ -23,6 +23,14 @@ enum Op {
   OP_UNSPECIFIED = 0;
   OP_SET = 1;
   OP_DELETE = 2;
+  // OP_ACK is a no-op command used by the application-level
+  // proactive-ack loop to advance the sender's vector-clock
+  // slot. Apply ignores OP_ACK for state purposes; the
+  // value is in the envelope's VC, not in the payload. Only
+  // useful for one-sided write traffic, where peers would
+  // otherwise advance their slots only via heartbeats and
+  // stall the wave gate.
+  OP_ACK = 3;
 }
 
 // Command is the per-write payload submitted via the substrate.
@@ -61,3 +69,18 @@ message SnapshotEntry {
   string key = 1;
   bytes value = 2;
 }
+
+// CommandBatch is the unit of work submitted to the substrate.
+// EVERY substrate payload is a CommandBatch, even single writes
+// (which become a one-element batch). This keeps the Apply
+// path uniform and removes the need for a discriminated
+// payload type.
+//
+// Application-level batching amortizes the per-Submit substrate
+// roundtrip (one wave-gate completion, two-peer fan-out) across
+// many user-visible writes. Under sustained load it can deliver
+// a multiplicative throughput win.
+message CommandBatch {
+  repeated Command commands = 1;
+}
+

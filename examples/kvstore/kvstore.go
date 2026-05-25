@@ -130,6 +130,12 @@ var (
 			Buckets: prometheus.ExponentialBuckets(1024, 4, 8),
 		},
 	)
+	metricKVAckSubmitted = promauto.With(comlink.MetricsRegistry()).NewCounter(
+		prometheus.CounterOpts{
+			Name: "kvstore_ack_submitted_total",
+			Help: "Proactive OP_ACK substrate Submits emitted by the ack controller.",
+		},
+	)
 )
 
 // ─── command schema (proto kvstore.v1.Command) ──────────────────
@@ -191,6 +197,14 @@ type Store struct {
 	// Batcher — coalesces concurrent Set/Delete calls into one
 	// substrate Submit. Nil when Config.Batching.Disabled=true.
 	batcher *batcher
+
+	// Proactive-ack loop. Nil when Config.Ack.Disabled=true.
+	ack *ackController
+
+	// self is the local replica id, captured at New time so
+	// Apply can quickly compare a message's sender against it
+	// to skip ack-back for self-deliveries.
+	self comlink.ReplicaID
 }
 
 // batchEntry is one queued mutation waiting for the batch loop
@@ -390,6 +404,93 @@ func (b *batcher) Close() error {
 	return nil
 }
 
+// ─── proactive ack loop ─────────────────────────────────────────
+//
+// One per Store. Apply.noteAppFromPeer sets pending=true on any
+// app message received from another replica. The loop ticks
+// every Interval and fires ONE no-op OP_ACK Submit if pending
+// is set, then clears it. Coalescing means at most one ack per
+// tick regardless of how many peer applies fired in that window.
+
+type ackController struct {
+	sub      *comlink.Substrate
+	interval time.Duration
+
+	pending  atomic.Bool
+	stop     chan struct{}
+	stopOnce sync.Once
+	done     chan struct{}
+}
+
+func newAckController(sub *comlink.Substrate, cfg AckConfig) *ackController {
+	if cfg.Interval <= 0 {
+		cfg.Interval = 10 * time.Millisecond
+	}
+	a := &ackController{
+		sub:      sub,
+		interval: cfg.Interval,
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	go a.loop()
+	return a
+}
+
+// noteAppFromPeer is called from Apply when an APP command (not
+// OP_ACK) arrives from a non-self sender. Marks that an ack
+// should be sent at the next tick.
+func (a *ackController) noteAppFromPeer() {
+	a.pending.Store(true)
+}
+
+// loop fires one ack Submit per tick whenever pending is set.
+// The ack is a CommandBatch carrying a single OP_ACK Command;
+// the substrate handles it like any other Submit, and Apply on
+// every replica skips state mutation when it sees OP_ACK.
+func (a *ackController) loop() {
+	defer close(a.done)
+	// Pre-marshal the ack payload once — it's the same bytes
+	// every time, so we save a per-tick proto.Marshal.
+	ackBytes, err := proto.Marshal(&kvpb.CommandBatch{
+		Commands: []*kvpb.Command{{Op: kvpb.Op_OP_ACK}},
+	})
+	if err != nil {
+		return
+	}
+	t := time.NewTicker(a.interval)
+	defer t.Stop()
+	// Use a cancelable context so a wedged Submit at shutdown
+	// returns immediately when Close fires.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { <-a.stop; cancel() }()
+
+	for {
+		select {
+		case <-a.stop:
+			return
+		case <-t.C:
+			if !a.pending.CompareAndSwap(true, false) {
+				continue
+			}
+			// Best-effort. If Submit errors (substrate closed,
+			// ctx cancelled), we don't retry — the next peer
+			// message will set pending again and we'll try
+			// then.
+			_ = a.sub.Submit(ctx, ackBytes)
+			metricKVAckSubmitted.Inc()
+		}
+	}
+}
+
+// Close stops the loop. Idempotent.
+func (a *ackController) Close() error {
+	a.stopOnce.Do(func() {
+		close(a.stop)
+		<-a.done
+	})
+	return nil
+}
 
 // watcher is the internal handle for one Watch call. Channel
 // is buffered so a slow consumer can't stall Apply; oldest
@@ -447,6 +548,37 @@ type Config struct {
 	// to bypass entirely (every Set/Delete becomes its own
 	// 1-element batch posted directly).
 	Batching BatchingConfig
+
+	// Ack controls the proactive-ack background loop. A
+	// replica that observes an app message from a peer fires a
+	// tiny no-op OP_ACK back through the substrate. The ack
+	// itself doesn't satisfy the wave-gate (waveOf doesn't
+	// strictly exceed the ack'd wave), but it bumps the
+	// sender's slot at *application-message rate* instead of
+	// the substrate's default heartbeat tick — which under
+	// sustained one-sided traffic drops Submit latency from
+	// "heartbeat interval × in-flight depth" (hundreds of ms)
+	// to "network roundtrip per Submit" (tens of ms).
+	//
+	// Only needed when traffic is one-sided. If every replica
+	// is also taking writes, their app messages bump their
+	// slots on their own and acks would just be noise.
+	Ack AckConfig
+}
+
+// AckConfig tunes the proactive-ack loop. See Config.Ack.
+type AckConfig struct {
+	// Disabled bypasses the ack loop entirely. Useful for
+	// before/after benchmarks.
+	Disabled bool
+
+	// Interval is the coalescing window: at most one ack per
+	// Interval, regardless of how many peer applies fire.
+	// Zero = 10 ms. Smaller = lower Submit latency at the cost
+	// of more ack traffic; larger = less network chatter but
+	// the wave-gate stalls back toward the heartbeat-tick
+	// floor when load is light.
+	Interval time.Duration
 }
 
 // BatchingConfig tunes the application-level write batcher.
@@ -563,6 +695,17 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 	// substrate Submits (kept on the same code path for parity).
 	if !cfg.Batching.Disabled {
 		s.batcher = newBatcher(sub, cfg.Batching)
+	}
+
+	// Capture self for Apply's "is this a peer message?" check.
+	s.self = cfg.Cluster.Self()
+
+	// Proactive-ack loop (Path B from the latency
+	// investigation). Defaults on; disable explicitly when the
+	// workload is bidirectional and would just generate
+	// redundant ack traffic.
+	if !cfg.Ack.Disabled {
+		s.ack = newAckController(sub, cfg.Ack)
 	}
 
 	// Reflect any post-Restore max-offset into our atomic so a
@@ -756,6 +899,11 @@ func (s *Store) FreezeMember(replica comlink.ReplicaID) error {
 // active Watch channel. Subsequent Set / Delete / Watch return
 // errors via the Substrate.
 func (s *Store) Close() error {
+	// Stop the ack loop early so it can't try to Submit through
+	// a closing substrate.
+	if s.ack != nil {
+		_ = s.ack.Close()
+	}
 	// Stop the batcher first so its loop drains any pending
 	// entries before we tear down the substrate underneath it.
 	if s.batcher != nil {
@@ -797,6 +945,29 @@ func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
 		return
 	}
 
+	// Skip-mutation + skip-ack-back detection: a batch made
+	// entirely of OP_ACK commands is the proactive-ack frame.
+	// It does no app-state work and must NOT trigger another
+	// ack (which would loop). One-element OP_ACK batches are
+	// the common case; we still handle multi-element defensively.
+	allAck := true
+	for _, c := range cmds {
+		if c.GetOp() != kvpb.Op_OP_ACK {
+			allAck = false
+			break
+		}
+	}
+	if allAck {
+		metricKVApply.WithLabelValues("ack").Inc()
+		return
+	}
+
+	// Track whether ANY command came from a peer (not self) so
+	// we can decide whether to schedule an ack. Within a batch
+	// all commands share a sender (the batch is one substrate
+	// message), so this is just one Equal compare per Apply.
+	fromPeer := !msg.Sender.Equal(s.self)
+
 	// Hold the data lock once for the whole batch — within a
 	// batch the writes are applied as one logical unit. This
 	// also amortizes the lock acquire/release across many
@@ -822,12 +993,25 @@ func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
 			delete(s.data, key)
 			metricKVApply.WithLabelValues("del").Inc()
 			events = append(events, evt{kvpb.Op_OP_DELETE, key, "", had})
+		case kvpb.Op_OP_ACK:
+			// Mixed batch with an ack inside it. Skip the ack
+			// command but apply the rest. (Shouldn't normally
+			// happen — the batcher doesn't mix ack with app
+			// commands — but be tolerant.)
+			metricKVApply.WithLabelValues("ack").Inc()
 		default:
 			// Unknown op — skip, keep the rest of the batch atomic.
 		}
 	}
 	metricKVKeys.Set(float64(len(s.data)))
 	s.mu.Unlock()
+
+	// Signal the ack loop AFTER applying state. The next tick
+	// will fire one ack for this (and any other peer apps that
+	// arrived in the same window).
+	if fromPeer && s.ack != nil {
+		s.ack.noteAppFromPeer()
+	}
 
 	// Track the highest applied offset for the periodic snapshot
 	// writer (atomic so we don't need the data lock).

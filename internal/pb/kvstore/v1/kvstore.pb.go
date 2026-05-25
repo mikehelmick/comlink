@@ -42,6 +42,14 @@ const (
 	Op_OP_UNSPECIFIED Op = 0
 	Op_OP_SET         Op = 1
 	Op_OP_DELETE      Op = 2
+	// OP_ACK is a no-op command used by the application-level
+	// proactive-ack loop to advance the sender's vector-clock
+	// slot. Apply ignores OP_ACK for state purposes; the
+	// value is in the envelope's VC, not in the payload. Only
+	// useful for one-sided write traffic, where peers would
+	// otherwise advance their slots only via heartbeats and
+	// stall the wave gate.
+	Op_OP_ACK Op = 3
 )
 
 // Enum value maps for Op.
@@ -50,11 +58,13 @@ var (
 		0: "OP_UNSPECIFIED",
 		1: "OP_SET",
 		2: "OP_DELETE",
+		3: "OP_ACK",
 	}
 	Op_value = map[string]int32{
 		"OP_UNSPECIFIED": 0,
 		"OP_SET":         1,
 		"OP_DELETE":      2,
+		"OP_ACK":         3,
 	}
 )
 
@@ -270,6 +280,60 @@ func (x *SnapshotEntry) GetValue() []byte {
 	return nil
 }
 
+// CommandBatch is the unit of work submitted to the substrate.
+// EVERY substrate payload is a CommandBatch, even single writes
+// (which become a one-element batch). This keeps the Apply
+// path uniform and removes the need for a discriminated
+// payload type.
+//
+// Application-level batching amortizes the per-Submit substrate
+// roundtrip (one wave-gate completion, two-peer fan-out) across
+// many user-visible writes. Under sustained load it can deliver
+// a multiplicative throughput win.
+type CommandBatch struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Commands      []*Command             `protobuf:"bytes,1,rep,name=commands,proto3" json:"commands,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CommandBatch) Reset() {
+	*x = CommandBatch{}
+	mi := &file_kvstore_v1_kvstore_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommandBatch) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommandBatch) ProtoMessage() {}
+
+func (x *CommandBatch) ProtoReflect() protoreflect.Message {
+	mi := &file_kvstore_v1_kvstore_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommandBatch.ProtoReflect.Descriptor instead.
+func (*CommandBatch) Descriptor() ([]byte, []int) {
+	return file_kvstore_v1_kvstore_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *CommandBatch) GetCommands() []*Command {
+	if x != nil {
+		return x.Commands
+	}
+	return nil
+}
+
 var File_kvstore_v1_kvstore_proto protoreflect.FileDescriptor
 
 const file_kvstore_v1_kvstore_proto_rawDesc = "" +
@@ -285,12 +349,16 @@ const file_kvstore_v1_kvstore_proto_rawDesc = "" +
 	"\aentries\x18\x02 \x03(\v2\x19.kvstore.v1.SnapshotEntryR\aentries\"7\n" +
 	"\rSnapshotEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value*3\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\"?\n" +
+	"\fCommandBatch\x12/\n" +
+	"\bcommands\x18\x01 \x03(\v2\x13.kvstore.v1.CommandR\bcommands*?\n" +
 	"\x02Op\x12\x12\n" +
 	"\x0eOP_UNSPECIFIED\x10\x00\x12\n" +
 	"\n" +
 	"\x06OP_SET\x10\x01\x12\r\n" +
-	"\tOP_DELETE\x10\x02BAZ?github.com/mikehelmick/comlink/internal/pb/kvstore/v1;kvstorepbb\x06proto3"
+	"\tOP_DELETE\x10\x02\x12\n" +
+	"\n" +
+	"\x06OP_ACK\x10\x03BAZ?github.com/mikehelmick/comlink/internal/pb/kvstore/v1;kvstorepbb\x06proto3"
 
 var (
 	file_kvstore_v1_kvstore_proto_rawDescOnce sync.Once
@@ -305,21 +373,23 @@ func file_kvstore_v1_kvstore_proto_rawDescGZIP() []byte {
 }
 
 var file_kvstore_v1_kvstore_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_kvstore_v1_kvstore_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_kvstore_v1_kvstore_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_kvstore_v1_kvstore_proto_goTypes = []any{
 	(Op)(0),               // 0: kvstore.v1.Op
 	(*Command)(nil),       // 1: kvstore.v1.Command
 	(*Snapshot)(nil),      // 2: kvstore.v1.Snapshot
 	(*SnapshotEntry)(nil), // 3: kvstore.v1.SnapshotEntry
+	(*CommandBatch)(nil),  // 4: kvstore.v1.CommandBatch
 }
 var file_kvstore_v1_kvstore_proto_depIdxs = []int32{
 	0, // 0: kvstore.v1.Command.op:type_name -> kvstore.v1.Op
 	3, // 1: kvstore.v1.Snapshot.entries:type_name -> kvstore.v1.SnapshotEntry
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	1, // 2: kvstore.v1.CommandBatch.commands:type_name -> kvstore.v1.Command
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_kvstore_v1_kvstore_proto_init() }
@@ -333,7 +403,7 @@ func file_kvstore_v1_kvstore_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_kvstore_v1_kvstore_proto_rawDesc), len(file_kvstore_v1_kvstore_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   3,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
