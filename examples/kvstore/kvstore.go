@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -137,6 +138,18 @@ var (
 			Help: "Proactive OP_ACK substrate Submits emitted by the ack controller.",
 		},
 	)
+	metricKVTombstonesGC = promauto.With(comlink.MetricsRegistry()).NewCounter(
+		prometheus.CounterOpts{
+			Name: "kvstore_tombstones_gc_total",
+			Help: "Tombstones dropped by the GC sweep (tied to safe-wave from peer observations).",
+		},
+	)
+	metricKVTombstonesLive = promauto.With(comlink.MetricsRegistry()).NewGauge(
+		prometheus.GaugeOpts{
+			Name: "kvstore_tombstones_live",
+			Help: "Current count of tombstones (deleted entries retained for LWW resurrection-prevention).",
+		},
+	)
 )
 
 // ─── command schema (proto kvstore.v1.Command) ──────────────────
@@ -211,6 +224,22 @@ type Store struct {
 	data   map[string]entry
 	maxOff atomic.Uint64 // highest msg.Offset seen in Apply
 
+	// peerWaveSeen[string(ReplicaID)] = max waveOf any
+	// envelope from that replica we've Apply'd. Protected by
+	// s.mu (only updated under Lock from Apply; only read
+	// under Lock from the tombstone-GC pass).
+	//
+	// Used to compute the safe-GC wave for tombstones:
+	// safeWave = min over active members of peerWaveSeen[m].
+	// A tombstone with wave < safeWave can be dropped because
+	// no future incoming envelope from any active member can
+	// have wave <= tombstone.wave (psync's per-sender FIFO +
+	// causal-predecessor delivery makes wave monotone per
+	// sender; once we observe r at wave W, all r's earlier
+	// sends are also Apply'd and r's next send will be at
+	// wave > W).
+	peerWaveSeen map[string]uint64
+
 	watchMu       sync.Mutex
 	watchers      map[string]map[*watcher]struct{}
 	totalWatchers int
@@ -235,6 +264,11 @@ type Store struct {
 	// Apply can quickly compare a message's sender against it
 	// to skip ack-back for self-deliveries.
 	self comlink.ReplicaID
+
+	// cluster is captured at New time for tombstone-GC
+	// member-list reads. Members may change between snapshots
+	// via VoteIn/VoteOut at the cluster level.
+	cluster *comlink.Cluster
 }
 
 // batchEntry is one queued mutation waiting for the batch loop
@@ -682,7 +716,8 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, errors.New("kvstore: Config.Members is required")
 	}
 	s := &Store{
-		data:        make(map[string]entry),
+		data:         make(map[string]entry),
+		peerWaveSeen: make(map[string]uint64),
 		watchers:    make(map[string]map[*watcher]struct{}),
 		snapshotDir: cfg.SnapshotDir,
 	}
@@ -738,8 +773,10 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		s.batcher = newBatcher(sub, cfg.Batching)
 	}
 
-	// Capture self for Apply's "is this a peer message?" check.
+	// Capture self for Apply's "is this a peer message?" check,
+	// and cluster for the tombstone-GC member-list read.
 	s.self = cfg.Cluster.Self()
+	s.cluster = cfg.Cluster
 
 	// Proactive-ack loop (Path B from the latency
 	// investigation). Defaults on; disable explicitly when the
@@ -866,7 +903,107 @@ func (s *Store) writeSnapshot() error {
 	metricKVSnapshotThrough.Set(float64(throughOff))
 	// Tell comlink the snapshot is durable so trim can advance.
 	s.sub.AdvanceSnapshotWatermark(throughOff)
+	// Sweep tombstones whose wave < the cluster-safe wave.
+	// Tied to snapshot cadence (every 10s default) — cheap and
+	// naturally rate-limited.
+	s.gcTombstones()
 	return nil
+}
+
+// gcTombstones drops every tombstone whose wave is strictly
+// less than safeWave = min over current cluster members of
+// peerWaveSeen[m]. If any active member has no observed wave
+// (0), safeWave is 0 and no tombstones are dropped.
+//
+// Soundness argument:
+//   - Psync delivers per-sender FIFO + causal predecessors
+//     are filled before any successor is delivered.
+//   - Therefore, when we observe r at wave W, every prior r-
+//     send is also Apply'd.
+//   - r's next send will be at wave > W (r's own slot
+//     increments).
+//   - So no future r-message can have wave <= W.
+//   - With safeWave = min(peerWaveSeen[r]) over all r in the
+//     active member set, no future envelope from any active
+//     member can have wave <= safeWave.
+//   - Tombstones with wave < safeWave can therefore never be
+//     beaten by a future LWW comparison.
+//
+// Conservative cases: a member who hasn't sent anything since
+// startup keeps safeWave at 0 (no GC). That's the price of
+// correctness in a dynamic-membership world.
+func (s *Store) gcTombstones() {
+	// Snapshot the active membership BEFORE taking the lock,
+	// so the cluster's membership-change callbacks aren't
+	// blocked by an ongoing GC sweep.
+	members := s.cluster.Members()
+	if len(members) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Compute safeWave: min over active members. If any
+	// member is unseen (wave 0), GC is suppressed entirely.
+	var safeWave uint64 = ^uint64(0) // MaxUint64
+	for _, m := range members {
+		w, ok := s.peerWaveSeen[string(m)]
+		if !ok || w == 0 {
+			// At least one member silent → safeWave = 0; bail.
+			metricKVTombstonesLive.Set(float64(s.countTombstonesLocked()))
+			return
+		}
+		if w < safeWave {
+			safeWave = w
+		}
+	}
+	if safeWave == 0 {
+		metricKVTombstonesLive.Set(float64(s.countTombstonesLocked()))
+		return
+	}
+
+	dropped := 0
+	for k, e := range s.data {
+		if e.deleted && e.wave < safeWave {
+			delete(s.data, k)
+			dropped++
+		}
+	}
+	if dropped > 0 {
+		metricKVTombstonesGC.Add(float64(dropped))
+		s.logger().Debug("kvstore: gc tombstones",
+			"dropped", dropped, "safe_wave", safeWave)
+	}
+	metricKVTombstonesLive.Set(float64(s.countTombstonesLocked()))
+}
+
+// countTombstonesLocked walks the data map and returns the
+// number of tombstones. Caller must hold s.mu.
+func (s *Store) countTombstonesLocked() int {
+	n := 0
+	for _, e := range s.data {
+		if e.deleted {
+			n++
+		}
+	}
+	return n
+}
+
+// logger returns a logger pinned to the local replica. Falls
+// back to slog default if nothing was configured.
+func (s *Store) logger() interface {
+	Debug(string, ...any)
+} {
+	// Minimal helper to keep the GC-log site clean; we don't
+	// stash a logger on Store currently.
+	return slogDebugAdapter{}
+}
+
+type slogDebugAdapter struct{}
+
+func (slogDebugAdapter) Debug(msg string, args ...any) {
+	slog.Debug(msg, args...)
 }
 
 // Snapshot implements comlink.Snapshotter — serializes the
@@ -995,6 +1132,19 @@ func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
 	if len(cmds) == 0 {
 		return
 	}
+
+	// Update peerWaveSeen FIRST — applies to every envelope
+	// (including ack-only batches). The wave-monotone-per-
+	// sender invariant means this max captures the safe-GC
+	// progression even when the envelope itself does no state
+	// work. Held under s.mu, so the GC sweep in
+	// writeSnapshot sees a consistent view.
+	s.mu.Lock()
+	prev := s.peerWaveSeen[string(msg.Sender)]
+	if msg.Wave > prev {
+		s.peerWaveSeen[string(msg.Sender)] = msg.Wave
+	}
+	s.mu.Unlock()
 
 	// Skip-mutation + skip-ack-back detection: a batch made
 	// entirely of OP_ACK commands is the proactive-ack frame.
