@@ -180,10 +180,34 @@ func (*ConvFrame_Watermark) isConvFrame_Body() {}
 // The sender ReplicaID is implicit from envelope.id.sender, so
 // it does not appear here.
 type Watermark struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Offset        uint64                 `protobuf:"varint,1,opt,name=offset,proto3" json:"offset,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// applied_through_offset is the highest log offset whose
+	// message has been applied at this replica (i.e. its SM has
+	// processed it). Below the safe-trim frontier is the per-
+	// replica minimum of this and snapshot_through_offset; the
+	// cluster-wide frontier is the min of those per-replica
+	// minimums.
+	//
+	// Named `offset` historically — the field tag is preserved so
+	// older replicas reading newer messages see the applied
+	// offset correctly.
+	Offset uint64 `protobuf:"varint,1,opt,name=offset,proto3" json:"offset,omitempty"`
+	// snapshot_through_offset is the highest log offset DURABLY
+	// covered by this replica's persisted application snapshot
+	// (see comlink.Snapshotter / Substrate.AdvanceSnapshotWatermark,
+	// PLAN §10). Zero means the replica has no snapshot — in which
+	// case trim cannot safely advance past zero on its behalf,
+	// because a future joiner could not recover.
+	//
+	// Only meaningful for substrates whose StateMachine
+	// implements Snapshotter. The system conv's Manager
+	// historically broadcast Watermark with applied=snapshot;
+	// wire format continues to support that case naturally
+	// (snapshot_through_offset = 0 means "no snapshot" rather
+	// than "snapshot at offset 0").
+	SnapshotThroughOffset uint64 `protobuf:"varint,2,opt,name=snapshot_through_offset,json=snapshotThroughOffset,proto3" json:"snapshot_through_offset,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *Watermark) Reset() {
@@ -219,6 +243,13 @@ func (*Watermark) Descriptor() ([]byte, []int) {
 func (x *Watermark) GetOffset() uint64 {
 	if x != nil {
 		return x.Offset
+	}
+	return 0
+}
+
+func (x *Watermark) GetSnapshotThroughOffset() uint64 {
+	if x != nil {
+		return x.SnapshotThroughOffset
 	}
 	return 0
 }
@@ -873,9 +904,10 @@ const file_comlink_v1_substrate_proto_rawDesc = "" +
 	"membership\x18\x03 \x01(\v2\x1b.comlink.v1.MembershipEventH\x00R\n" +
 	"membership\x125\n" +
 	"\twatermark\x18\x04 \x01(\v2\x15.comlink.v1.WatermarkH\x00R\twatermarkB\x06\n" +
-	"\x04body\"#\n" +
+	"\x04body\"[\n" +
 	"\tWatermark\x12\x16\n" +
-	"\x06offset\x18\x01 \x01(\x04R\x06offset\"\v\n" +
+	"\x06offset\x18\x01 \x01(\x04R\x06offset\x126\n" +
+	"\x17snapshot_through_offset\x18\x02 \x01(\x04R\x15snapshotThroughOffset\"\v\n" +
 	"\tHeartbeat\"\xed\x03\n" +
 	"\x0fMembershipEvent\x12<\n" +
 	"\fsuspect_down\x18\x01 \x01(\v2\x17.comlink.v1.SuspectDownH\x00R\vsuspectDown\x120\n" +

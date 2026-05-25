@@ -28,42 +28,46 @@ func r(tag string) *pb.ReplicaID {
 	return &pb.ReplicaID{Value: b}
 }
 
+func mark(applied, snap uint64) trim.Mark {
+	return trim.Mark{Applied: clog.Offset(applied), Snapshot: clog.Offset(snap)}
+}
+
 func TestUpdateAndGet(t *testing.T) {
 	tr := trim.New()
 	if _, ok := tr.Get(r("alice")); ok {
 		t.Fatal("Get on empty tracker returned ok=true")
 	}
-	if !tr.Update(r("alice"), 10) {
+	if !tr.UpdateApplied(r("alice"), 10) {
 		t.Fatal("first Update returned false")
 	}
 	got, ok := tr.Get(r("alice"))
-	if !ok || got != 10 {
-		t.Fatalf("Get(alice) = (%d, %v), want (10, true)", got, ok)
+	if !ok || got.Applied != 10 || got.Snapshot != 10 {
+		t.Fatalf("Get(alice) = (%+v, %v), want ({10,10}, true)", got, ok)
 	}
 }
 
 func TestUpdateOnlyAdvances(t *testing.T) {
 	tr := trim.New()
-	tr.Update(r("alice"), 10)
-	if tr.Update(r("alice"), 5) {
+	tr.UpdateApplied(r("alice"), 10)
+	if tr.UpdateApplied(r("alice"), 5) {
 		t.Fatal("retreating Update returned true")
 	}
-	if got, _ := tr.Get(r("alice")); got != 10 {
-		t.Fatalf("Get(alice) = %d, want 10 (retreat ignored)", got)
+	if got, _ := tr.Get(r("alice")); got.Applied != 10 {
+		t.Fatalf("Get(alice).Applied = %d, want 10 (retreat ignored)", got.Applied)
 	}
-	if !tr.Update(r("alice"), 15) {
+	if !tr.UpdateApplied(r("alice"), 15) {
 		t.Fatal("advancing Update returned false")
 	}
-	if got, _ := tr.Get(r("alice")); got != 15 {
-		t.Fatalf("Get(alice) = %d, want 15", got)
+	if got, _ := tr.Get(r("alice")); got.Applied != 15 {
+		t.Fatalf("Get(alice).Applied = %d, want 15", got.Applied)
 	}
 }
 
 func TestSafeFrontierIsMinOverActive(t *testing.T) {
 	tr := trim.New()
-	tr.Update(r("alice"), 100)
-	tr.Update(r("bob"), 50)
-	tr.Update(r("carol"), 75)
+	tr.UpdateApplied(r("alice"), 100)
+	tr.UpdateApplied(r("bob"), 50)
+	tr.UpdateApplied(r("carol"), 75)
 
 	got, ok := tr.SafeFrontier([]*pb.ReplicaID{r("alice"), r("bob"), r("carol")})
 	if !ok {
@@ -75,11 +79,9 @@ func TestSafeFrontierIsMinOverActive(t *testing.T) {
 }
 
 func TestSafeFrontierUnsetReplicaPins(t *testing.T) {
-	// PLAN §5.3 safety: if any active member has no watermark
-	// yet, the frontier must be 0 (don't trim anything).
 	tr := trim.New()
-	tr.Update(r("alice"), 100)
-	tr.Update(r("bob"), 50)
+	tr.UpdateApplied(r("alice"), 100)
+	tr.UpdateApplied(r("bob"), 50)
 
 	got, ok := tr.SafeFrontier([]*pb.ReplicaID{r("alice"), r("bob"), r("carol")})
 	if ok {
@@ -91,23 +93,18 @@ func TestSafeFrontierUnsetReplicaPins(t *testing.T) {
 }
 
 func TestForgetDropsFromMin(t *testing.T) {
-	// Voted-out replica's stale watermark should not pin trim.
 	tr := trim.New()
-	tr.Update(r("alice"), 100)
-	tr.Update(r("bob"), 50)   // bob about to be voted out
-	tr.Update(r("carol"), 75)
+	tr.UpdateApplied(r("alice"), 100)
+	tr.UpdateApplied(r("bob"), 50)
+	tr.UpdateApplied(r("carol"), 75)
 
-	// Pre-Forget: min is 50 (bob).
 	got, _ := tr.SafeFrontier([]*pb.ReplicaID{r("alice"), r("bob"), r("carol")})
 	if got != 50 {
 		t.Fatalf("pre-Forget SafeFrontier = %d, want 50", got)
 	}
 
-	// Vote bob out.
 	tr.Forget(r("bob"))
 
-	// Post-Forget with bob excluded from active list: min is 75
-	// (carol).
 	got, ok := tr.SafeFrontier([]*pb.ReplicaID{r("alice"), r("carol")})
 	if !ok {
 		t.Fatal("post-Forget SafeFrontier ok=false")
@@ -119,7 +116,7 @@ func TestForgetDropsFromMin(t *testing.T) {
 
 func TestSafeFrontierEmptyActive(t *testing.T) {
 	tr := trim.New()
-	tr.Update(r("alice"), 100)
+	tr.UpdateApplied(r("alice"), 100)
 	if _, ok := tr.SafeFrontier(nil); ok {
 		t.Fatal("SafeFrontier on empty active returned ok=true")
 	}
@@ -127,28 +124,27 @@ func TestSafeFrontierEmptyActive(t *testing.T) {
 
 func TestSnapshot(t *testing.T) {
 	tr := trim.New()
-	tr.Update(r("alice"), 10)
-	tr.Update(r("bob"), 20)
+	tr.UpdateApplied(r("alice"), 10)
+	tr.UpdateApplied(r("bob"), 20)
 	snap := tr.Snapshot()
 	if len(snap) != 2 {
 		t.Fatalf("Snapshot len = %d, want 2", len(snap))
 	}
 	// Mutating the snapshot should not affect the tracker.
-	snap[string(r("alice").GetValue())] = 999
-	if got, _ := tr.Get(r("alice")); got != 10 {
-		t.Fatalf("Get(alice) after mutating snapshot = %d, want 10", got)
+	snap[string(r("alice").GetValue())] = mark(999, 999)
+	if got, _ := tr.Get(r("alice")); got.Applied != 10 {
+		t.Fatalf("Get(alice).Applied after mutating snapshot = %d, want 10", got.Applied)
 	}
 }
 
-// Concurrent Update + SafeFrontier must not race.
 func TestConcurrentUpdateAndRead(t *testing.T) {
 	tr := trim.New()
-	tr.Update(r("alice"), 1)
-	tr.Update(r("bob"), 1)
+	tr.UpdateApplied(r("alice"), 1)
+	tr.UpdateApplied(r("bob"), 1)
 	done := make(chan struct{})
 	go func() {
 		for i := uint64(2); i < 1000; i++ {
-			tr.Update(r("alice"), clog.Offset(i))
+			tr.UpdateApplied(r("alice"), clog.Offset(i))
 		}
 		close(done)
 	}()
@@ -156,4 +152,41 @@ func TestConcurrentUpdateAndRead(t *testing.T) {
 		_, _ = tr.SafeFrontier([]*pb.ReplicaID{r("alice"), r("bob")})
 	}
 	<-done
+}
+
+// TestSafeFrontierWithSnapshotZero (Phase 10(e)): a replica with
+// snapshot=0 pins the cluster frontier to 0, regardless of how
+// far it's applied. This is correct — without a snapshot, a
+// joiner couldn't recover any trimmed history.
+func TestSafeFrontierWithSnapshotZero(t *testing.T) {
+	tr := trim.New()
+	tr.UpdateApplied(r("alice"), 100)             // applied=snap=100
+	tr.Update(r("bob"), mark(100, 0))             // applied=100, no snapshot
+	tr.UpdateApplied(r("carol"), 100)
+
+	got, ok := tr.SafeFrontier([]*pb.ReplicaID{r("alice"), r("bob"), r("carol")})
+	if !ok {
+		t.Fatal("SafeFrontier ok=false")
+	}
+	if got != 0 {
+		t.Fatalf("SafeFrontier = %d, want 0 (bob has no snapshot)", got)
+	}
+}
+
+// TestSafeFrontierMinOverPerReplicaMins (Phase 10(e)): each
+// replica's contribution is min(applied, snapshot); the cluster
+// frontier is min over replicas.
+func TestSafeFrontierMinOverPerReplicaMins(t *testing.T) {
+	tr := trim.New()
+	tr.Update(r("alice"), mark(100, 80))   // contributes 80
+	tr.Update(r("bob"), mark(90, 95))      // contributes 90
+	tr.Update(r("carol"), mark(120, 110))  // contributes 110
+
+	got, ok := tr.SafeFrontier([]*pb.ReplicaID{r("alice"), r("bob"), r("carol")})
+	if !ok {
+		t.Fatal("SafeFrontier ok=false")
+	}
+	if got != 80 {
+		t.Fatalf("SafeFrontier = %d, want 80 (min over per-replica mins)", got)
+	}
 }

@@ -59,7 +59,32 @@ message ConvFrame {
 // The sender ReplicaID is implicit from envelope.id.sender, so
 // it does not appear here.
 message Watermark {
+  // applied_through_offset is the highest log offset whose
+  // message has been applied at this replica (i.e. its SM has
+  // processed it). Below the safe-trim frontier is the per-
+  // replica minimum of this and snapshot_through_offset; the
+  // cluster-wide frontier is the min of those per-replica
+  // minimums.
+  //
+  // Named `offset` historically — the field tag is preserved so
+  // older replicas reading newer messages see the applied
+  // offset correctly.
   uint64 offset = 1;
+
+  // snapshot_through_offset is the highest log offset DURABLY
+  // covered by this replica's persisted application snapshot
+  // (see comlink.Snapshotter / Substrate.AdvanceSnapshotWatermark,
+  // PLAN §10). Zero means the replica has no snapshot — in which
+  // case trim cannot safely advance past zero on its behalf,
+  // because a future joiner could not recover.
+  //
+  // Only meaningful for substrates whose StateMachine
+  // implements Snapshotter. The system conv's Manager
+  // historically broadcast Watermark with applied=snapshot;
+  // wire format continues to support that case naturally
+  // (snapshot_through_offset = 0 means "no snapshot" rather
+  // than "snapshot at offset 0").
+  uint64 snapshot_through_offset = 2;
 }
 
 // Heartbeat is a content-free dummy message emitted by

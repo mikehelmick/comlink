@@ -319,11 +319,15 @@ func (m *Manager) SetWatermark(offset uint64) {
 	if m.cfg.Log == nil {
 		return
 	}
-	advanced := m.trim.Update(m.cfg.Self, clog.Offset(offset))
+	// The system Manager doesn't snapshot — UpdateApplied sets
+	// both Applied and Snapshot watermarks to `offset` so trim
+	// continues to behave as it did before snapshot-aware trim
+	// (Phase 10(e)).
+	advanced := m.trim.UpdateApplied(m.cfg.Self, clog.Offset(offset))
 	if !advanced {
 		return
 	}
-	bs, err := frame.MarshalWatermark(offset)
+	bs, err := frame.MarshalWatermark(offset, offset)
 	if err != nil {
 		m.logger.Warn("membership: marshal Watermark", "err", err)
 		return
@@ -338,7 +342,18 @@ func (m *Manager) handleWatermark(w *pb.Watermark, sender *pb.ReplicaID) {
 	if m.trim == nil {
 		return
 	}
-	if !m.trim.Update(sender, clog.Offset(w.GetOffset())) {
+	mark := trim.Mark{
+		Applied:  clog.Offset(w.GetOffset()),
+		Snapshot: clog.Offset(w.GetSnapshotThroughOffset()),
+	}
+	// Backwards compat: a peer running pre-10(e) won't set
+	// snapshot_through_offset. Treat unset as equal to applied
+	// so its trim contribution doesn't pin the cluster
+	// frontier to zero.
+	if mark.Snapshot == 0 {
+		mark.Snapshot = mark.Applied
+	}
+	if !m.trim.Update(sender, mark) {
 		return
 	}
 	m.maybeTrim()

@@ -66,7 +66,7 @@ func TestRoundtripHeartbeat(t *testing.T) {
 }
 
 func TestRoundtripWatermark(t *testing.T) {
-	bs, err := frame.MarshalWatermark(42)
+	bs, err := frame.MarshalWatermark(42, 30)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +79,10 @@ func TestRoundtripWatermark(t *testing.T) {
 	}
 	if got.Watermark.GetOffset() != 42 {
 		t.Fatalf("Watermark.Offset = %d, want 42", got.Watermark.GetOffset())
+	}
+	if got.Watermark.GetSnapshotThroughOffset() != 30 {
+		t.Fatalf("Watermark.SnapshotThroughOffset = %d, want 30",
+			got.Watermark.GetSnapshotThroughOffset())
 	}
 }
 

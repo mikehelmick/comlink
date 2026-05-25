@@ -42,42 +42,93 @@ import (
 	clog "github.com/mikehelmick/comlink/log"
 )
 
+// Mark is one replica's watermark contribution: the applied
+// frontier (highest offset whose message has been applied locally)
+// and the snapshot frontier (highest offset durably covered by a
+// local snapshot, or 0 if the replica has no snapshot).
+//
+// For trim safety the per-replica usable frontier is min(applied,
+// snapshot). A replica with snapshot=0 always pins the cluster
+// frontier to 0 — appropriate when no snapshot exists, since a
+// joiner couldn't recover trimmed history any other way.
+//
+// For the system conv (which doesn't snapshot today), callers
+// use UpdateApplied with both fields equal — the snapshot field
+// gets the applied value too, so the system conv's trim
+// continues to work the way it did before Phase 10(e).
+type Mark struct {
+	Applied  clog.Offset
+	Snapshot clog.Offset
+}
+
+// usableFrontier is the per-replica trim contribution: the lower
+// of the applied and snapshot watermarks. A snapshot of 0 means
+// "no snapshot", which we treat as zero contribution (pinning
+// the cluster frontier to 0).
+func (m Mark) usableFrontier() clog.Offset {
+	if m.Snapshot == 0 {
+		return 0
+	}
+	if m.Applied < m.Snapshot {
+		return m.Applied
+	}
+	return m.Snapshot
+}
+
 // Tracker holds the latest watermark observed from each member.
 // Concurrent access is safe.
 type Tracker struct {
 	mu    sync.Mutex
-	marks map[string]clog.Offset // string(replicaID.value) -> offset
+	marks map[string]Mark
 }
 
 // New returns an empty Tracker.
 func New() *Tracker {
-	return &Tracker{marks: make(map[string]clog.Offset)}
+	return &Tracker{marks: make(map[string]Mark)}
 }
 
-// Update records replica's latest watermark. If a previous value
-// exists, the new value is taken iff offset > existing (watermarks
-// only ever advance — a replica that retreats its watermark is a
-// protocol violation we silently ignore).
+// Update records a peer's latest watermark contribution. Both
+// fields are monotonic — a retreat in either is silently
+// ignored.
 //
-// Returns true if the stored value advanced as a result.
-func (t *Tracker) Update(replica *pb.ReplicaID, offset clog.Offset) bool {
+// Returns true if EITHER field advanced.
+func (t *Tracker) Update(replica *pb.ReplicaID, mark Mark) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	key := string(replica.GetValue())
-	if existing, ok := t.marks[key]; ok && offset <= existing {
+	cur := t.marks[key] // zero value if absent
+	advanced := false
+	if mark.Applied > cur.Applied {
+		cur.Applied = mark.Applied
+		advanced = true
+	}
+	if mark.Snapshot > cur.Snapshot {
+		cur.Snapshot = mark.Snapshot
+		advanced = true
+	}
+	if !advanced {
 		return false
 	}
-	t.marks[key] = offset
+	t.marks[key] = cur
 	return true
 }
 
-// Get returns replica's latest known watermark and whether it has
-// been observed.
-func (t *Tracker) Get(replica *pb.ReplicaID) (clog.Offset, bool) {
+// UpdateApplied is a backwards-compat helper for callers that
+// don't snapshot (or that conflate applied + snapshot, like the
+// system conv's Manager). Sets both Applied and Snapshot to
+// `offset`, so trim treats this replica's watermark as fully
+// usable for trim safety.
+func (t *Tracker) UpdateApplied(replica *pb.ReplicaID, offset clog.Offset) bool {
+	return t.Update(replica, Mark{Applied: offset, Snapshot: offset})
+}
+
+// Get returns replica's latest watermark and whether it has been
+// observed.
+func (t *Tracker) Get(replica *pb.ReplicaID) (Mark, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	off, ok := t.marks[string(replica.GetValue())]
-	return off, ok
+	m, ok := t.marks[string(replica.GetValue())]
+	return m, ok
 }
 
 // Forget drops replica from the tracker — used when a replica is
@@ -90,9 +141,9 @@ func (t *Tracker) Forget(replica *pb.ReplicaID) {
 }
 
 // SafeFrontier returns the safe-trim offset given the current
-// active membership list: min(watermark[r]) over r in active.
-// If any active replica has not yet advertised a watermark, the
-// frontier is 0 (nothing safe to trim — paper §5.3 safety
+// active membership list: min over r in active of
+// usableFrontier(mark_r). If any active replica has not yet
+// advertised a watermark, the frontier is 0 (paper §5.3 safety
 // condition).
 //
 // Returns (frontier, ok). ok=false if no active members or any
@@ -106,24 +157,25 @@ func (t *Tracker) SafeFrontier(active []*pb.ReplicaID) (clog.Offset, bool) {
 	var min clog.Offset
 	first := true
 	for _, r := range active {
-		off, ok := t.marks[string(r.GetValue())]
+		m, ok := t.marks[string(r.GetValue())]
 		if !ok {
 			return 0, false
 		}
-		if first || off < min {
-			min = off
+		f := m.usableFrontier()
+		if first || f < min {
+			min = f
 			first = false
 		}
 	}
 	return min, true
 }
 
-// Snapshot returns a copy of every (replica, offset) pair in the
+// Snapshot returns a copy of every (replica, mark) pair in the
 // tracker. Useful for tests and debugging.
-func (t *Tracker) Snapshot() map[string]clog.Offset {
+func (t *Tracker) Snapshot() map[string]Mark {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	out := make(map[string]clog.Offset, len(t.marks))
+	out := make(map[string]Mark, len(t.marks))
 	for k, v := range t.marks {
 		out[k] = v
 	}

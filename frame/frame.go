@@ -52,11 +52,16 @@ func MarshalHeartbeat() ([]byte, error) {
 	return proto.Marshal(&pb.ConvFrame{Body: &pb.ConvFrame_Heartbeat{Heartbeat: &pb.Heartbeat{}}})
 }
 
-// MarshalWatermark wraps a Watermark advertising offset in a
-// ConvFrame.
-func MarshalWatermark(offset uint64) ([]byte, error) {
+// MarshalWatermark wraps a Watermark advertisement in a
+// ConvFrame. Carries both the applied-through and snapshot-
+// through offsets per Phase 10(e) — callers that don't
+// snapshot pass the same value for both.
+func MarshalWatermark(appliedOffset, snapshotThroughOffset uint64) ([]byte, error) {
 	return proto.Marshal(&pb.ConvFrame{
-		Body: &pb.ConvFrame_Watermark{Watermark: &pb.Watermark{Offset: offset}},
+		Body: &pb.ConvFrame_Watermark{Watermark: &pb.Watermark{
+			Offset:                appliedOffset,
+			SnapshotThroughOffset: snapshotThroughOffset,
+		}},
 	})
 }
 
