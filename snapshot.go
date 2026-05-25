@@ -163,13 +163,20 @@ type snapshotWatermark struct {
 }
 
 func (w *snapshotWatermark) advance(offset uint64) {
+	w.advanceReturning(offset)
+}
+
+// advanceReturning is the same as advance but returns whether
+// the watermark actually moved. Used by Substrate to decide
+// whether a broadcast is needed.
+func (w *snapshotWatermark) advanceReturning(offset uint64) bool {
 	for {
 		cur := w.throughOffset.Load()
 		if offset <= cur {
-			return // monotonic — never goes backwards
+			return false
 		}
 		if w.throughOffset.CompareAndSwap(cur, offset) {
-			return
+			return true
 		}
 	}
 }

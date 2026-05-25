@@ -701,6 +701,6 @@ explicit "settle" messages added.
 | 7 — Correctness hardening                  | done (v1)   |
 | 8 — Local Kubernetes deployment            | done (v1)   |
 | 9 — Soak / chaos test driver               | done (v1)   |
-| 10 — Auto-eviction + snapshot recovery     | in progress |
+| 10 — Auto-eviction + snapshot recovery     | done (v1)   |
 
 Update this table as each phase moves through `in progress` and `done`.

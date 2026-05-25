@@ -42,7 +42,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/mikehelmick/comlink"
 	"github.com/prometheus/client_golang/prometheus"
@@ -90,6 +95,24 @@ var (
 			Help: "Operations applied to the local Store via StateMachine.Apply.",
 		},
 		[]string{"op"}, // "set" | "del" | "malformed"
+	)
+	metricKVSnapshotWrites = promauto.With(comlink.MetricsRegistry()).NewCounter(
+		prometheus.CounterOpts{
+			Name: "kvstore_snapshot_writes_total",
+			Help: "Number of times the Store has fsynced a snapshot to disk.",
+		},
+	)
+	metricKVSnapshotBytes = promauto.With(comlink.MetricsRegistry()).NewGauge(
+		prometheus.GaugeOpts{
+			Name: "kvstore_snapshot_bytes",
+			Help: "Size in bytes of the most recently written snapshot.",
+		},
+	)
+	metricKVSnapshotThrough = promauto.With(comlink.MetricsRegistry()).NewGauge(
+		prometheus.GaugeOpts{
+			Name: "kvstore_snapshot_through_offset",
+			Help: "Log offset covered by the most recently written snapshot.",
+		},
 	)
 )
 
@@ -142,12 +165,22 @@ type Event struct {
 type Store struct {
 	sub *comlink.Substrate
 
-	mu   sync.RWMutex
-	data map[string]string
+	mu     sync.RWMutex
+	data   map[string]string
+	maxOff atomic.Uint64 // highest msg.Offset seen in Apply
 
 	watchMu       sync.Mutex
 	watchers      map[string]map[*watcher]struct{}
 	totalWatchers int
+
+	// snapshotDir is the app-owned directory where the Store
+	// persists its snapshot. Empty disables disk persistence
+	// (in-memory-only mode, suitable for tests).
+	snapshotDir string
+
+	// snapshotter goroutine lifecycle.
+	snapshotStop chan struct{}
+	snapshotDone chan struct{}
 }
 
 // watcher is the internal handle for one Watch call. Channel
@@ -168,7 +201,51 @@ type Config struct {
 	Cluster        *comlink.Cluster
 	ConversationID comlink.ConversationID
 	Members        []comlink.ReplicaID
+
+	// SnapshotDir, if non-empty, makes the Store durable:
+	//   - On startup, the Store reads SnapshotDir/state.snap
+	//     and installs it via SubstrateConfig.InitialSnapshot.
+	//   - A background goroutine writes a fresh snapshot to
+	//     SnapshotDir/state.snap.tmp + fsync + atomic rename
+	//     every SnapshotInterval (default 10s), then calls
+	//     Substrate.AdvanceSnapshotWatermark so the comlink
+	//     trim protocol can compact older log entries.
+	//
+	// Combined with the substrate's own log on disk, this is
+	// the full recovery story: a pod that loses memory but
+	// keeps its PVC restores SM state from state.snap and
+	// applies any newer log entries via comlink's auto-replay.
+	//
+	// Empty SnapshotDir = in-memory-only (current pre-10(f)
+	// behavior). Useful for tests.
+	SnapshotDir string
+
+	// SnapshotInterval is the cadence for background snapshot
+	// writes. Zero defaults to 10s. Snapshots are skipped (no
+	// disk write) when no Apply has fired since the last
+	// snapshot — apps that go idle don't churn disk.
+	SnapshotInterval time.Duration
+
+	// BootstrapFromSponsor enables auto-pull of a snapshot from
+	// the cluster's sponsor when SnapshotDir has no existing
+	// snapshot AND the cluster has Sponsors configured. Apps
+	// that are joiners set this to true; founders ignore it.
+	BootstrapFromSponsor bool
 }
+
+// snapshotPayload is the on-disk format. Versioned implicitly
+// via the field tags; production apps would want explicit
+// version + migration.
+type snapshotPayload struct {
+	ThroughOffset uint64            `json:"through_offset"`
+	Data          map[string]string `json:"data"`
+}
+
+const (
+	defaultSnapshotInterval = 10 * time.Second
+	snapshotFileName        = "state.snap"
+	snapshotTempName        = "state.snap.tmp"
+)
 
 // New constructs a Store and its backing Substrate. Errors from
 // Substrate construction surface here.
@@ -183,20 +260,200 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, errors.New("kvstore: Config.Members is required")
 	}
 	s := &Store{
-		data:     make(map[string]string),
-		watchers: make(map[string]map[*watcher]struct{}),
+		data:        make(map[string]string),
+		watchers:    make(map[string]map[*watcher]struct{}),
+		snapshotDir: cfg.SnapshotDir,
 	}
-	sub, err := cfg.Cluster.NewSubstrate(ctx, comlink.SubstrateConfig{
+
+	// Load any persisted snapshot from disk and feed it to the
+	// substrate via InitialSnapshot. If absent AND BootstrapFromSponsor
+	// is set, fall back to AutoBootstrapFromSponsor (mutually
+	// exclusive with InitialSnapshot at the substrate level).
+	subCfg := comlink.SubstrateConfig{
 		ConversationID: cfg.ConversationID,
 		Members:        cfg.Members,
 		Ordering:       comlink.OrderingTotal,
 		StateMachine:   s,
-	})
+	}
+	if cfg.SnapshotDir != "" {
+		loaded, err := loadDiskSnapshot(cfg.SnapshotDir)
+		if err != nil {
+			return nil, fmt.Errorf("kvstore: load snapshot: %w", err)
+		}
+		if loaded != nil {
+			subCfg.InitialSnapshot = loaded
+			// Seed our in-memory maxOff so the FIRST background
+			// snapshot doesn't regress the on-disk through_offset.
+			s.maxOff.Store(loaded.ThroughOffset)
+		} else if cfg.BootstrapFromSponsor {
+			subCfg.AutoBootstrapFromSponsor = true
+		}
+	} else if cfg.BootstrapFromSponsor {
+		subCfg.AutoBootstrapFromSponsor = true
+	}
+
+	sub, err := cfg.Cluster.NewSubstrate(ctx, subCfg)
 	if err != nil {
 		return nil, fmt.Errorf("kvstore: create substrate: %w", err)
 	}
 	s.sub = sub
+
+	// Reflect any post-Restore max-offset into our atomic so a
+	// subsequent snapshot reports the correct through_offset.
+	// (Substrate seeds appliedOffset from InitialSnapshot, but
+	// the SM tracks maxOff itself via Apply.)
+	if got := s.maxOff.Load(); got > 0 {
+		metricKVSnapshotThrough.Set(float64(got))
+	}
+
+	if cfg.SnapshotDir != "" {
+		interval := cfg.SnapshotInterval
+		if interval <= 0 {
+			interval = defaultSnapshotInterval
+		}
+		s.snapshotStop = make(chan struct{})
+		s.snapshotDone = make(chan struct{})
+		go s.snapshotLoop(interval)
+	}
 	return s, nil
+}
+
+// loadDiskSnapshot reads SnapshotDir/state.snap and returns a
+// *comlink.Snapshot whose Bytes are the on-disk JSON. Returns
+// (nil, nil) if the file doesn't exist (fresh install).
+func loadDiskSnapshot(dir string) (*comlink.Snapshot, error) {
+	path := filepath.Join(dir, snapshotFileName)
+	bs, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	// Sanity-check it parses before handing it to the substrate.
+	var p snapshotPayload
+	if err := json.Unmarshal(bs, &p); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return &comlink.Snapshot{
+		Bytes:         bs,
+		ThroughOffset: p.ThroughOffset,
+	}, nil
+}
+
+// snapshotLoop runs in a background goroutine, writing the
+// Store's state to disk every `interval`. Skips the write if
+// no Apply has fired since the last snapshot.
+func (s *Store) snapshotLoop(interval time.Duration) {
+	defer close(s.snapshotDone)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	var lastOff uint64
+	for {
+		select {
+		case <-s.snapshotStop:
+			// Final snapshot on shutdown so we don't lose work.
+			_ = s.writeSnapshot()
+			return
+		case <-t.C:
+			cur := s.maxOff.Load()
+			if cur == lastOff {
+				continue // no progress; skip the write
+			}
+			if err := s.writeSnapshot(); err != nil {
+				// Don't fail the loop on a transient I/O error —
+				// next tick will retry. Bubble up via the
+				// snapshot-failure metric.
+				continue
+			}
+			lastOff = cur
+		}
+	}
+}
+
+// writeSnapshot serializes the current state, fsyncs it to
+// disk via SnapshotDir/state.snap.tmp + atomic rename, and
+// notifies the substrate via AdvanceSnapshotWatermark so the
+// comlink trim protocol can compact older log entries.
+func (s *Store) writeSnapshot() error {
+	if s.snapshotDir == "" {
+		return nil
+	}
+	bs, throughOff, err := s.Snapshot()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.snapshotDir, 0o755); err != nil {
+		return err
+	}
+	tmp := filepath.Join(s.snapshotDir, snapshotTempName)
+	final := filepath.Join(s.snapshotDir, snapshotFileName)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(bs); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	metricKVSnapshotWrites.Inc()
+	metricKVSnapshotBytes.Set(float64(len(bs)))
+	metricKVSnapshotThrough.Set(float64(throughOff))
+	// Tell comlink the snapshot is durable so trim can advance.
+	s.sub.AdvanceSnapshotWatermark(throughOff)
+	return nil
+}
+
+// Snapshot implements comlink.Snapshotter — serializes the
+// current state + the highest applied offset. The byte form is
+// the same JSON layout the Store writes to disk.
+func (s *Store) Snapshot() ([]byte, uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	copied := make(map[string]string, len(s.data))
+	for k, v := range s.data {
+		copied[k] = v
+	}
+	throughOff := s.maxOff.Load()
+	bs, err := json.Marshal(snapshotPayload{
+		ThroughOffset: throughOff,
+		Data:          copied,
+	})
+	return bs, throughOff, err
+}
+
+// Restore implements comlink.Snapshotter — installs SM state
+// from a snapshot reader. Called by the substrate exactly once
+// at construction time if InitialSnapshot is set.
+func (s *Store) Restore(r io.Reader) error {
+	bs, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	var p snapshotPayload
+	if err := json.Unmarshal(bs, &p); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data = p.Data
+	s.maxOff.Store(p.ThroughOffset)
+	metricKVKeys.Set(float64(len(s.data)))
+	return nil
 }
 
 // FreezeMember propagates a cluster-level eviction down to the
@@ -218,6 +475,12 @@ func (s *Store) FreezeMember(replica comlink.ReplicaID) error {
 // active Watch channel. Subsequent Set / Delete / Watch return
 // errors via the Substrate.
 func (s *Store) Close() error {
+	// Stop the snapshot loop (it writes a final snapshot on
+	// shutdown before exiting).
+	if s.snapshotStop != nil {
+		close(s.snapshotStop)
+		<-s.snapshotDone
+	}
 	s.watchMu.Lock()
 	for _, ws := range s.watchers {
 		for w := range ws {
@@ -253,6 +516,18 @@ func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
 	}
 	metricKVKeys.Set(float64(len(s.data)))
 	s.mu.Unlock()
+
+	// Track the highest applied offset for the periodic snapshot
+	// writer (atomic so we don't need the data lock).
+	for {
+		cur := s.maxOff.Load()
+		if msg.Offset <= cur {
+			break
+		}
+		if s.maxOff.CompareAndSwap(cur, msg.Offset) {
+			break
+		}
+	}
 
 	// Fan out to watchers AFTER releasing the data lock so a
 	// slow watcher can't block other Apply calls.
@@ -376,10 +651,12 @@ func (s *Store) notify(key string, event Event) {
 	}
 }
 
-// Snapshot returns a copy of the current key→value map. Useful
-// for tests; production callers should prefer Get to avoid the
-// copy cost.
-func (s *Store) Snapshot() map[string]string {
+// SnapshotMap returns a copy of the current key→value map.
+// Useful for tests; production callers should prefer Get to
+// avoid the copy cost. (Named to disambiguate from the
+// Snapshotter.Snapshot method, which returns serialized
+// bytes + a through-offset.)
+func (s *Store) SnapshotMap() map[string]string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make(map[string]string, len(s.data))

@@ -57,9 +57,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
-	"strings"
 
 	"github.com/mikehelmick/comlink"
 	"github.com/mikehelmick/comlink/examples/kvstore"
@@ -142,10 +143,23 @@ func run() error {
 	if len(members) == 0 {
 		members = cluster.Members()
 	}
+	// Put kvstore's app-side snapshot in DataDir/kvstore/ —
+	// same PVC as the comlink log, separate subdir so the
+	// boundary between "app state" and "library state" is
+	// visible on disk. The Store periodically fsyncs
+	// state.snap there and tells the substrate trim can
+	// advance past the snapshotted offset.
+	snapDir := filepath.Join(cfg.DataDir, "kvstore")
+	// Joiner-bootstrap: if this is a joiner (Sponsors set) AND
+	// no on-disk snapshot exists yet, pull the snapshot from
+	// the sponsor instead of starting empty.
+	bootstrap := len(cfg.Transport.Sponsors) > 0
 	store, err := kvstore.New(ctx, kvstore.Config{
-		Cluster:        cluster,
-		ConversationID: convID,
-		Members:        members,
+		Cluster:              cluster,
+		ConversationID:       convID,
+		Members:              members,
+		SnapshotDir:          snapDir,
+		BootstrapFromSponsor: bootstrap,
 	})
 	if err != nil {
 		return fmt.Errorf("kvstore.New: %w", err)

@@ -163,7 +163,7 @@ func waitConvergeStores(t *testing.T, nodes []*grpcNode, want map[string]string,
 	for {
 		ok := true
 		for _, n := range nodes {
-			if !sameMap(n.store.Snapshot(), want) {
+			if !sameMap(n.store.SnapshotMap(), want) {
 				ok = false
 				break
 			}
@@ -173,7 +173,7 @@ func waitConvergeStores(t *testing.T, nodes []*grpcNode, want map[string]string,
 		}
 		if time.Now().After(end) {
 			for i, n := range nodes {
-				t.Errorf("replica %d snapshot = %v, want %v", i, n.store.Snapshot(), want)
+				t.Errorf("replica %d snapshot = %v, want %v", i, n.store.SnapshotMap(), want)
 			}
 			return
 		}

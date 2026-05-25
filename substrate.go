@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"path/filepath"
 	"sync"
 	"time"
@@ -31,6 +32,7 @@ import (
 	clog "github.com/mikehelmick/comlink/log"
 	"github.com/mikehelmick/comlink/order"
 	"github.com/mikehelmick/comlink/psync"
+	"github.com/mikehelmick/comlink/trim"
 )
 
 // StateMachine is the application-implemented contract for
@@ -224,8 +226,21 @@ type Substrate struct {
 
 	// snapshotWatermark tracks how far the app has DURABLY
 	// snapshotted (via AdvanceSnapshotWatermark). Published to
-	// peers via the trim protocol (Phase 10(c)).
+	// peers via the trim protocol.
 	snapshotWmk snapshotWatermark
+
+	// appliedOffset is the highest log offset whose Apply has
+	// completed on this replica. Atomic so the trim watermark
+	// broadcaster reads it without coordinating with the
+	// apply pump goroutine. Initialized from any
+	// InitialSnapshot.ThroughOffset so trim doesn't briefly
+	// regress.
+	appliedOffset atomic.Uint64
+
+	// trim is the per-substrate watermark tracker (Phase 10(f)).
+	// Updated on every received Watermark frame; consulted in
+	// maybeTrim to advance the local log's safe-trim frontier.
+	trim *trim.Tracker
 
 	// Submit waiter machinery. Submit may register its waiter
 	// AFTER the apply pump has already fired for that
@@ -335,7 +350,11 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 	if initialSnap != nil {
 		s.snapshotThrough = initialSnap.ThroughOffset
 		s.snapshotWmk.advance(initialSnap.ThroughOffset)
+		// Seed appliedOffset from the snapshot so trim doesn't
+		// briefly regress before the first new Apply lands.
+		s.appliedOffset.Store(initialSnap.ThroughOffset)
 	}
+	s.trim = trim.New()
 
 	// Bind psync to the Cluster's lifetime ctx, NOT the caller's
 	// NewSubstrate ctx — the latter is typically a short-lived
@@ -651,9 +670,10 @@ func (s *Substrate) Members() []ReplicaID {
 // application has DURABLY persisted a snapshot through log
 // offset `through`. The substrate uses this:
 //
-//   - To extend the trim safe-frontier so older log entries
-//     can be compacted (Phase 10(c) — not yet wired through to
-//     trim itself).
+//   - To broadcast a Watermark frame to peers so they can
+//     advance their own trim safe-frontier (Phase 10(f)).
+//   - To update its OWN trim tracker so it can truncate its
+//     local log when the cluster-wide frontier advances.
 //   - To answer sponsor-handshake snapshot requests with a
 //     pointer to the latest covered offset (Phase 10(d)).
 //
@@ -666,13 +686,93 @@ func (s *Substrate) Members() []ReplicaID {
 // data on crash and re-needing log entries that the cluster
 // has since trimmed.
 func (s *Substrate) AdvanceSnapshotWatermark(through uint64) {
-	s.snapshotWmk.advance(through)
+	if !s.snapshotWmk.advanceReturning(through) {
+		return // didn't advance — nothing new to broadcast
+	}
+	// Broadcast the new watermark to peers via the substrate's
+	// own psync. Carry applied as the latest applied offset
+	// (which is always >= through since you must have applied
+	// up to a message before you can snapshot it).
+	applied := s.appliedOffset.Load()
+	if through > applied {
+		// Defensive — app advanced snapshot past anything we've
+		// applied locally? Treat applied = through.
+		applied = through
+	}
+	bs, err := frame.MarshalWatermark(applied, through)
+	if err != nil {
+		s.logger.Warn("substrate: marshal Watermark", "err", err)
+		return
+	}
+	// Update our own tracker entry inline. Don't wait for the
+	// self-delivery — trim can advance locally as soon as peer
+	// watermarks come in.
+	s.trim.Update(s.cluster.Self().toPB(), trim.Mark{
+		Applied:  clog.Offset(applied),
+		Snapshot: clog.Offset(through),
+	})
+	// Async broadcast so we don't block AdvanceSnapshotWatermark
+	// on the genserver.
+	go func() {
+		if _, err := s.conv.Send(bs); err != nil {
+			s.logger.Warn("substrate: Watermark Send", "err", err)
+			return
+		}
+		s.hb.NoteSent()
+		s.maybeTrim()
+	}()
 }
 
 // SnapshotWatermark returns the most recent offset the
 // application has reported as durably snapshotted.
 func (s *Substrate) SnapshotWatermark() uint64 {
 	return s.snapshotWmk.get()
+}
+
+// AppliedOffset returns the highest log offset whose message
+// has been Apply'd at this replica. Useful for apps building
+// their snapshot to know the offset to claim coverage of.
+func (s *Substrate) AppliedOffset() uint64 {
+	return s.appliedOffset.Load()
+}
+
+// handleWatermark is called from the apply pump when a peer's
+// Watermark frame arrives. Updates the local tracker and re-
+// evaluates the safe-trim frontier.
+func (s *Substrate) handleWatermark(ctx context.Context, sender *pb.ReplicaID, w *pb.Watermark) {
+	_ = ctx
+	mark := trim.Mark{
+		Applied:  clog.Offset(w.GetOffset()),
+		Snapshot: clog.Offset(w.GetSnapshotThroughOffset()),
+	}
+	if !s.trim.Update(sender, mark) {
+		return
+	}
+	s.maybeTrim()
+}
+
+// maybeTrim computes the safe-trim frontier across active
+// members and truncates the local log if it advanced.
+func (s *Substrate) maybeTrim() {
+	pbMembers := make([]*pb.ReplicaID, 0, len(s.cfg.Members))
+	for _, m := range s.cfg.Members {
+		pbMembers = append(pbMembers, m.toPB())
+	}
+	frontier, ok := s.trim.SafeFrontier(pbMembers)
+	if !ok || frontier == 0 {
+		return
+	}
+	if frontier <= s.log.FirstOffset() {
+		return
+	}
+	if err := s.log.Truncate(context.Background(), frontier); err != nil {
+		s.logger.Warn("substrate: log.Truncate", "frontier", frontier, "err", err)
+		return
+	}
+	s.logger.Info("substrate: trimmed log",
+		"conv", shortConvID(s.cfg.ConversationID),
+		"frontier", frontier)
+	metricSubstrateTrim.WithLabelValues(shortConvID(s.cfg.ConversationID)).Inc()
 }
 
 // FreezeMember marks `replica`'s slot as frozen in this
@@ -748,8 +848,11 @@ func (s *Substrate) handleApplied(ctx context.Context, applied order.Applied) {
 	}
 	if dec.App == nil {
 		// Heartbeat / membership / watermark variants don't
-		// reach the application — they exist for stability /
-		// substrate bookkeeping only.
+		// reach the application. Watermark is special: it's
+		// our per-substrate trim protocol (Phase 10(f)).
+		if dec.Watermark != nil {
+			s.handleWatermark(ctx, sender, dec.Watermark)
+		}
 		return
 	}
 
@@ -796,6 +899,23 @@ func (s *Substrate) handleApplied(ctx context.Context, applied order.Applied) {
 		s.cfg.StateMachine.Apply(ctx, msg)
 		metricSubstrateApplyDuration.WithLabelValues(convLabel).Observe(time.Since(applyStart).Seconds())
 		metricSubstrateApplied.WithLabelValues(convLabel).Inc()
+	}
+	// Track the highest applied offset for trim watermark
+	// broadcasts. Atomic so the trim publisher / broadcaster
+	// can read without coordinating with the apply pump.
+	if msg.Offset > 0 {
+		// Monotonic max — apply pump is single-goroutine so a
+		// plain Store would work, but be defensive in case the
+		// pump is ever parallelized.
+		for {
+			cur := s.appliedOffset.Load()
+			if msg.Offset <= cur {
+				break
+			}
+			if s.appliedOffset.CompareAndSwap(cur, msg.Offset) {
+				break
+			}
+		}
 	}
 
 	// Signal any matching Submit waiter, OR record that this

@@ -152,6 +152,16 @@ var (
 		[]string{"conv_id"},
 	)
 
+	// metricSubstrateTrim counts the number of times this
+	// substrate has truncated its local log (Phase 10(f)).
+	metricSubstrateTrim = promauto.With(metricsRegistry).NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "comlink_substrate_trim_total",
+			Help: "Local log truncations performed by the substrate after a safe-frontier advance.",
+		},
+		[]string{"conv_id"},
+	)
+
 	// metricSubstrateAutoEvict counts substrate-level
 	// auto-evictions (Phase 10(a)) — a peer was silent for too
 	// long and its slot was frozen so wave gates could advance.

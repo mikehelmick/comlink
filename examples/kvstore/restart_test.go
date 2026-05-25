@@ -124,7 +124,7 @@ func TestKVStoreReplicaRestartRecoversSMState(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			snap := restartedStore.Snapshot()
+			snap := restartedStore.SnapshotMap()
 			t.Fatalf("r2 SM did not recover from log: snapshot=%v want=%v", snap, want)
 		}
 		time.Sleep(50 * time.Millisecond)
