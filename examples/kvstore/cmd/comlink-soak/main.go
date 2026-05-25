@@ -37,6 +37,7 @@ import (
 	"bytes"
 	"context"
 	crand "crypto/rand"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -75,6 +76,13 @@ var (
 	flagPaceWrite  = flag.Duration("pace-write", 50*time.Millisecond, "per-writer pacing sleep. Set to 0 to remove pacing entirely (true throughput mode — may peg CPU).")
 	flagPaceRead   = flag.Duration("pace-read", 30*time.Millisecond, "per-reader pacing sleep. Set to 0 to remove pacing entirely.")
 	flagTargetMB   = flag.Int("target-mb", 0, "if >0, soak exits once this many MB have been successfully written (whichever comes first: -duration or -target-mb). Useful for repeatable bulk-load benchmarks.")
+
+	// Instrumentation: emit a JSON-line per status tick to a file
+	// so a downstream renderer (cmd/render-soak) can chart the
+	// run. External tools (e.g. cluster.sh migrate) can append
+	// annotation events to the same file — the renderer treats
+	// any line with kind="annotation" as a vertical marker.
+	flagEventsOut = flag.String("events-out", "", "if set, append a JSON line per status tick to this file. Format: {\"ts\": ISO8601, \"kind\":\"tick\"|\"annotation\", ...}")
 )
 
 // ─── stats ───────────────────────────────────────────────────────
@@ -411,6 +419,25 @@ func statusPrinter(ctx context.Context, s *stats) {
 	ticker := time.NewTicker(*flagStatusEvery)
 	defer ticker.Stop()
 	var last statsSnap
+	var eventsW *eventsWriter
+	if *flagEventsOut != "" {
+		var err error
+		eventsW, err = newEventsWriter(*flagEventsOut)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "events-out: %v\n", err)
+		} else {
+			defer eventsW.Close()
+			// Open with a run-start marker so the renderer can find
+			// the start-of-run boundary even if older events linger
+			// in the file from prior runs.
+			eventsW.writeRaw(map[string]any{
+				"ts":   time.Now().UTC().Format(time.RFC3339Nano),
+				"kind": "annotation",
+				"tag":  "run-start",
+				"text": fmt.Sprintf("soak start: writers=%d readers=%d value_bytes=%d target_mb=%d", *flagWriters, *flagReaders, *flagValueBytes, *flagTargetMB),
+			})
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -428,9 +455,54 @@ func statusPrinter(ctx context.Context, s *stats) {
 			float64(snap.wo-last.wo)/dt, float64(snap.ro-last.ro)/dt,
 			humanBytes(snap.bw), humanBytes(snap.br),
 			bwRate, brRate)
+		if eventsW != nil {
+			eventsW.writeRaw(map[string]any{
+				"ts":                time.Now().UTC().Format(time.RFC3339Nano),
+				"kind":              "tick",
+				"writes_ok":         snap.wo,
+				"writes_fail":       snap.wf,
+				"reads_ok":          snap.ro,
+				"reads_miss":        snap.rm,
+				"reads_fail":        snap.rf,
+				"restarts":          snap.rs,
+				"bytes_write":       snap.bw,
+				"bytes_read":        snap.br,
+				"writes_per_sec":    float64(snap.wo-last.wo) / dt,
+				"reads_per_sec":     float64(snap.ro-last.ro) / dt,
+				"bytes_write_mib_s": bwRate,
+				"bytes_read_mib_s":  brRate,
+				"writes_fail_delta": snap.wf - last.wf,
+			})
+		}
 		last = snap
 	}
 }
+
+// eventsWriter is an append-only JSON-lines writer for the
+// soak driver's instrumentation file. Safe to call from a
+// single goroutine; external annotation writers (e.g.
+// cluster.sh) append to the SAME file out-of-band.
+type eventsWriter struct {
+	f *os.File
+}
+
+func newEventsWriter(path string) (*eventsWriter, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return &eventsWriter{f: f}, nil
+}
+
+func (w *eventsWriter) writeRaw(m map[string]any) {
+	bs, err := jsonMarshalLine(m)
+	if err != nil {
+		return
+	}
+	_, _ = w.f.Write(bs)
+}
+
+func (w *eventsWriter) Close() error { return w.f.Close() }
 
 // ─── preflight + convergence ─────────────────────────────────────
 
@@ -501,6 +573,16 @@ func verifyConvergence() error {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// jsonMarshalLine marshals m to a NUL-free JSON line ending in
+// '\n'. Used by the events writer.
+func jsonMarshalLine(m map[string]any) ([]byte, error) {
+	bs, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	return append(bs, '\n'), nil
 }
 
 // kubectlExecGet calls `kubectl exec pod -- wget -qO- localhost:8000/kv/key`.

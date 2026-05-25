@@ -240,6 +240,20 @@ cmd_status() {
     done
 }
 
+# annotate TAG TEXT: append a JSON annotation line to the
+# events file pointed to by COMLINK_SOAK_EVENTS. Lets external
+# operators stamp the soak's timeline (e.g. "migration started")
+# so the renderer can mark them as vertical lines.
+annotate() {
+    local tag="$1" text="$2"
+    [ -n "${COMLINK_SOAK_EVENTS:-}" ] || return 0
+    [ -d "$(dirname "$COMLINK_SOAK_EVENTS")" ] || return 0
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '{"ts":"%s","kind":"annotation","tag":"%s","text":"%s"}\n' "$ts" "$tag" "$text" \
+        >>"$COMLINK_SOAK_EVENTS"
+}
+
 # migrate ORDINAL: simulates "drain node, reschedule pod" by
 # killing the replica's process and restarting it on a NEW
 # transport port against the SAME DataDir. The HTTP port is
@@ -255,6 +269,7 @@ cmd_migrate() {
     pid="$(cat "$STATE_DIR/pids/$ord.pid")"
     old_tp="$(cat "$STATE_DIR/ports/$ord.transport")"
     old_hp="$(cat "$STATE_DIR/ports/$ord.http")"
+    annotate "migrate-start" "kill ord=$ord old_transport=$old_tp"
     echo "[migrate] killing ordinal=$ord pid=$pid (transport=$old_tp, http=$old_hp)"
     kill "$pid" 2>/dev/null || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -296,6 +311,7 @@ cmd_migrate() {
         exit 1
     fi
 
+    annotate "migrate-done" "ord=$ord new_transport=$new_tp http=$new_hp"
     echo
     echo "[migrate] ordinal=$ord restarted: http://127.0.0.1:$new_hp"
     echo "[migrate] NOTE: survivors' persisted membership still points at $old_tp."
