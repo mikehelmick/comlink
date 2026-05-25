@@ -249,12 +249,19 @@ func newRouter(cluster *comlink.Cluster, store *kvstore.Store, logger *slog.Logg
 
 	mux.HandleFunc("PUT /kv/{key}", func(w http.ResponseWriter, r *http.Request) {
 		key := r.PathValue("key")
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		// 16 MiB cap accommodates the soak driver's bulk mode (which
+		// pushes 64–256 KiB values to exercise the snapshot streaming
+		// path) while still bounding any one request's memory cost.
+		body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		// Bigger payloads + larger keyspace means snapshot streaming
+		// can take meaningfully longer than 5s under load — bump to
+		// 30s so writes don't fail spuriously when a slow apply pump
+		// is processing a recent snapshot trim.
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 		if err := store.Set(ctx, key, string(body)); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)

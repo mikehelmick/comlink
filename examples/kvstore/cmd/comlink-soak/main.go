@@ -34,12 +34,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	crand "crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"math/rand/v2"
+	mrand "math/rand/v2"
 	"net/http"
 	"os"
 	"os/exec"
@@ -66,23 +68,43 @@ var (
 	flagKeyPrefix    = flag.String("key-prefix", "soak", "prefix for all keys written by this run")
 	flagStatusEvery  = flag.Duration("status-every", 10*time.Second, "status print cadence")
 	flagSkipChaos    = flag.Bool("skip-chaos", false, "skip pod restarts (pure load test)")
+
+	// Bulk-throughput knobs (Phase 11 — exercise snapshot streaming
+	// + disk-snapshot trim under sustained heavy write load).
+	flagValueBytes = flag.Int("value-bytes", 0, "if >0, each write uses a random payload of this size in bytes (default: small timestamp string). Use 65536+ to drive hundreds of MB through the cluster.")
+	flagPaceWrite  = flag.Duration("pace-write", 50*time.Millisecond, "per-writer pacing sleep. Set to 0 to remove pacing entirely (true throughput mode — may peg CPU).")
+	flagPaceRead   = flag.Duration("pace-read", 30*time.Millisecond, "per-reader pacing sleep. Set to 0 to remove pacing entirely.")
+	flagTargetMB   = flag.Int("target-mb", 0, "if >0, soak exits once this many MB have been successfully written (whichever comes first: -duration or -target-mb). Useful for repeatable bulk-load benchmarks.")
 )
 
 // ─── stats ───────────────────────────────────────────────────────
 
 type stats struct {
-	writesOK   atomic.Uint64
-	writesFail atomic.Uint64
-	readsOK    atomic.Uint64
-	readsFail  atomic.Uint64
-	readsMiss  atomic.Uint64 // 404 — key not yet replicated, retried later
-	restarts   atomic.Uint64
+	writesOK    atomic.Uint64
+	writesFail  atomic.Uint64
+	readsOK     atomic.Uint64
+	readsFail   atomic.Uint64
+	readsMiss   atomic.Uint64 // 404 — key not yet replicated, retried later
+	restarts    atomic.Uint64
+	bytesWrite  atomic.Uint64 // total bytes of value payloads successfully PUT
+	bytesReadOK atomic.Uint64 // total bytes successfully GET (200s)
 }
 
-func (s *stats) snapshot() (uint64, uint64, uint64, uint64, uint64, uint64) {
-	return s.writesOK.Load(), s.writesFail.Load(),
-		s.readsOK.Load(), s.readsFail.Load(),
-		s.readsMiss.Load(), s.restarts.Load()
+type statsSnap struct {
+	wo, wf, ro, rf, rm, rs, bw, br uint64
+}
+
+func (s *stats) snapshot() statsSnap {
+	return statsSnap{
+		wo: s.writesOK.Load(),
+		wf: s.writesFail.Load(),
+		ro: s.readsOK.Load(),
+		rf: s.readsFail.Load(),
+		rm: s.readsMiss.Load(),
+		rs: s.restarts.Load(),
+		bw: s.bytesWrite.Load(),
+		br: s.bytesReadOK.Load(),
+	}
 }
 
 // ─── main ────────────────────────────────────────────────────────
@@ -92,6 +114,11 @@ func main() {
 
 	fmt.Printf("comlink-soak: target=%s duration=%s restart-every=%s writers=%d readers=%d keyspace=%d\n",
 		*flagTargetURL, *flagDuration, *flagRestartEvery, *flagWriters, *flagReaders, *flagKeyspace)
+	if *flagValueBytes > 0 {
+		fmt.Printf("comlink-soak: bulk mode — value-bytes=%d (%.1f KiB), pace-write=%s, pace-read=%s, target-mb=%d\n",
+			*flagValueBytes, float64(*flagValueBytes)/1024.0,
+			*flagPaceWrite, *flagPaceRead, *flagTargetMB)
+	}
 
 	// Sanity-check the cluster is reachable BEFORE we go.
 	if err := pingCluster(*flagTargetURL, *flagReplicas); err != nil {
@@ -104,6 +131,30 @@ func main() {
 	defer cancel()
 
 	st := &stats{}
+
+	// If -target-mb is set, watch the byte counter and trigger
+	// shutdown the moment we cross the threshold. This sits
+	// orthogonal to the time-based -duration cap; whichever
+	// fires first wins.
+	if *flagTargetMB > 0 {
+		go func() {
+			targetBytes := uint64(*flagTargetMB) * 1024 * 1024
+			t := time.NewTicker(200 * time.Millisecond)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if st.bytesWrite.Load() >= targetBytes {
+						fmt.Printf("[target] reached %d MB written; cancelling soak\n", *flagTargetMB)
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
 
 	var wg sync.WaitGroup
 	for i := 0; i < *flagWriters; i++ {
@@ -128,16 +179,18 @@ func main() {
 	wg.Wait()
 	cancel()
 
-	wo, wf, ro, rf, rm, rs := st.snapshot()
+	snap := st.snapshot()
 	fmt.Println()
 	fmt.Println("─── final summary ──────────────────────────────────")
-	fmt.Printf("  writes OK     : %d\n", wo)
-	fmt.Printf("  writes FAIL   : %d\n", wf)
-	fmt.Printf("  reads  OK     : %d\n", ro)
-	fmt.Printf("  reads  MISS   : %d (404, key not yet replicated)\n", rm)
-	fmt.Printf("  reads  FAIL   : %d (network / transient)\n", rf)
-	fmt.Printf("  pod restarts  : %d\n", rs)
-	if wo+ro == 0 {
+	fmt.Printf("  writes OK     : %d\n", snap.wo)
+	fmt.Printf("  writes FAIL   : %d\n", snap.wf)
+	fmt.Printf("  reads  OK     : %d\n", snap.ro)
+	fmt.Printf("  reads  MISS   : %d (404, key not yet replicated)\n", snap.rm)
+	fmt.Printf("  reads  FAIL   : %d (network / transient)\n", snap.rf)
+	fmt.Printf("  pod restarts  : %d\n", snap.rs)
+	fmt.Printf("  bytes written : %s\n", humanBytes(snap.bw))
+	fmt.Printf("  bytes read    : %s\n", humanBytes(snap.br))
+	if snap.wo+snap.ro == 0 {
 		fmt.Fprintln(os.Stderr, "no successful operations — something is wrong")
 		os.Exit(1)
 	}
@@ -160,23 +213,48 @@ func main() {
 func writer(ctx context.Context, wg *sync.WaitGroup, s *stats, id int) {
 	defer wg.Done()
 	client := &http.Client{Timeout: *flagOpTimeout}
+	// Pre-allocate a payload buffer when in bulk mode. We refresh
+	// the first 8 bytes each iteration with a unique stamp so the
+	// payload isn't byte-identical run to run (helps catch any
+	// silent dedup/compression bugs in the snapshot path).
+	var bulk []byte
+	if *flagValueBytes > 0 {
+		bulk = make([]byte, *flagValueBytes)
+		if _, err := crand.Read(bulk); err != nil {
+			fmt.Fprintf(os.Stderr, "writer %d: seed rand: %v\n", id, err)
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		key := fmt.Sprintf("%s-%d", *flagKeyPrefix, rand.IntN(*flagKeyspace))
-		val := fmt.Sprintf("w%d@%d", id, time.Now().UnixNano())
-		if err := doPut(ctx, client, key, val); err != nil {
+		key := fmt.Sprintf("%s-%d", *flagKeyPrefix, mrand.IntN(*flagKeyspace))
+		var body io.Reader
+		var size int
+		if bulk != nil {
+			// Mutate a tiny prefix so each PUT is observably unique.
+			stamp := fmt.Sprintf("w%d@%d", id, time.Now().UnixNano())
+			n := copy(bulk, stamp)
+			_ = n
+			body = bytes.NewReader(bulk)
+			size = len(bulk)
+		} else {
+			val := fmt.Sprintf("w%d@%d", id, time.Now().UnixNano())
+			body = strings.NewReader(val)
+			size = len(val)
+		}
+		if err := doPutBody(ctx, client, key, body); err != nil {
 			s.writesFail.Add(1)
 		} else {
 			s.writesOK.Add(1)
+			s.bytesWrite.Add(uint64(size))
 		}
-		// Small natural pacing — without this the test pegs CPU
-		// in the kvd HTTP handler and disguises the latency
-		// signal.
-		time.Sleep(50 * time.Millisecond)
+		// Optional pacing. Set -pace-write=0 for max throughput.
+		if d := *flagPaceWrite; d > 0 {
+			time.Sleep(d)
+		}
 	}
 }
 
@@ -190,26 +268,35 @@ func reader(ctx context.Context, wg *sync.WaitGroup, s *stats, id int) {
 			return
 		default:
 		}
-		key := fmt.Sprintf("%s-%d", *flagKeyPrefix, rand.IntN(*flagKeyspace))
-		status, err := doGet(ctx, client, key)
+		key := fmt.Sprintf("%s-%d", *flagKeyPrefix, mrand.IntN(*flagKeyspace))
+		status, n, err := doGetWithLen(ctx, client, key)
 		switch {
 		case err != nil:
 			s.readsFail.Add(1)
 		case status == 200:
 			s.readsOK.Add(1)
+			s.bytesReadOK.Add(uint64(n))
 		case status == 404:
 			s.readsMiss.Add(1)
 		default:
 			s.readsFail.Add(1)
 		}
-		time.Sleep(30 * time.Millisecond)
+		if d := *flagPaceRead; d > 0 {
+			time.Sleep(d)
+		}
 	}
 }
 
+// doPut is kept as a small-payload helper used by the canary
+// path so existing call sites don't have to change.
 func doPut(ctx context.Context, client *http.Client, key, val string) error {
+	return doPutBody(ctx, client, key, strings.NewReader(val))
+}
+
+func doPutBody(ctx context.Context, client *http.Client, key string, body io.Reader) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
 		fmt.Sprintf("%s/kv/%s", *flagTargetURL, key),
-		strings.NewReader(val))
+		body)
 	if err != nil {
 		return err
 	}
@@ -225,19 +312,39 @@ func doPut(ctx context.Context, client *http.Client, key, val string) error {
 	return nil
 }
 
-func doGet(ctx context.Context, client *http.Client, key string) (int, error) {
+func doGetWithLen(ctx context.Context, client *http.Client, key string) (int, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		fmt.Sprintf("%s/kv/%s", *flagTargetURL, key), nil)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode, nil
+	n, _ := io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, int(n), nil
+}
+
+// humanBytes formats a byte count as KiB / MiB / GiB for the
+// summary lines.
+func humanBytes(b uint64) string {
+	const (
+		ki = 1024
+		mi = 1024 * ki
+		gi = 1024 * mi
+	)
+	switch {
+	case b >= gi:
+		return fmt.Sprintf("%.2f GiB", float64(b)/float64(gi))
+	case b >= mi:
+		return fmt.Sprintf("%.2f MiB", float64(b)/float64(mi))
+	case b >= ki:
+		return fmt.Sprintf("%.2f KiB", float64(b)/float64(ki))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }
 
 // ─── chaos ───────────────────────────────────────────────────────
@@ -303,23 +410,25 @@ func runKubectl(ctx context.Context, timeout time.Duration, args ...string) erro
 func statusPrinter(ctx context.Context, s *stats) {
 	ticker := time.NewTicker(*flagStatusEvery)
 	defer ticker.Stop()
-	var last struct {
-		wo, wf, ro, rf, rm uint64
-	}
+	var last statsSnap
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
-		wo, wf, ro, rf, rm, rs := s.snapshot()
+		snap := s.snapshot()
 		dt := flagStatusEvery.Seconds()
-		fmt.Printf("[status] writes %d/+%d (fail %d/+%d) | reads %d/+%d (miss %d/+%d, fail %d/+%d) | restarts %d | %.1f write/s, %.1f read/s\n",
-			wo, wo-last.wo, wf, wf-last.wf,
-			ro, ro-last.ro, rm, rm-last.rm, rf, rf-last.rf,
-			rs,
-			float64(wo-last.wo)/dt, float64(ro-last.ro)/dt)
-		last.wo, last.wf, last.ro, last.rf, last.rm = wo, wf, ro, rf, rm
+		bwRate := float64(snap.bw-last.bw) / dt / (1024.0 * 1024.0)
+		brRate := float64(snap.br-last.br) / dt / (1024.0 * 1024.0)
+		fmt.Printf("[status] writes %d/+%d (fail %d/+%d) | reads %d/+%d (miss %d/+%d, fail %d/+%d) | restarts %d | %.1f write/s, %.1f read/s | total %s W, %s R | rate %.2f MiB/s W, %.2f MiB/s R\n",
+			snap.wo, snap.wo-last.wo, snap.wf, snap.wf-last.wf,
+			snap.ro, snap.ro-last.ro, snap.rm, snap.rm-last.rm, snap.rf, snap.rf-last.rf,
+			snap.rs,
+			float64(snap.wo-last.wo)/dt, float64(snap.ro-last.ro)/dt,
+			humanBytes(snap.bw), humanBytes(snap.br),
+			bwRate, brRate)
+		last = snap
 	}
 }
 

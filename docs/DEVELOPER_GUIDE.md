@@ -385,6 +385,111 @@ the system conv (forthcoming), the joiner reads the conv
 registry and creates the corresponding substrates. Today,
 the app configures this out-of-band (env vars, config files).
 
+## Operator playbook: moving a replica to a different node
+
+The "pod-eviction-and-reschedule" scenario — taking a replica
+offline and bringing it back up on a *different physical node*
+— is a routine cluster operation. Most often it's K8s draining
+a worker so the StatefulSet controller can reschedule the pod
+to a healthy node; the PVC follows. Sometimes it's manual:
+a planned move to a node with more RAM, or rotating out a node
+that's about to be decommissioned.
+
+### What survives the move (and what doesn't)
+
+Survives automatically as long as the PVC is preserved:
+- Comlink's persistent state (`DataDir/comlink.bolt`):
+  ClusterID, persisted membership list, local message log.
+- The application's on-disk snapshot
+  (`DataDir/<your-app>/state.snap` if you followed the
+  kvstore pattern). The state machine is fully restored from
+  this file BEFORE the substrate's apply pump starts — so
+  local reads serve the pre-eviction state immediately on
+  restart, with zero peer round-trips.
+
+Does NOT survive the move (operator action required):
+- The pod's gRPC listen address. When the pod reschedules,
+  its IP usually changes. Peers' persisted membership lists
+  still point at the OLD address until either DNS catches up
+  (for headless-service-named pods) or you tell them
+  explicitly via `Cluster.UpdatePeerAddr`.
+
+### Step-by-step playbook
+
+1. **Drain / evict the old pod.** Kubernetes does this for
+   you when you `kubectl drain` the node. For manual moves,
+   `Cluster.Close()` on the replica is the clean shutdown
+   call — it stops accepting new traffic and flushes any
+   pending writes to disk.
+
+2. **Wait for the new pod to come up against the same PVC.**
+   The StatefulSet controller handles this; in a manual flow,
+   start a new comlink-kvd process with the same
+   `COMLINK_DATA_DIR` and the same `COMLINK_SELF`. The new
+   process re-reads `comlink.bolt` to recover ClusterID + ML.
+
+3. **Verify the snapshot loaded.** `kvstore` exposes a `Get`
+   immediately after `New` returns — values written before the
+   move are present without waiting on peers. (See
+   `TestKVStoreReplicaMigrationToNewNode` for the exact
+   assertion the integration test makes.)
+
+4. **Update peer routing on the survivors.** If the new pod
+   has a different listen address (almost always true unless
+   you've pinned a NodePort), each surviving replica needs:
+
+   ```go
+   peerCluster.UpdatePeerAddr(movedReplicaID, newAddr)
+   ```
+
+   In K8s with a headless service this happens automatically
+   over the next DNS refresh cycle. For a manual flow you
+   call it explicitly. The library closes the cached gRPC
+   connection to the old addr; the next outbound `Send`
+   re-dials at the new addr.
+
+### Known limitation: post-migration write convergence
+
+With kvstore's `OrderingTotal` substrate today, a write
+initiated AFTER a peer restart does not reliably converge
+on the restarted peer within a bounded time. The new
+message arrives at the peer's `psync` layer, but the
+local message graph is empty post-restart (the snapshot
+only restores SM state, not the vector-clock graph), so
+the new message gets deferred waiting for "missing parent"
+entries that the lost-message protocol can't always
+fulfill from peers' trimmed logs.
+
+The operator workaround today is to bounce the substrate
+on EVERY peer after the migration completes — fresh
+substrates re-establish their graph from the persisted
+log. This works because each peer's local log still has
+the entries the restored peer needs.
+
+Closing this gap properly is Phase 12 work (per-substrate
+snapshot that includes the vector-clock graph frontier,
+OR a restart handshake that re-streams from a peer at
+the snapshot's offset). Track the issue in `PLAN.md`.
+
+### Mapping to the K8s deployment
+
+`deploy/manifests/app/20-statefulset.yaml` mounts the PVC at
+`/var/lib/comlink`. Both `comlink.bolt` and the kvstore
+snapshot under `/var/lib/comlink/kvstore/state.snap` are
+preserved through pod reschedules. The headless service
+`comlink-kvd-peers` handles peer DNS so `UpdatePeerAddr`
+calls aren't usually needed — pods locate each other by
+`<pod>.<svc>` DNS names that the K8s control plane
+re-resolves to whatever IP the pod currently has. The pod
+anti-affinity rule (one pod per worker) means a `kubectl
+drain` reliably moves a replica to a fresh node.
+
+For a true 4-node migration demo against the local kind
+cluster: scale `kind-config.yaml` to 4 workers, redeploy,
+then `kubectl drain kind-worker3` to watch the StatefulSet
+controller reschedule one pod onto `kind-worker4`. The
+PVC follows automatically.
+
 ## Wire format and protocol notes
 
 Useful when debugging or tuning:
