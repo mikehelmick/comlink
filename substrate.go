@@ -360,6 +360,7 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 	// NewSubstrate ctx — the latter is typically a short-lived
 	// bootstrap context that would otherwise kill the conv's pumps
 	// the moment NewSubstrate returns.
+	convLabelForObs := shortConvID(cfg.ConversationID)
 	conv, err := psync.New(c.runCtx, psync.Config{
 		ConversationID:  cfg.ConversationID.toPB(),
 		Self:            c.cfg.Self.toPB(),
@@ -373,6 +374,14 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 		// Receive-path liveness signal — keeps the FD's view of
 		// peers fresh even when the Order wave gate is stalled.
 		OnReceive: s.noteReceive,
+		// Instrumentation hooks routed through to the comlink
+		// package's Prometheus registry.
+		OnHandleSendDuration: func(d time.Duration) {
+			metricPsyncHandleSend.WithLabelValues(convLabelForObs).Observe(d.Seconds())
+		},
+		OnBroadcastSendDuration: func(d time.Duration) {
+			metricPsyncBroadcastSend.WithLabelValues(convLabelForObs).Observe(d.Seconds())
+		},
 	})
 	if err != nil {
 		rollback()
@@ -590,6 +599,7 @@ func (s *Substrate) Submit(ctx context.Context, payload []byte) error {
 	if err != nil {
 		return fmt.Errorf("comlink: Submit: send: %w", err)
 	}
+	sendDone := time.Now()
 	metricSubstrateSubmitted.WithLabelValues(convLabel).Inc()
 	s.hb.NoteSent()
 	// Compute sender_seq from the returned MessageID + our known
@@ -630,6 +640,7 @@ func (s *Substrate) Submit(ctx context.Context, payload []byte) error {
 
 	select {
 	case <-wait:
+		metricSubstrateSubmitWait.WithLabelValues(convLabel).Observe(time.Since(sendDone).Seconds())
 		return nil
 	case <-ctx.Done():
 		s.mu.Lock()
@@ -829,6 +840,8 @@ func (s *Substrate) applyPump() {
 }
 
 func (s *Substrate) handleApplied(ctx context.Context, applied order.Applied) {
+	convLabelApply := shortConvID(s.cfg.ConversationID)
+	decodeStart := time.Now()
 	env := applied.Envelope
 	if env == nil || env.GetId() == nil {
 		return
@@ -846,6 +859,7 @@ func (s *Substrate) handleApplied(ctx context.Context, applied order.Applied) {
 		s.logger.Warn("substrate: bad ConvFrame", "err", err)
 		return
 	}
+	metricSubstrateApplyDecode.WithLabelValues(convLabelApply).Observe(time.Since(decodeStart).Seconds())
 	if dec.App == nil {
 		// Heartbeat / membership / watermark variants don't
 		// reach the application. Watermark is special: it's
@@ -875,10 +889,12 @@ func (s *Substrate) handleApplied(ctx context.Context, applied order.Applied) {
 	senderSeq := vc[senderSlot]
 
 	// Look up offset from the local log.
+	lookupStart := time.Now()
 	var offset uint64
 	if entry, err := s.log.LookupBySender(ctx, sender.GetValue(), senderSeq); err == nil {
 		offset = uint64(entry.Offset)
 	}
+	metricSubstrateApplyLookup.WithLabelValues(convLabelApply).Observe(time.Since(lookupStart).Seconds())
 
 	msg := &Message{
 		ID:      messageIDFromPB(env.GetId()),

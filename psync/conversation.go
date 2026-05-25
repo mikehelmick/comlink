@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/mikehelmick/go-functional/genserver"
 
@@ -85,6 +86,18 @@ type Config struct {
 	// Runs synchronously in the pump goroutine. Must be fast
 	// and non-blocking — no I/O, no genserver re-entry.
 	OnReceive func(from *pb.ReplicaID)
+
+	// OnHandleSendDuration, if non-nil, is called after every
+	// completed handleSend with the in-genserver duration
+	// (excludes the async peer broadcast). Hook for the
+	// owning package's Prometheus registry so we don't pull a
+	// metrics dependency into psync.
+	OnHandleSendDuration func(time.Duration)
+
+	// OnBroadcastSendDuration, if non-nil, is called once per
+	// peer Send from the broadcast goroutine with the
+	// network.Send latency for that one peer.
+	OnBroadcastSendDuration func(time.Duration)
 }
 
 // Conversation is one replica's view of a Psync conversation.
@@ -260,6 +273,12 @@ type serverImpl struct {
 	// substrates wire this to FD.NoteReceived so peer liveness
 	// signals survive Order back-pressure.
 	onReceive func(from *pb.ReplicaID)
+	// onHandleSendDuration / onBroadcastSendDuration are
+	// instrumentation hooks fed back to the substrate layer
+	// (which lives in a parent package and owns the Prometheus
+	// registry). nil-safe — checked before invoking.
+	onHandleSendDuration    func(time.Duration)
+	onBroadcastSendDuration func(time.Duration)
 }
 
 // Init creates the initial mutable state.
@@ -365,17 +384,19 @@ func New(ctx context.Context, cfg Config) (*Conversation, error) {
 	}
 
 	impl := &serverImpl{
-		convID:     proto.Clone(cfg.ConversationID).(*pb.ConversationID),
-		self:       proto.Clone(cfg.Self).(*pb.ReplicaID),
-		selfSlot:   selfSlot,
-		membership: membership,
-		log:        cfg.Log,
-		storage:    cfg.Storage,
-		network:    cfg.Network,
-		mask:       mask,
-		deliver:    deliver,
-		logger:     logger,
-		onReceive:  cfg.OnReceive,
+		convID:                  proto.Clone(cfg.ConversationID).(*pb.ConversationID),
+		self:                    proto.Clone(cfg.Self).(*pb.ReplicaID),
+		selfSlot:                selfSlot,
+		membership:              membership,
+		log:                     cfg.Log,
+		storage:                 cfg.Storage,
+		network:                 cfg.Network,
+		mask:                    mask,
+		deliver:                 deliver,
+		logger:                  logger,
+		onReceive:               cfg.OnReceive,
+		onHandleSendDuration:    cfg.OnHandleSendDuration,
+		onBroadcastSendDuration: cfg.OnBroadcastSendDuration,
 	}
 
 	c := &Conversation{
@@ -607,6 +628,10 @@ func (c *Conversation) Close() error {
 // ─── handlers (run inside the genserver goroutine) ────────────────
 
 func (s *serverImpl) handleSend(st *state, payload []byte) (*pb.MessageID, error) {
+	if s.onHandleSendDuration != nil {
+		start := time.Now()
+		defer func() { s.onHandleSendDuration(time.Since(start)) }()
+	}
 	view := currentView(st.graph, s.membership)
 	newVec := Increment(view, s.selfSlot)
 	id := &pb.MessageID{
@@ -661,7 +686,12 @@ func (s *serverImpl) broadcastEnvelope(peers []*pb.ReplicaID, wireBytes []byte) 
 			continue
 		}
 		go func(p *pb.ReplicaID) {
-			if err := s.network.Send(context.Background(), p, wireBytes); err != nil {
+			start := time.Now()
+			err := s.network.Send(context.Background(), p, wireBytes)
+			if s.onBroadcastSendDuration != nil {
+				s.onBroadcastSendDuration(time.Since(start))
+			}
+			if err != nil {
 				s.logger.Warn("psync: send to peer failed",
 					"peer", fmt.Sprintf("%x", p.GetValue()),
 					"err", err)

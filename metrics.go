@@ -112,6 +112,63 @@ var (
 		[]string{"conv_id"},
 	)
 
+	// metricSubstrateSubmitWait records how long Submit waited
+	// on local Apply AFTER psync.Send returned. This is the
+	// "queueing + wave-gate + apply-pump" component of Submit,
+	// distinct from the psync.Send work itself.
+	metricSubstrateSubmitWait = promauto.With(metricsRegistry).NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "comlink_substrate_submit_wait_seconds",
+			Help:    "Time Submit blocked on the pendingApplies channel after psync.Send returned.",
+			Buckets: prometheus.ExponentialBucketsRange(100e-6, 30.0, 14),
+		},
+		[]string{"conv_id"},
+	)
+
+	// metricPsyncHandleSend records the in-genserver portion of
+	// psync.Send: graph view + log append + graph insert +
+	// deliver-channel push + envelope marshal + spawn broadcast.
+	// Does NOT include the network broadcast (which is async).
+	metricPsyncHandleSend = promauto.With(metricsRegistry).NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "comlink_psync_handle_send_seconds",
+			Help:    "In-genserver portion of psync.handleSend (excludes async peer broadcast).",
+			Buckets: prometheus.ExponentialBucketsRange(10e-6, 1.0, 12),
+		},
+		[]string{"conv_id"},
+	)
+
+	// metricPsyncBroadcastSend records the duration of one
+	// network.Send to one peer from the broadcast goroutine.
+	metricPsyncBroadcastSend = promauto.With(metricsRegistry).NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "comlink_psync_broadcast_send_seconds",
+			Help:    "Per-peer network.Send duration from the async broadcast goroutine.",
+			Buckets: prometheus.ExponentialBucketsRange(50e-6, 5.0, 12),
+		},
+		[]string{"conv_id"},
+	)
+
+	// metricSubstrateApplyDecode and metricSubstrateApplyLookup
+	// split the apply-pump work that's NOT the SM.Apply call,
+	// so we can see where in handleApplied the time is going.
+	metricSubstrateApplyDecode = promauto.With(metricsRegistry).NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "comlink_substrate_apply_decode_seconds",
+			Help:    "frame.Unmarshal + sender-slot lookup in handleApplied.",
+			Buckets: prometheus.ExponentialBucketsRange(10e-6, 1.0, 12),
+		},
+		[]string{"conv_id"},
+	)
+	metricSubstrateApplyLookup = promauto.With(metricsRegistry).NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "comlink_substrate_apply_lookup_seconds",
+			Help:    "log.LookupBySender duration in handleApplied (offset resolution).",
+			Buckets: prometheus.ExponentialBucketsRange(10e-6, 1.0, 12),
+		},
+		[]string{"conv_id"},
+	)
+
 	// metricMembershipVoteIn / metricMembershipVoteOut count
 	// vote outcomes at the system Manager. Useful for catching
 	// loss of quorum or persistent disagreement.

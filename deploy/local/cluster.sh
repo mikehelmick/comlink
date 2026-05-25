@@ -34,6 +34,29 @@ STATE_DIR="${COMLINK_CLUSTER_DIR:-/tmp/comlink-cluster}"
 KVD_BIN="${COMLINK_KVD:-$(go env GOPATH)/bin/comlink-kvd}"
 DEFAULT_REPLICAS=3
 
+# Go-runtime tuning knobs passed to every kvd process. Empty
+# string = leave the Go default in place.
+#
+#   GOMAXPROCS — caps the number of OS threads the Go runtime
+#                can use to run goroutines simultaneously. The
+#                default is host-cores; with N kvd processes
+#                that's N×cores of P's competing for one CPU,
+#                which thrashes the OS scheduler. Setting this
+#                explicitly (e.g. 2 per kvd × 3 replicas + 3
+#                for the soak = 9 of 10 host cores) usually
+#                helps under heavy local load.
+#   GOGC       — % heap growth that triggers a GC cycle. Default
+#                100 means GC fires when the heap doubles.
+#                Higher values (e.g. 200, 400) reduce GC
+#                frequency at the cost of higher peak RSS.
+#   GOMEMLIMIT — soft memory limit in bytes (or 100MiB / 1GiB
+#                / etc). When the heap approaches this, GC fires
+#                more aggressively to stay under. Useful for
+#                bounding per-process RSS on a shared host.
+COMLINK_GOMAXPROCS_DEFAULT="${COMLINK_GOMAXPROCS:-}"
+COMLINK_GOGC_DEFAULT="${COMLINK_GOGC:-}"
+COMLINK_GOMEMLIMIT_DEFAULT="${COMLINK_GOMEMLIMIT:-}"
+
 # Deterministic 32-hex-char ReplicaID from "kvd-<ordinal>".
 self_for() {
     printf '%s' "kvd-$1" | shasum -a 256 | cut -c1-32
@@ -107,6 +130,15 @@ start_one() {
     # use the same substrate ID across restarts.
     local conv_id="0000000000000000000000000000abcd"
 
+    # Optional Go-runtime tuning. Only set when non-empty so we
+    # don't override Go defaults when the operator hasn't asked.
+    local gomaxprocs_env=""
+    local gogc_env=""
+    local gomemlimit_env=""
+    [ -n "$COMLINK_GOMAXPROCS_DEFAULT" ] && gomaxprocs_env="GOMAXPROCS=$COMLINK_GOMAXPROCS_DEFAULT"
+    [ -n "$COMLINK_GOGC_DEFAULT" ]       && gogc_env="GOGC=$COMLINK_GOGC_DEFAULT"
+    [ -n "$COMLINK_GOMEMLIMIT_DEFAULT" ] && gomemlimit_env="GOMEMLIMIT=$COMLINK_GOMEMLIMIT_DEFAULT"
+
     env \
         COMLINK_SELF="$self" \
         COMLINK_DATA_DIR="$data" \
@@ -117,6 +149,9 @@ start_one() {
         $members_env \
         $bootstrap_env \
         $sponsor_env \
+        $gomaxprocs_env \
+        $gogc_env \
+        $gomemlimit_env \
         "$KVD_BIN" >>"$log" 2>&1 &
 
     local pid=$!
@@ -140,7 +175,22 @@ wait_http_ready() {
 }
 
 cmd_up() {
-    local n="${1:-$DEFAULT_REPLICAS}"
+    local n="$DEFAULT_REPLICAS"
+    # Parse optional flags: --gomaxprocs N --gogc N --gomemlimit V.
+    # A bare positional arg (the replica count) is also accepted.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --gomaxprocs)  COMLINK_GOMAXPROCS_DEFAULT="$2"; shift 2 ;;
+            --gomaxprocs=*) COMLINK_GOMAXPROCS_DEFAULT="${1#*=}"; shift ;;
+            --gogc)        COMLINK_GOGC_DEFAULT="$2"; shift 2 ;;
+            --gogc=*)      COMLINK_GOGC_DEFAULT="${1#*=}"; shift ;;
+            --gomemlimit)  COMLINK_GOMEMLIMIT_DEFAULT="$2"; shift 2 ;;
+            --gomemlimit=*) COMLINK_GOMEMLIMIT_DEFAULT="${1#*=}"; shift ;;
+            -*)            echo "unknown flag: $1" >&2; exit 2 ;;
+            *)             n="$1"; shift ;;
+        esac
+    done
+
     ensure_binary
     ensure_dirs
 
@@ -148,6 +198,17 @@ cmd_up() {
         echo "cluster appears to be running; run 'down' first" >&2
         exit 1
     fi
+
+    # Persist the chosen tuning so 'migrate' inherits it on restart.
+    {
+        echo "GOMAXPROCS=$COMLINK_GOMAXPROCS_DEFAULT"
+        echo "GOGC=$COMLINK_GOGC_DEFAULT"
+        echo "GOMEMLIMIT=$COMLINK_GOMEMLIMIT_DEFAULT"
+    } >"$STATE_DIR/tuning.env"
+
+    # Echo what we're about to launch with.
+    [ -n "$COMLINK_GOMAXPROCS_DEFAULT$COMLINK_GOGC_DEFAULT$COMLINK_GOMEMLIMIT_DEFAULT" ] && \
+        echo "[up] tuning: GOMAXPROCS=$COMLINK_GOMAXPROCS_DEFAULT GOGC=$COMLINK_GOGC_DEFAULT GOMEMLIMIT=$COMLINK_GOMEMLIMIT_DEFAULT"
 
     local base_transport=7100
     local base_http=8100
@@ -265,6 +326,14 @@ cmd_migrate() {
         echo "no replica $ord running" >&2
         exit 1
     fi
+    # Inherit the cluster-wide tuning the operator chose at 'up'.
+    if [ -f "$STATE_DIR/tuning.env" ]; then
+        # shellcheck disable=SC1091
+        set -a; . "$STATE_DIR/tuning.env"; set +a
+        COMLINK_GOMAXPROCS_DEFAULT="${GOMAXPROCS:-}"
+        COMLINK_GOGC_DEFAULT="${GOGC:-}"
+        COMLINK_GOMEMLIMIT_DEFAULT="${GOMEMLIMIT:-}"
+    fi
     local pid old_tp old_hp
     pid="$(cat "$STATE_DIR/pids/$ord.pid")"
     old_tp="$(cat "$STATE_DIR/ports/$ord.transport")"
@@ -338,22 +407,31 @@ case "${1:-}" in
     logs)     shift; cmd_logs "$@" ;;
     *)
         cat >&2 <<EOF
-usage: $0 {up [N] | down | status | migrate ORDINAL | logs ORDINAL}
+usage: $0 {up [N] [--gomaxprocs N] [--gogc N] [--gomemlimit V] | down | status | migrate ORDINAL | logs ORDINAL}
 
-  up [N]            start N replicas (default $DEFAULT_REPLICAS) on
-                    127.0.0.1:710X (transport) and :810X (HTTP).
-                    State under $STATE_DIR.
-  down              kill all replicas and remove state.
-  status            per-replica health + members view.
-  migrate ORDINAL   kill replica ORDINAL, restart on NEW ports
-                    against the same DataDir (simulates a K8s pod
-                    reschedule to a different node).
-  logs ORDINAL      tail -F the replica's log.
+  up [N] [tunings]   start N replicas (default $DEFAULT_REPLICAS) on
+                     127.0.0.1:710X (transport) and :810X (HTTP).
+                     State under $STATE_DIR. Tunings persist into
+                     the state dir and re-apply on migrate.
+  down               kill all replicas and remove state.
+  status             per-replica health + members view.
+  migrate ORDINAL    kill replica ORDINAL, restart on NEW ports
+                     against the same DataDir (simulates a K8s pod
+                     reschedule to a different node). Inherits the
+                     tunings used at 'up'.
+  logs ORDINAL       tail -F the replica's log.
 
-env:
+tuning flags (passed to every kvd as env):
+  --gomaxprocs N     caps OS threads per kvd process
+  --gogc N           GC trigger threshold (% heap growth)
+  --gomemlimit V     soft heap-size cap (e.g. 1GiB, 512MiB)
+
+env (alternative to flags):
   COMLINK_CLUSTER_DIR  state dir (default /tmp/comlink-cluster)
-  COMLINK_KVD          path to the kvd binary
-                       (default \$GOPATH/bin/comlink-kvd)
+  COMLINK_KVD          path to the kvd binary (default \$GOPATH/bin/comlink-kvd)
+  COMLINK_GOMAXPROCS   same as --gomaxprocs
+  COMLINK_GOGC         same as --gogc
+  COMLINK_GOMEMLIMIT   same as --gomemlimit
 EOF
         exit 2
         ;;

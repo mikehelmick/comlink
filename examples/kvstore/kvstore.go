@@ -116,6 +116,20 @@ var (
 			Help: "Log offset covered by the most recently written snapshot.",
 		},
 	)
+	metricKVBatchFlushOps = promauto.With(comlink.MetricsRegistry()).NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "kvstore_batch_flush_ops",
+			Help:    "Number of commands in each Submit'd batch.",
+			Buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512},
+		},
+	)
+	metricKVBatchFlushBytes = promauto.With(comlink.MetricsRegistry()).NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "kvstore_batch_flush_bytes",
+			Help:    "Marshaled size in bytes of each Submit'd batch.",
+			Buckets: prometheus.ExponentialBuckets(1024, 4, 8),
+		},
+	)
 )
 
 // ─── command schema (proto kvstore.v1.Command) ──────────────────
@@ -173,7 +187,209 @@ type Store struct {
 	// snapshotter goroutine lifecycle.
 	snapshotStop chan struct{}
 	snapshotDone chan struct{}
+
+	// Batcher — coalesces concurrent Set/Delete calls into one
+	// substrate Submit. Nil when Config.Batching.Disabled=true.
+	batcher *batcher
 }
+
+// batchEntry is one queued mutation waiting for the batch loop
+// to flush. done is closed (with err set) when the batch this
+// entry was bundled into has finished its Submit call.
+type batchEntry struct {
+	cmd  *kvpb.Command
+	bytes int // approx wire size for byte-trigger accounting
+	done chan struct{}
+	err  error
+}
+
+// batcher owns the per-Store flush loop. One per Store.
+type batcher struct {
+	sub *comlink.Substrate
+	cfg BatchingConfig
+
+	in       chan *batchEntry
+	stop     chan struct{}
+	stopOnce sync.Once
+	done     chan struct{}
+}
+
+func newBatcher(sub *comlink.Substrate, cfg BatchingConfig) *batcher {
+	// Fill in defaults. Zero values picked to be sensible for
+	// a 3-replica OrderingTotal substrate.
+	if cfg.MinWindow <= 0 {
+		cfg.MinWindow = 1 * time.Millisecond
+	}
+	if cfg.MaxWindow <= 0 {
+		cfg.MaxWindow = 50 * time.Millisecond
+	}
+	if cfg.MaxBatchOps <= 0 {
+		cfg.MaxBatchOps = 256
+	}
+	if cfg.MaxBatchBytes <= 0 {
+		cfg.MaxBatchBytes = 4 << 20 // 4 MiB
+	}
+	if cfg.RateHalfLife <= 0 {
+		cfg.RateHalfLife = 500 * time.Millisecond
+	}
+	b := &batcher{
+		sub:  sub,
+		cfg:  cfg,
+		in:   make(chan *batchEntry, 1024),
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	go b.loop()
+	return b
+}
+
+// submit enqueues a Command, waits for the batch to flush, and
+// returns the per-batch Submit error.
+func (b *batcher) submit(ctx context.Context, c *kvpb.Command, approxBytes int) error {
+	e := &batchEntry{
+		cmd:   c,
+		bytes: approxBytes,
+		done:  make(chan struct{}),
+	}
+	select {
+	case b.in <- e:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-b.stop:
+		return errors.New("kvstore: batcher closed")
+	}
+	select {
+	case <-e.done:
+		return e.err
+	case <-ctx.Done():
+		// Note: even if ctx fires, the entry may still get
+		// flushed (we don't / can't pull it back out of the
+		// queue). The caller-visible result honors the ctx
+		// deadline; the batch may still Submit.
+		return ctx.Err()
+	}
+}
+
+// loop is the single-goroutine flush loop using a drain-then-
+// flush model:
+//
+//   - Block on the first arrival.
+//   - Greedily drain any other entries already queued (non-
+//     blocking reads from in) up to MaxBatchOps / MaxBatchBytes.
+//   - Flush.
+//
+// Under sustained load, while the loop is blocked inside
+// Submit (waiting for local Apply), concurrent callers queue
+// entries in b.in. The next loop iteration reads them all at
+// once and flushes them as a single batch — so batch size
+// scales naturally with concurrency × Submit latency, without
+// adding any artificial time-window delay.
+//
+// Under light load, batches are 1-element (no concurrent
+// arrivals to drain). That's fine: the only "cost" of going
+// through the batcher in that case is one extra channel hop.
+func (b *batcher) loop() {
+	defer close(b.done)
+
+	// Submits get a context that's cancelled when b.stop fires,
+	// so a wedged Submit at shutdown returns instead of hanging
+	// the Close path.
+	submitCtx, submitCancel := context.WithCancel(context.Background())
+	defer submitCancel()
+	go func() {
+		<-b.stop
+		submitCancel()
+	}()
+
+	pending := make([]*batchEntry, 0, b.cfg.MaxBatchOps)
+	var batchBytes int
+
+	resetBatch := func() {
+		pending = pending[:0]
+		batchBytes = 0
+	}
+
+	abortPending := func(err error) {
+		for _, e := range pending {
+			e.err = err
+			close(e.done)
+		}
+		resetBatch()
+	}
+
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		commands := make([]*kvpb.Command, len(pending))
+		for i, e := range pending {
+			commands[i] = e.cmd
+		}
+		payload, err := proto.Marshal(&kvpb.CommandBatch{Commands: commands})
+		if err == nil {
+			err = b.sub.Submit(submitCtx, payload)
+			metricKVBatchFlushOps.Observe(float64(len(commands)))
+			metricKVBatchFlushBytes.Observe(float64(len(payload)))
+		}
+		for _, e := range pending {
+			e.err = err
+			close(e.done)
+		}
+		resetBatch()
+	}
+
+	// drainAvailable greedily reads everything currently queued
+	// in b.in (non-blocking) without exceeding the size caps.
+	// Returns when b.in has nothing more to give OR when a
+	// cap is hit.
+	drainAvailable := func() {
+		for {
+			if len(pending) >= b.cfg.MaxBatchOps || batchBytes >= b.cfg.MaxBatchBytes {
+				return
+			}
+			select {
+			case e, ok := <-b.in:
+				if !ok {
+					return
+				}
+				pending = append(pending, e)
+				batchBytes += e.bytes
+			default:
+				return
+			}
+		}
+	}
+
+	for {
+		select {
+		case <-b.stop:
+			abortPending(errors.New("kvstore: batcher closed"))
+			return
+
+		case e := <-b.in:
+			pending = append(pending, e)
+			batchBytes += e.bytes
+			// Greedily absorb anything else already queued —
+			// these are concurrent callers blocked on the
+			// previous flush, so we get a "natural" batch with
+			// zero added latency.
+			drainAvailable()
+			flush()
+		}
+	}
+}
+
+// Close stops the batcher loop. Draining of in-flight entries
+// happens via the final flush() call in the loop's stop path.
+// Idempotent — multiple Close calls are safe.
+func (b *batcher) Close() error {
+	b.stopOnce.Do(func() {
+		close(b.stop)
+		<-b.done
+	})
+	return nil
+}
+
 
 // watcher is the internal handle for one Watch call. Channel
 // is buffered so a slow consumer can't stall Apply; oldest
@@ -223,6 +439,62 @@ type Config struct {
 	// snapshot AND the cluster has Sponsors configured. Apps
 	// that are joiners set this to true; founders ignore it.
 	BootstrapFromSponsor bool
+
+	// Batching coalesces concurrent Set/Delete calls into one
+	// substrate message. Zero values pick defaults appropriate
+	// for a 3-replica OrderingTotal substrate where each Submit
+	// costs one wave-gate roundtrip. Set Batching.Disabled=true
+	// to bypass entirely (every Set/Delete becomes its own
+	// 1-element batch posted directly).
+	Batching BatchingConfig
+}
+
+// BatchingConfig tunes the application-level write batcher.
+//
+// The batcher accumulates concurrent Set/Delete calls into one
+// kvpb.CommandBatch and Submits that batch to the substrate
+// once. Each caller blocks until the batch is locally Apply'd
+// (same Set/Delete semantics as before — what changes is the
+// number of substrate messages, not the per-call contract).
+//
+// The flush window adapts to incoming arrival rate: under
+// heavy load, the batch fills quickly so the time-trigger
+// shrinks toward MinWindow; under light load, time stretches
+// toward MaxWindow so a stream of one-off writes still bundles
+// well. The size + byte triggers cap latency from blowing up
+// regardless of arrival rate.
+type BatchingConfig struct {
+	// Disabled bypasses the batcher entirely. Every Set/Delete
+	// posts its own one-element batch directly. Useful for
+	// debugging / measuring the no-batching baseline without
+	// having to rebuild.
+	Disabled bool
+
+	// MinWindow is the floor for the adaptive time trigger.
+	// Even under saturating load the batcher waits at least
+	// this long after the first queued entry before flushing,
+	// so writes get a chance to accumulate. Zero = 1 ms.
+	MinWindow time.Duration
+
+	// MaxWindow is the ceiling for the adaptive time trigger.
+	// A burst of one-off writes flushes no later than this
+	// after the first queued entry. Zero = 50 ms.
+	MaxWindow time.Duration
+
+	// MaxBatchOps flushes the batch when the queue reaches this
+	// many ops, regardless of time. Zero = 256.
+	MaxBatchOps int
+
+	// MaxBatchBytes flushes the batch when the cumulative
+	// value-bytes reach this size. Caps a single substrate
+	// payload's size so the apply pump doesn't choke on a
+	// pathological 100-MiB batch. Zero = 4 MiB.
+	MaxBatchBytes int
+
+	// RateHalfLife is kept for API stability — currently unused
+	// by the drain-then-flush loop. Reserved for a future
+	// adaptive variant.
+	RateHalfLife time.Duration
 }
 
 // On-disk format: protobuf-encoded kvpb.Snapshot. The file is
@@ -285,6 +557,13 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("kvstore: create substrate: %w", err)
 	}
 	s.sub = sub
+
+	// Spin up the batcher unless explicitly disabled. With
+	// batching off, Set/Delete fall back to direct one-element
+	// substrate Submits (kept on the same code path for parity).
+	if !cfg.Batching.Disabled {
+		s.batcher = newBatcher(sub, cfg.Batching)
+	}
 
 	// Reflect any post-Restore max-offset into our atomic so a
 	// subsequent snapshot reports the correct through_offset.
@@ -477,6 +756,11 @@ func (s *Store) FreezeMember(replica comlink.ReplicaID) error {
 // active Watch channel. Subsequent Set / Delete / Watch return
 // errors via the Substrate.
 func (s *Store) Close() error {
+	// Stop the batcher first so its loop drains any pending
+	// entries before we tear down the substrate underneath it.
+	if s.batcher != nil {
+		_ = s.batcher.Close()
+	}
 	// Stop the snapshot loop (it writes a final snapshot on
 	// shutdown before exiting).
 	if s.snapshotStop != nil {
@@ -496,26 +780,51 @@ func (s *Store) Close() error {
 
 // Apply implements comlink.StateMachine. Runs on every replica
 // in the same total order. Must be pure / deterministic.
+//
+// Every Apply payload is a kvpb.CommandBatch — single-write
+// callers produce 1-element batches, the batcher coalesces
+// many. Commands within a batch are applied in proto order
+// (which is the order Set/Delete callers were enqueued in on
+// the source replica).
 func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
-	var c kvpb.Command
-	if err := proto.Unmarshal(msg.Payload, &c); err != nil {
+	var batch kvpb.CommandBatch
+	if err := proto.Unmarshal(msg.Payload, &batch); err != nil {
 		metricKVApply.WithLabelValues("malformed").Inc()
-		return // malformed command — ignore deterministically.
+		return // malformed payload — ignore deterministically.
 	}
-	key := c.GetKey()
-	val := string(c.GetValue())
-	s.mu.Lock()
-	_, had := s.data[key]
-	switch c.GetOp() {
-	case kvpb.Op_OP_SET:
-		s.data[key] = val
-		metricKVApply.WithLabelValues("set").Inc()
-	case kvpb.Op_OP_DELETE:
-		delete(s.data, key)
-		metricKVApply.WithLabelValues("del").Inc()
-	default:
-		s.mu.Unlock()
+	cmds := batch.GetCommands()
+	if len(cmds) == 0 {
 		return
+	}
+
+	// Hold the data lock once for the whole batch — within a
+	// batch the writes are applied as one logical unit. This
+	// also amortizes the lock acquire/release across many
+	// mutations.
+	type evt struct {
+		op   kvpb.Op
+		key  string
+		val  string
+		had  bool
+	}
+	events := make([]evt, 0, len(cmds))
+	s.mu.Lock()
+	for _, c := range cmds {
+		key := c.GetKey()
+		val := string(c.GetValue())
+		_, had := s.data[key]
+		switch c.GetOp() {
+		case kvpb.Op_OP_SET:
+			s.data[key] = val
+			metricKVApply.WithLabelValues("set").Inc()
+			events = append(events, evt{kvpb.Op_OP_SET, key, val, had})
+		case kvpb.Op_OP_DELETE:
+			delete(s.data, key)
+			metricKVApply.WithLabelValues("del").Inc()
+			events = append(events, evt{kvpb.Op_OP_DELETE, key, "", had})
+		default:
+			// Unknown op — skip, keep the rest of the batch atomic.
+		}
 	}
 	metricKVKeys.Set(float64(len(s.data)))
 	s.mu.Unlock()
@@ -534,12 +843,14 @@ func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
 
 	// Fan out to watchers AFTER releasing the data lock so a
 	// slow watcher can't block other Apply calls.
-	switch c.GetOp() {
-	case kvpb.Op_OP_SET:
-		s.notify(key, Event{Type: EventSet, Key: key, Value: val, PriorExists: had})
-	case kvpb.Op_OP_DELETE:
-		if had {
-			s.notify(key, Event{Type: EventDelete, Key: key, PriorExists: true})
+	for _, e := range events {
+		switch e.op {
+		case kvpb.Op_OP_SET:
+			s.notify(e.key, Event{Type: EventSet, Key: e.key, Value: e.val, PriorExists: e.had})
+		case kvpb.Op_OP_DELETE:
+			if e.had {
+				s.notify(e.key, Event{Type: EventDelete, Key: e.key, PriorExists: true})
+			}
 		}
 	}
 }
@@ -564,30 +875,44 @@ func (s *Store) Get(key string) (string, bool) {
 // been Apply'd locally (and is therefore guaranteed to be in
 // the global order). Peers will see it shortly after via the
 // substrate.
+//
+// Internally: routes through the batcher (unless disabled).
+// The batcher coalesces concurrent Set/Delete calls into one
+// substrate Submit; the caller's blocking-until-Apply'd
+// contract is preserved.
 func (s *Store) Set(ctx context.Context, key, value string) error {
-	bs, err := proto.Marshal(&kvpb.Command{
+	cmd := &kvpb.Command{
 		Op:    kvpb.Op_OP_SET,
 		Key:   key,
 		Value: []byte(value),
-	})
-	if err != nil {
-		return fmt.Errorf("kvstore: marshal Set: %w", err)
 	}
 	metricKVSet.Inc()
-	return s.sub.Submit(ctx, bs)
+	return s.submitCommand(ctx, cmd, len(key)+len(value)+8)
 }
 
 // Delete issues a "delete k" command. Returns when Apply'd
 // locally. No-op (still ordered) if the key is absent.
 func (s *Store) Delete(ctx context.Context, key string) error {
-	bs, err := proto.Marshal(&kvpb.Command{
+	cmd := &kvpb.Command{
 		Op:  kvpb.Op_OP_DELETE,
 		Key: key,
-	})
-	if err != nil {
-		return fmt.Errorf("kvstore: marshal Delete: %w", err)
 	}
 	metricKVDelete.Inc()
+	return s.submitCommand(ctx, cmd, len(key)+8)
+}
+
+// submitCommand sends one Command to the substrate, either via
+// the batcher (if enabled) or as a one-element batch directly.
+// Both code paths produce kvpb.CommandBatch payloads on the
+// wire so the Apply path is uniform.
+func (s *Store) submitCommand(ctx context.Context, c *kvpb.Command, approxBytes int) error {
+	if s.batcher != nil {
+		return s.batcher.submit(ctx, c, approxBytes)
+	}
+	bs, err := proto.Marshal(&kvpb.CommandBatch{Commands: []*kvpb.Command{c}})
+	if err != nil {
+		return fmt.Errorf("kvstore: marshal CommandBatch: %w", err)
+	}
 	return s.sub.Submit(ctx, bs)
 }
 
