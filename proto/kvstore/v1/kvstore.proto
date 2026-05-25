@@ -68,6 +68,17 @@ message Snapshot {
 message SnapshotEntry {
   string key = 1;
   bytes value = 2;
+  // LWW metadata (added when the kvstore demo moved to
+  // OrderingPartial + app-level LWW conflict resolution).
+  // Without these, a fresh joiner bootstrapping from snapshot
+  // could be overwritten by a delayed older write whose
+  // (wave, origin_replica_id) would have lost the comparison.
+  uint64 wave = 3;
+  bytes origin_replica_id = 4;
+  // deleted distinguishes a tombstone from a live entry. A
+  // Delete's (wave, origin_replica_id) is retained so a late-
+  // arriving older Set cannot resurrect the key.
+  bool deleted = 5;
 }
 
 // CommandBatch is the unit of work submitted to the substrate.

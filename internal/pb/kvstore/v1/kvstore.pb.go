@@ -229,9 +229,20 @@ func (x *Snapshot) GetEntries() []*SnapshotEntry {
 }
 
 type SnapshotEntry struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	// LWW metadata (added when the kvstore demo moved to
+	// OrderingPartial + app-level LWW conflict resolution).
+	// Without these, a fresh joiner bootstrapping from snapshot
+	// could be overwritten by a delayed older write whose
+	// (wave, origin_replica_id) would have lost the comparison.
+	Wave            uint64 `protobuf:"varint,3,opt,name=wave,proto3" json:"wave,omitempty"`
+	OriginReplicaId []byte `protobuf:"bytes,4,opt,name=origin_replica_id,json=originReplicaId,proto3" json:"origin_replica_id,omitempty"`
+	// deleted distinguishes a tombstone from a live entry. A
+	// Delete's (wave, origin_replica_id) is retained so a late-
+	// arriving older Set cannot resurrect the key.
+	Deleted       bool `protobuf:"varint,5,opt,name=deleted,proto3" json:"deleted,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -278,6 +289,27 @@ func (x *SnapshotEntry) GetValue() []byte {
 		return x.Value
 	}
 	return nil
+}
+
+func (x *SnapshotEntry) GetWave() uint64 {
+	if x != nil {
+		return x.Wave
+	}
+	return 0
+}
+
+func (x *SnapshotEntry) GetOriginReplicaId() []byte {
+	if x != nil {
+		return x.OriginReplicaId
+	}
+	return nil
+}
+
+func (x *SnapshotEntry) GetDeleted() bool {
+	if x != nil {
+		return x.Deleted
+	}
+	return false
 }
 
 // CommandBatch is the unit of work submitted to the substrate.
@@ -346,10 +378,13 @@ const file_kvstore_v1_kvstore_proto_rawDesc = "" +
 	"\x05value\x18\x03 \x01(\fR\x05value\"f\n" +
 	"\bSnapshot\x12%\n" +
 	"\x0ethrough_offset\x18\x01 \x01(\x04R\rthroughOffset\x123\n" +
-	"\aentries\x18\x02 \x03(\v2\x19.kvstore.v1.SnapshotEntryR\aentries\"7\n" +
+	"\aentries\x18\x02 \x03(\v2\x19.kvstore.v1.SnapshotEntryR\aentries\"\x91\x01\n" +
 	"\rSnapshotEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value\"?\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\x12\x12\n" +
+	"\x04wave\x18\x03 \x01(\x04R\x04wave\x12*\n" +
+	"\x11origin_replica_id\x18\x04 \x01(\fR\x0foriginReplicaId\x12\x18\n" +
+	"\adeleted\x18\x05 \x01(\bR\adeleted\"?\n" +
 	"\fCommandBatch\x12/\n" +
 	"\bcommands\x18\x01 \x03(\v2\x13.kvstore.v1.CommandR\bcommands*?\n" +
 	"\x02Op\x12\x12\n" +

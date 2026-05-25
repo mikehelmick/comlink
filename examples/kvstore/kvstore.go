@@ -38,6 +38,7 @@
 package kvstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -172,13 +173,42 @@ type Event struct {
 
 // ─── store ──────────────────────────────────────────────────────
 
+// entry is the per-key LWW state. Two writes for the same key
+// resolve deterministically via (wave, originRep) lexicographic
+// comparison — same tiebreaker logic OrderingTotal uses
+// intra-wave, lifted into the application so OrderingPartial
+// can be used safely under concurrent writes.
+//
+// deleted=true marks a tombstone: the key is gone from the
+// app's point of view (Get returns ok=false), but the entry
+// stays in the map so a delayed older Set can be correctly
+// rejected via the same (wave, originRep) comparison. GC of
+// tombstones is a follow-up tied to the substrate's log-trim
+// frontier.
+type entry struct {
+	value     string
+	wave      uint64
+	originRep [16]byte
+	deleted   bool
+}
+
+// lww reports whether `inc` strictly wins LWW against `cur`.
+// Equal (wave, originRep) means same envelope → caller decides
+// (within-batch ordering = slice index).
+func lww(inc, cur entry) bool {
+	if inc.wave != cur.wave {
+		return inc.wave > cur.wave
+	}
+	return bytes.Compare(inc.originRep[:], cur.originRep[:]) > 0
+}
+
 // Store is the public API. Construct via New and tear down via
 // Close (which also closes the underlying Substrate).
 type Store struct {
 	sub *comlink.Substrate
 
 	mu     sync.RWMutex
-	data   map[string]string
+	data   map[string]entry
 	maxOff atomic.Uint64 // highest msg.Offset seen in Apply
 
 	watchMu       sync.Mutex
@@ -652,7 +682,7 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, errors.New("kvstore: Config.Members is required")
 	}
 	s := &Store{
-		data:        make(map[string]string),
+		data:        make(map[string]entry),
 		watchers:    make(map[string]map[*watcher]struct{}),
 		snapshotDir: cfg.SnapshotDir,
 	}
@@ -661,10 +691,21 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 	// substrate via InitialSnapshot. If absent AND BootstrapFromSponsor
 	// is set, fall back to AutoBootstrapFromSponsor (mutually
 	// exclusive with InitialSnapshot at the substrate level).
+	// OrderingPartial: the kvstore handles concurrent-write
+	// resolution at the application layer (LWW by (wave,
+	// originReplicaID) — see entry.go's lww()). This skips
+	// the OrderingTotal wave-gate entirely, which used to
+	// dominate Submit latency under one-sided traffic.
+	//
+	// Safety: every replica's Apply uses the same deterministic
+	// merge function on the same (wave, sender) tuples, so all
+	// replicas converge to the same state regardless of
+	// delivery order. Reads are not monotonic mid-convergence,
+	// per the demo's documented contract.
 	subCfg := comlink.SubstrateConfig{
 		ConversationID: cfg.ConversationID,
 		Members:        cfg.Members,
-		Ordering:       comlink.OrderingTotal,
+		Ordering:       comlink.OrderingPartial,
 		StateMachine:   s,
 	}
 	if cfg.SnapshotDir != "" {
@@ -840,10 +881,13 @@ func (s *Store) writeSnapshot() error {
 func (s *Store) Snapshot() ([]byte, uint64, error) {
 	s.mu.RLock()
 	entries := make([]*kvpb.SnapshotEntry, 0, len(s.data))
-	for k, v := range s.data {
+	for k, e := range s.data {
 		entries = append(entries, &kvpb.SnapshotEntry{
-			Key:   k,
-			Value: []byte(v),
+			Key:             k,
+			Value:           []byte(e.value),
+			Wave:            e.wave,
+			OriginReplicaId: append([]byte(nil), e.originRep[:]...),
+			Deleted:         e.deleted,
 		})
 	}
 	throughOff := s.maxOff.Load()
@@ -868,9 +912,16 @@ func (s *Store) Restore(r io.Reader) error {
 	if err := proto.Unmarshal(bs, &p); err != nil {
 		return err
 	}
-	rebuilt := make(map[string]string, len(p.GetEntries()))
+	rebuilt := make(map[string]entry, len(p.GetEntries()))
 	for _, e := range p.GetEntries() {
-		rebuilt[e.GetKey()] = string(e.GetValue())
+		var rep [16]byte
+		copy(rep[:], e.GetOriginReplicaId())
+		rebuilt[e.GetKey()] = entry{
+			value:     string(e.GetValue()),
+			wave:      e.GetWave(),
+			originRep: rep,
+			deleted:   e.GetDeleted(),
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -968,42 +1019,101 @@ func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
 	// message), so this is just one Equal compare per Apply.
 	fromPeer := !msg.Sender.Equal(s.self)
 
+	// Tag for this envelope's LWW comparison. All commands in
+	// a batch share one envelope, so the (wave, originRep)
+	// pair is the same for every command in this batch.
+	var senderArr [16]byte
+	copy(senderArr[:], msg.Sender)
+	envWave := msg.Wave
+
 	// Hold the data lock once for the whole batch — within a
 	// batch the writes are applied as one logical unit. This
 	// also amortizes the lock acquire/release across many
-	// mutations.
+	// mutations. Within the batch, commands touching the same
+	// key are applied in slice order; the LWW (wave, sender)
+	// tuple is identical for all commands in the batch, so
+	// intra-batch later-wins is naturally upheld (each
+	// successive write to the same key sees the just-written
+	// entry as the "current" and lww() returns false for
+	// equal-tuple, but we always allow the in-batch overwrite
+	// because that's the originating-side ordering the user
+	// intended).
 	type evt struct {
-		op   kvpb.Op
-		key  string
-		val  string
-		had  bool
+		op       kvpb.Op
+		key      string
+		val      string
+		hadLive  bool // there was a live (non-tombstone) entry before
+		applied  bool // we actually changed state for this op
 	}
 	events := make([]evt, 0, len(cmds))
 	s.mu.Lock()
 	for _, c := range cmds {
 		key := c.GetKey()
 		val := string(c.GetValue())
-		_, had := s.data[key]
+		cur, exists := s.data[key]
+		hadLive := exists && !cur.deleted
+
 		switch c.GetOp() {
 		case kvpb.Op_OP_SET:
-			s.data[key] = val
-			metricKVApply.WithLabelValues("set").Inc()
-			events = append(events, evt{kvpb.Op_OP_SET, key, val, had})
+			inc := entry{
+				value:     val,
+				wave:      envWave,
+				originRep: senderArr,
+				deleted:   false,
+			}
+			// In-batch successive writes to the same key share
+			// (wave, sender) with the prior one; allow the later
+			// to win (user's submission order). For arrivals from
+			// other batches/envelopes, strict LWW gate applies.
+			same := exists && cur.wave == inc.wave && cur.originRep == inc.originRep
+			win := !exists || same || lww(inc, cur)
+			if win {
+				s.data[key] = inc
+				metricKVApply.WithLabelValues("set").Inc()
+				events = append(events, evt{kvpb.Op_OP_SET, key, val, hadLive, true})
+			} else {
+				metricKVApply.WithLabelValues("set-stale").Inc()
+				events = append(events, evt{kvpb.Op_OP_SET, key, val, hadLive, false})
+			}
 		case kvpb.Op_OP_DELETE:
-			delete(s.data, key)
-			metricKVApply.WithLabelValues("del").Inc()
-			events = append(events, evt{kvpb.Op_OP_DELETE, key, "", had})
+			// Delete is a tombstone with the same (wave, sender)
+			// LWW guarding as Set. If incoming loses to current,
+			// we don't tombstone (the live value still wins).
+			inc := entry{
+				value:     "",
+				wave:      envWave,
+				originRep: senderArr,
+				deleted:   true,
+			}
+			same := exists && cur.wave == inc.wave && cur.originRep == inc.originRep
+			win := !exists || same || lww(inc, cur)
+			if win {
+				s.data[key] = inc
+				metricKVApply.WithLabelValues("del").Inc()
+				events = append(events, evt{kvpb.Op_OP_DELETE, key, "", hadLive, true})
+			} else {
+				metricKVApply.WithLabelValues("del-stale").Inc()
+				events = append(events, evt{kvpb.Op_OP_DELETE, key, "", hadLive, false})
+			}
 		case kvpb.Op_OP_ACK:
-			// Mixed batch with an ack inside it. Skip the ack
-			// command but apply the rest. (Shouldn't normally
-			// happen — the batcher doesn't mix ack with app
-			// commands — but be tolerant.)
+			// Mixed batch with an ack inside it. Skip but allow
+			// the rest. Shouldn't happen — the batcher doesn't
+			// mix ack with app commands — but be tolerant.
 			metricKVApply.WithLabelValues("ack").Inc()
 		default:
 			// Unknown op — skip, keep the rest of the batch atomic.
 		}
 	}
-	metricKVKeys.Set(float64(len(s.data)))
+	// metricKVKeys counts LIVE entries (non-tombstones) so the
+	// gauge reflects what Get can return. Tombstones are
+	// bookkeeping, not user data.
+	live := 0
+	for _, e := range s.data {
+		if !e.deleted {
+			live++
+		}
+	}
+	metricKVKeys.Set(float64(live))
 	s.mu.Unlock()
 
 	// Signal the ack loop AFTER applying state. The next tick
@@ -1026,13 +1136,18 @@ func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
 	}
 
 	// Fan out to watchers AFTER releasing the data lock so a
-	// slow watcher can't block other Apply calls.
+	// slow watcher can't block other Apply calls. Only fire
+	// for ops that actually changed state (LWW losers are
+	// silent — peers shouldn't observe a stale-write event).
 	for _, e := range events {
+		if !e.applied {
+			continue
+		}
 		switch e.op {
 		case kvpb.Op_OP_SET:
-			s.notify(e.key, Event{Type: EventSet, Key: e.key, Value: e.val, PriorExists: e.had})
+			s.notify(e.key, Event{Type: EventSet, Key: e.key, Value: e.val, PriorExists: e.hadLive})
 		case kvpb.Op_OP_DELETE:
-			if e.had {
+			if e.hadLive {
 				s.notify(e.key, Event{Type: EventDelete, Key: e.key, PriorExists: true})
 			}
 		}
@@ -1040,19 +1155,21 @@ func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
 }
 
 // Get returns the value stored under key, or (empty, false) if
-// absent. Reads are LOCAL — they reflect whatever has been
-// Apply'd at this replica, which may trail a peer's recent Set
-// by the network roundtrip + ordering pipeline.
+// absent OR tombstoned. Reads are LOCAL — they reflect whatever
+// has been Apply'd at this replica, which may trail a peer's
+// recent Set by the network roundtrip + LWW resolution
+// pipeline. Reads are NOT monotonic across replicas: a key may
+// briefly show different values mid-convergence.
 func (s *Store) Get(key string) (string, bool) {
 	s.mu.RLock()
-	v, ok := s.data[key]
+	e, ok := s.data[key]
 	s.mu.RUnlock()
-	if ok {
-		metricKVGet.WithLabelValues("hit").Inc()
-	} else {
+	if !ok || e.deleted {
 		metricKVGet.WithLabelValues("miss").Inc()
+		return "", false
 	}
-	return v, ok
+	metricKVGet.WithLabelValues("hit").Inc()
+	return e.value, true
 }
 
 // Set issues a "set k=v" command. Returns when the command has
@@ -1179,8 +1296,11 @@ func (s *Store) SnapshotMap() map[string]string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make(map[string]string, len(s.data))
-	for k, v := range s.data {
-		out[k] = v
+	for k, e := range s.data {
+		if e.deleted {
+			continue
+		}
+		out[k] = e.value
 	}
 	return out
 }
