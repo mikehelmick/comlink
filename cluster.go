@@ -68,6 +68,12 @@ type Cluster struct {
 	snapshotMu      sync.Mutex
 	snapshotSources map[string]*Substrate
 
+	// metadataCh is the public-facing channel for system-conv
+	// application messages (Phase 11(a)). Lazy-initialized on
+	// first call to MetadataMessages. Closed in
+	// adaptMetadataChannel when the system Manager closes.
+	metadataCh chan MetadataMessage
+
 	// runCtx is the Cluster's own lifetime context, cancelled by
 	// Close. Internal goroutines (psync pumps, membership pump,
 	// transport mux) MUST tie themselves to runCtx — not the

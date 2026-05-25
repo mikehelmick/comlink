@@ -548,6 +548,46 @@ ReplicaID public types. Top-level `README.md` quickstart.
 - 10(f) Per-substrate trim machinery + kvstore disk
   persistence + end-to-end recovery test. ✅
 
+---
+
+### Phase 11 — Multi-tenant demo: cluster metadata API + kvstore refactor
+**Scope:** Surface the cluster-scoped (system) conversation as an
+application-usable channel for metadata, build a small replicated
+conversation registry on top of it, then refactor the kvstore demo
+into a true multi-tenant service that hosts many independent stores
+on one cluster.
+
+**Exit criteria:**
+- `Cluster.SubmitMetadata(ctx, payload)` and
+  `Cluster.MetadataMessages()` are the public surface for
+  riding on the system conv.
+- A `MetadataRegistry` helper provides a replicated
+  `map[string]ConvInfo` for the conversation registry pattern.
+- `comlink-kvd` exposes `POST /stores/<name>` /
+  `DELETE /stores/<name>` / `/stores/<name>/kv/<key>` and can
+  host multiple independent kvstores backed by separate
+  conversations.
+- Soak driver exercises the multi-tenant case.
+
+**Sub-commit plan:**
+- 11(a) Cluster metadata API: `SubmitMetadata` +
+  `MetadataMessages` channel. Apps build their own SM
+  consumers on top.
+- 11(b) `MetadataRegistry` helper: replicated `map[string]ConvInfo`,
+  Watch channel for changes. Built using 11(a).
+- 11(c) Multi-tenant kvstore service: `Server` type that owns
+  many `Store` instances keyed by name; create/delete drives
+  the metadata registry.
+- 11(d) `comlink-kvd` HTTP rework: per-store routes.
+- 11(e) Multi-tenant soak update + manifest tweaks if needed.
+
+**Explicitly DEFERRED to Phase 12+:**
+- Per-conversation membership protocol (substrates today
+  have static Members at construction time). The metadata API
+  is independent of this — the registry just records the
+  ASSIGNMENT; the app still creates substrates with whatever
+  members it chooses.
+
 **Forward-looking architectural items captured during Phase 10
 design discussion. Tracked here so they don't get lost; will be
 sequenced as their own phase(s) AFTER Phase 10 wraps:**
@@ -703,5 +743,6 @@ explicit "settle" messages added.
 | 8 — Local Kubernetes deployment            | done (v1)   |
 | 9 — Soak / chaos test driver               | done (v1)   |
 | 10 — Auto-eviction + snapshot recovery     | done (v1)   |
+| 11 — Multi-tenant: cluster metadata API + kvstore refactor | in progress |
 
 Update this table as each phase moves through `in progress` and `done`.
