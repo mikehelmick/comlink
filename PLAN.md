@@ -542,10 +542,11 @@ ReplicaID public types. Top-level `README.md` quickstart.
   receives it via `StateMachine.Restore` before any Apply
   fires. Joiner's substrate then resumes lost-message
   catch-up from throughOffset, NOT from the beginning.
-- 10(e) End-to-end test: trim-then-join recovery scenario
-  in the kvstore example. App-side snapshot is just
-  json.Marshal/Unmarshal of the map; demonstrates the full
-  protocol with a realistic (if simple) app implementation.
+- 10(e) Snapshot-aware trim wire/tracker (Watermark gains
+  snapshot_through_offset; SafeFrontier becomes min over
+  per-replica min(applied, snapshot)). ✅
+- 10(f) Per-substrate trim machinery + kvstore disk
+  persistence + end-to-end recovery test. ✅
 
 **Forward-looking architectural items captured during Phase 10
 design discussion. Tracked here so they don't get lost; will be
