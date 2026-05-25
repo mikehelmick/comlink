@@ -574,7 +574,7 @@ on one cluster.
   `MetadataMessages` channel. Apps build their own SM
   consumers on top.
 - 11(b) `MetadataRegistry` helper: replicated `map[string]ConvInfo`,
-  Watch channel for changes. Built using 11(a).
+  Watch channel for changes. Built using 11(a). ✅
 - 11(c) Multi-tenant kvstore service: `Server` type that owns
   many `Store` instances keyed by name; create/delete drives
   the metadata registry.
