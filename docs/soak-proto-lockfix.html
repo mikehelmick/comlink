@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>comlink soak — protobuf &#43; snapshot-lock fix</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1419;
+    --surface: #1a1f2e;
+    --surface-2: #232a3d;
+    --text: #e6e8eb;
+    --text-dim: #9aa3b2;
+    --accent: #6cc1ff;
+    --good: #6dd17e;
+    --bad: #ff7575;
+    --warn: #ffce6d;
+    --border: #2a3145;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+  }
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+  }
+  header h1 {
+    margin: 0 0 4px;
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  header .subtitle {
+    color: var(--text-dim);
+    font-size: 14px;
+    margin-bottom: 24px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px 20px;
+  }
+  .card.kpi {
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .kpi .label {
+    color: var(--text-dim);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .kpi .value {
+    font-size: 24px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .kpi .value.good { color: var(--good); }
+  .kpi .value.bad { color: var(--bad); }
+  .kpi .value.warn { color: var(--warn); }
+  .card.chart {
+    padding: 16px 18px 12px;
+  }
+  .card.chart h2 {
+    margin: 0 0 12px;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .card.chart h2 .hint {
+    font-weight: 400;
+    color: var(--text-dim);
+    font-size: 12px;
+    margin-left: 8px;
+  }
+  .chart-wrap {
+    position: relative;
+    height: 240px;
+  }
+  .chart-wrap.tall {
+    height: 320px;
+  }
+  table.summary {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+  table.summary td {
+    padding: 8px 12px;
+    border-top: 1px solid var(--border);
+  }
+  table.summary td:first-child {
+    color: var(--text-dim);
+    width: 50%;
+  }
+  table.summary td:last-child {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .narrative {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 16px 22px;
+    margin: 24px 0;
+  }
+  .narrative h2 {
+    margin: 0 0 8px;
+    font-size: 16px;
+  }
+  .narrative p {
+    margin: 0 0 8px;
+    color: var(--text-dim);
+    font-size: 14px;
+  }
+  .narrative p:last-child { margin-bottom: 0; }
+  .annotations-list {
+    list-style: none;
+    padding: 0; margin: 0;
+  }
+  .annotations-list li {
+    padding: 8px 0;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .annotations-list li:first-child { border-top: none; }
+  .annotations-list .tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    background: var(--surface-2);
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+    margin-right: 8px;
+    font-variant-numeric: tabular-nums;
+  }
+  footer {
+    margin-top: 32px;
+    color: var(--text-dim);
+    font-size: 12px;
+    text-align: center;
+  }
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 800px) {
+    .two-col { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>comlink soak — protobuf &#43; snapshot-lock fix</h1>
+    <div class="subtitle">3-replica local cluster, 8 writers × 64 KiB values, NO migration. Compares against the original JSON&#43;held-lock baseline.</div>
+    <div class="subtitle">Generated Sun, 24 May 2026 20:36:59 PDT · Run window Mon, 25 May 2026 03:25:20 UTC → Mon, 25 May 2026 03:29:10 UTC (3m50s)</div>
+  </header>
+
+  <section class="grid">
+    <div class="card kpi"><span class="label">Bytes written</span><span class="value good">130.94 MiB</span></div>
+    <div class="card kpi"><span class="label">Bytes read</span><span class="value">7.26 GiB</span></div>
+    <div class="card kpi"><span class="label">Write success</span><span class="value">33.9%</span></div>
+    <div class="card kpi"><span class="label">Peak write throughput</span><span class="value">1.76 MiB/s</span></div>
+    <div class="card kpi"><span class="label">Peak read throughput</span><span class="value">335.11 MiB/s</span></div>
+  </section>
+
+  <div class="card chart" style="margin-bottom: 16px;">
+    <h2>Throughput over time <span class="hint">MiB/sec, write + read</span></h2>
+    <div class="chart-wrap tall"><canvas id="chartThroughput"></canvas></div>
+  </div>
+
+  <div class="two-col">
+    <div class="card chart">
+      <h2>Operations per second <span class="hint">writes vs. reads</span></h2>
+      <div class="chart-wrap"><canvas id="chartOps"></canvas></div>
+    </div>
+    <div class="card chart">
+      <h2>Write success rate <span class="hint">% of attempts in interval</span></h2>
+      <div class="chart-wrap"><canvas id="chartSuccess"></canvas></div>
+    </div>
+  </div>
+
+  <div class="card chart" style="margin-top: 16px;">
+    <h2>Cumulative bytes <span class="hint">total written + read since start</span></h2>
+    <div class="chart-wrap"><canvas id="chartCumBytes"></canvas></div>
+  </div>
+
+  <div class="two-col" style="margin-top: 24px;">
+    <div class="card">
+      <h2 style="margin-top: 0; font-size: 16px;">Run summary</h2>
+      <table class="summary">
+        <tr><td>Total writes OK</td><td>2095</td></tr>
+        <tr><td>Total writes FAIL</td><td>4089</td></tr>
+        <tr><td>Total reads OK</td><td>118893</td></tr>
+        <tr><td>Total reads MISS (404)</td><td>413832</td></tr>
+        <tr><td>Total reads FAIL</td><td>392137</td></tr>
+        <tr><td>Bytes written</td><td>130.94 MiB</td></tr>
+        <tr><td>Bytes read</td><td>7.26 GiB</td></tr>
+        <tr><td>Write success rate</td><td>33.9%</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h2 style="margin-top: 0; font-size: 16px;">Timeline annotations</h2>
+      
+      <p style="color: var(--text-dim); margin: 0;">No annotations recorded for this run.</p>
+      
+    </div>
+  </div>
+
+  <footer>
+    Generated by <code>comlink/examples/kvstore/cmd/render-soak</code>.
+    Charts powered by Chart.js. Source JSONL: <code>3m50s</code> window, 47 ticks.
+  </footer>
+</div>
+
+<script>
+const labels = ["00:00","00:04","00:09","00:14","00:19","00:25","00:30","00:35","00:40","00:45","00:50","00:55","01:00","01:05","01:10","01:15","01:20","01:25","01:30","01:35","01:40","01:45","01:50","01:55","02:00","02:05","02:10","02:15","02:20","02:25","02:30","02:35","02:40","02:45","02:50","02:55","03:00","03:05","03:10","03:15","03:20","03:25","03:30","03:35","03:40","03:45","03:50"];
+const writesPerSec = [20.6,5.8,11.2,9.2,4.8,4.2,25.2,3,5.4,3.2,7.4,3,17.8,9.6,4.4,7,8.2,9,13.2,21.2,5.6,1.6,4.8,7.2,7.6,28.2,6.2,6.6,5.2,7.2,8.2,25.2,7.2,4.4,1.6,3.2,4.8,10.4,22.2,3.8,4.8,4.6,1.6,11.8,26,2.4,3.2];
+const readsPerSec  = [112.6,4.2,16.4,15.4,9.2,8.8,895.2,19.4,25.8,22,25.4,20,1245,246,32.2,43.8,41.4,61.4,740.8,1612.2,54.6,27.6,52.4,66.4,132.2,2876.4,80.8,57.2,64.6,77,97,2867.4,945.4,79.8,49.6,62.4,84.6,500.6,4029.4,96.2,76.2,78.4,71.4,518.8,5361.8,67,106.2];
+const bytesWMiBs   = [1.2875,0.3625,0.7,0.575,0.3,0.2625,1.575,0.1875,0.3375,0.2,0.4625,0.1875,1.1125,0.6,0.275,0.4375,0.5125,0.5625,0.825,1.325,0.35,0.1,0.3,0.45,0.475,1.7625,0.3875,0.4125,0.325,0.45,0.5125,1.575,0.45,0.275,0.1,0.2,0.3,0.65,1.3875,0.2375,0.3,0.2875,0.1,0.7375,1.625,0.15,0.2];
+const bytesRMiBs   = [7.0375,0.2625,1.025,0.9625,0.575,0.55,55.95,1.2125,1.6125,1.375,1.5875,1.25,77.8125,15.375,2.0125,2.7375,2.5875,3.8375,46.3,100.7625,3.4125,1.725,3.275,4.15,8.2625,179.775,5.05,3.575,4.0375,4.8125,6.0625,179.2125,59.0875,4.9875,3.1,3.9,5.2875,31.2875,251.8375,6.0125,4.7625,4.9,4.4625,32.425,335.1125,4.1875,6.6375];
+const cumBytesW    = [6750208,8650752,12320768,15335424,16908288,18284544,26542080,27525120,29294592,30343168,32768000,33751040,39583744,42729472,44171264,46465024,49152000,52101120,56426496,63373312,65208320,65732608,67305472,69664768,72155136,81395712,83427328,85590016,87293952,89653248,92340224,100597760,102957056,104398848,104923136,105971712,107544576,110952448,118226944,119472128,121044992,122552320,123076608,126943232,135462912,136249344,137297920];
+const cumBytesR    = [36896768,38273024,43646976,48693248,51707904,54591488,347930624,354287616,362741760,369950720,378273792,384827392,792788992,873398272,883949568,898301952,911867904,931987456,1174732800,1703018496,1720909824,1729953792,1747124224,1768882176,1812201472,2754740224,2781216768,2799960064,2821128192,2846359552,2878144512,3817734144,4127522816,4153671680,4169924608,4190371840,4218093568,4382130176,5702483968,5734006784,5758976000,5784666112,5808062464,5978062848,7735017472,7756972032,7791771648];
+const successPct   = [58.52272727272727,12.554112554112555,70,21.69811320754717,13.114754098360656,12.068965517241379,56.25,9.433962264150944,46.55172413793103,21.05263157894737,14.979757085020243,5.2264808362369335,44.27860696517413,35.03649635036496,21.153846153846153,30.17241379310345,29.285714285714285,25.423728813559322,47.142857142857146,62.72189349112426,30.107526881720432,8,34.285714285714285,24.489795918367346,24.358974358974358,95.27027027027027,35.22727272727273,13.75,20.967741935483872,22.78481012658228,35.3448275862069,87.5,55.38461538461539,66.66666666666667,30.76923076923077,21.05263157894737,20.689655172413794,49.523809523809526,99.10714285714286,38,20.869565217391305,19.82758620689655,16.666666666666668,44.3609022556391,97.74436090225564,92.3076923076923,9.523809523809524];
+const annotations  = null;
+
+
+
+const annotationPlugin = {
+  id: 'annotationLines',
+  afterDraw(chart) {
+    const {ctx, chartArea: {top, bottom}, scales: {x}} = chart;
+    if (!x || !annotations || annotations.length === 0) return;
+    ctx.save();
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    annotations.forEach((a, i) => {
+      const idx = Math.min(a.index, labels.length - 1);
+      const xPos = x.getPixelForValue(idx);
+      const color = a.label.includes('migrate') ? '#ffce6d' : '#6cc1ff';
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(xPos, top);
+      ctx.lineTo(xPos, bottom);
+      ctx.stroke();
+      
+      
+      if (chart.canvas.id === 'chartThroughput') {
+        ctx.setLineDash([]);
+        ctx.fillStyle = color;
+        ctx.font = 'bold 11px sans-serif';
+        const labelText = a.label;
+        const textW = ctx.measureText(labelText).width;
+        const boxX = xPos + 4;
+        const boxY = top + 8 + (i * 18);
+        ctx.fillRect(boxX, boxY, textW + 8, 16);
+        ctx.fillStyle = '#0f1419';
+        ctx.fillText(labelText, boxX + 4, boxY + 12);
+      }
+    });
+    ctx.restore();
+  }
+};
+
+const baseOpts = {
+  responsive: true,
+  maintainAspectRatio: false,
+  interaction: { mode: 'index', intersect: false },
+  scales: {
+    x: {
+      ticks: { color: '#9aa3b2', maxRotation: 0, autoSkipPadding: 24 },
+      grid: { color: 'rgba(154,163,178,0.08)' },
+    },
+    y: {
+      ticks: { color: '#9aa3b2' },
+      grid: { color: 'rgba(154,163,178,0.08)' },
+      beginAtZero: true,
+    },
+  },
+  plugins: {
+    legend: { labels: { color: '#e6e8eb', boxWidth: 14 } },
+    tooltip: {
+      backgroundColor: '#0f1419',
+      borderColor: '#2a3145',
+      borderWidth: 1,
+      titleColor: '#e6e8eb',
+      bodyColor: '#e6e8eb',
+    },
+  },
+};
+
+new Chart(document.getElementById('chartThroughput'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [
+      { label: 'Write MiB/s', data: bytesWMiBs, borderColor: '#6dd17e',
+        backgroundColor: 'rgba(109,209,126,0.15)', fill: true, tension: 0.25, pointRadius: 0 },
+      { label: 'Read MiB/s',  data: bytesRMiBs, borderColor: '#6cc1ff',
+        backgroundColor: 'rgba(108,193,255,0.10)', fill: true, tension: 0.25, pointRadius: 0 },
+    ],
+  },
+  options: baseOpts,
+  plugins: [annotationPlugin],
+});
+
+new Chart(document.getElementById('chartOps'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [
+      { label: 'Writes/s', data: writesPerSec, borderColor: '#6dd17e', tension: 0.2, pointRadius: 0, fill: false },
+      { label: 'Reads/s',  data: readsPerSec,  borderColor: '#6cc1ff', tension: 0.2, pointRadius: 0, fill: false, yAxisID: 'y2' },
+    ],
+  },
+  options: {
+    ...baseOpts,
+    scales: {
+      x: baseOpts.scales.x,
+      y:  { ...baseOpts.scales.y, position: 'left', title: { display: true, text: 'writes/s', color: '#6dd17e' } },
+      y2: { ...baseOpts.scales.y, position: 'right', title: { display: true, text: 'reads/s', color: '#6cc1ff' }, grid: { drawOnChartArea: false } },
+    },
+  },
+  plugins: [annotationPlugin],
+});
+
+new Chart(document.getElementById('chartSuccess'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [
+      { label: '% writes succeeded', data: successPct, borderColor: '#ffce6d',
+        backgroundColor: 'rgba(255,206,109,0.15)', fill: true, tension: 0.2, pointRadius: 0 },
+    ],
+  },
+  options: {
+    ...baseOpts,
+    scales: {
+      x: baseOpts.scales.x,
+      y: { ...baseOpts.scales.y, suggestedMin: 0, suggestedMax: 100, ticks: { ...baseOpts.scales.y.ticks, callback: v => v + '%' } },
+    },
+  },
+  plugins: [annotationPlugin],
+});
+
+new Chart(document.getElementById('chartCumBytes'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [
+      { label: 'Cumulative MiB written',
+        data: cumBytesW.map(v => v / (1024*1024)),
+        borderColor: '#6dd17e', backgroundColor: 'rgba(109,209,126,0.15)',
+        fill: true, tension: 0.1, pointRadius: 0 },
+      { label: 'Cumulative MiB read',
+        data: cumBytesR.map(v => v / (1024*1024)),
+        borderColor: '#6cc1ff', backgroundColor: 'rgba(108,193,255,0.10)',
+        fill: true, tension: 0.1, pointRadius: 0,
+        yAxisID: 'y2' },
+    ],
+  },
+  options: {
+    ...baseOpts,
+    scales: {
+      x: baseOpts.scales.x,
+      y:  { ...baseOpts.scales.y, position: 'left', title: { display: true, text: 'MiB written', color: '#6dd17e' } },
+      y2: { ...baseOpts.scales.y, position: 'right', title: { display: true, text: 'MiB read', color: '#6cc1ff' }, grid: { drawOnChartArea: false } },
+    },
+  },
+  plugins: [annotationPlugin],
+});
+</script>
+</body>
+</html>

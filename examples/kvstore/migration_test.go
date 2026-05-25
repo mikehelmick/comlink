@@ -206,7 +206,7 @@ func TestKVStoreReplicaMigrationToNewNode(t *testing.T) {
 	t.Logf("phase B: converged — %.1f MiB per replica", float64(numKeys*payloadBytes)/(1024*1024))
 
 	// ─── Phase C: wait for carol to snapshot to disk ──────────
-	carolSnapPath := filepath.Join(carolSnapDir, "state.snap")
+	carolSnapPath := filepath.Join(carolSnapDir, "state.snap.pb")
 	waitSnapshotCovers(t, carolSnapPath, want, 5*time.Second)
 	preMigrateSize := mustStatSize(t, carolSnapPath)
 	t.Logf("phase C: carol snapshot persisted (%.1f MiB on disk)", float64(preMigrateSize)/(1024*1024))

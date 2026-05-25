@@ -39,7 +39,6 @@ package kvstore
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -47,6 +46,9 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+
+	kvpb "github.com/mikehelmick/comlink/internal/pb/kvstore/v1"
+	"google.golang.org/protobuf/proto"
 	"time"
 
 	"github.com/mikehelmick/comlink"
@@ -116,22 +118,12 @@ var (
 	)
 )
 
-// ─── command schema ─────────────────────────────────────────────
-
-type opKind string
-
-const (
-	opSet    opKind = "set"
-	opDelete opKind = "del"
-)
-
-// command is the wire-encoded mutation. JSON keeps the demo
-// readable; production apps would use protobuf.
-type command struct {
-	Op opKind `json:"op"`
-	K  string `json:"k"`
-	V  string `json:"v,omitempty"`
-}
+// ─── command schema (proto kvstore.v1.Command) ──────────────────
+//
+// On-the-wire mutations are protobuf (kvpb.Command). Wire-format
+// previously was JSON; protobuf cut both encode time and per-
+// message bytes substantially, which directly relieves substrate
+// genserver contention under heavy concurrent writers.
 
 // ─── events (Watch) ─────────────────────────────────────────────
 
@@ -233,18 +225,14 @@ type Config struct {
 	BootstrapFromSponsor bool
 }
 
-// snapshotPayload is the on-disk format. Versioned implicitly
-// via the field tags; production apps would want explicit
-// version + migration.
-type snapshotPayload struct {
-	ThroughOffset uint64            `json:"through_offset"`
-	Data          map[string]string `json:"data"`
-}
-
+// On-disk format: protobuf-encoded kvpb.Snapshot. The file is
+// named state.snap.pb so it can't be confused with the previous
+// JSON-encoded state.snap from earlier versions; mixing them
+// would silently produce a parse error at startup.
 const (
 	defaultSnapshotInterval = 10 * time.Second
-	snapshotFileName        = "state.snap"
-	snapshotTempName        = "state.snap.tmp"
+	snapshotFileName        = "state.snap.pb"
+	snapshotTempName        = "state.snap.pb.tmp"
 )
 
 // New constructs a Store and its backing Substrate. Errors from
@@ -318,9 +306,9 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 	return s, nil
 }
 
-// loadDiskSnapshot reads SnapshotDir/state.snap and returns a
-// *comlink.Snapshot whose Bytes are the on-disk JSON. Returns
-// (nil, nil) if the file doesn't exist (fresh install).
+// loadDiskSnapshot reads SnapshotDir/state.snap.pb and returns
+// a *comlink.Snapshot whose Bytes are the on-disk protobuf.
+// Returns (nil, nil) if the file doesn't exist (fresh install).
 func loadDiskSnapshot(dir string) (*comlink.Snapshot, error) {
 	path := filepath.Join(dir, snapshotFileName)
 	bs, err := os.ReadFile(path)
@@ -331,13 +319,13 @@ func loadDiskSnapshot(dir string) (*comlink.Snapshot, error) {
 		return nil, err
 	}
 	// Sanity-check it parses before handing it to the substrate.
-	var p snapshotPayload
-	if err := json.Unmarshal(bs, &p); err != nil {
+	var p kvpb.Snapshot
+	if err := proto.Unmarshal(bs, &p); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return &comlink.Snapshot{
 		Bytes:         bs,
-		ThroughOffset: p.ThroughOffset,
+		ThroughOffset: p.GetThroughOffset(),
 	}, nil
 }
 
@@ -420,18 +408,28 @@ func (s *Store) writeSnapshot() error {
 
 // Snapshot implements comlink.Snapshotter — serializes the
 // current state + the highest applied offset. The byte form is
-// the same JSON layout the Store writes to disk.
+// kvpb.Snapshot (protobuf).
+//
+// IMPORTANT: the data lock is released BEFORE the
+// proto.Marshal so the (still nontrivial) serialization of
+// large state maps doesn't block Apply / Set / Delete. Apply
+// callers see the post-copy state machine; the marshal sees
+// a frozen snapshot of the data at copy time.
 func (s *Store) Snapshot() ([]byte, uint64, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	copied := make(map[string]string, len(s.data))
+	entries := make([]*kvpb.SnapshotEntry, 0, len(s.data))
 	for k, v := range s.data {
-		copied[k] = v
+		entries = append(entries, &kvpb.SnapshotEntry{
+			Key:   k,
+			Value: []byte(v),
+		})
 	}
 	throughOff := s.maxOff.Load()
-	bs, err := json.Marshal(snapshotPayload{
+	s.mu.RUnlock()
+
+	bs, err := proto.Marshal(&kvpb.Snapshot{
 		ThroughOffset: throughOff,
-		Data:          copied,
+		Entries:       entries,
 	})
 	return bs, throughOff, err
 }
@@ -444,14 +442,18 @@ func (s *Store) Restore(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	var p snapshotPayload
-	if err := json.Unmarshal(bs, &p); err != nil {
+	var p kvpb.Snapshot
+	if err := proto.Unmarshal(bs, &p); err != nil {
 		return err
+	}
+	rebuilt := make(map[string]string, len(p.GetEntries()))
+	for _, e := range p.GetEntries() {
+		rebuilt[e.GetKey()] = string(e.GetValue())
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data = p.Data
-	s.maxOff.Store(p.ThroughOffset)
+	s.data = rebuilt
+	s.maxOff.Store(p.GetThroughOffset())
 	metricKVKeys.Set(float64(len(s.data)))
 	return nil
 }
@@ -495,20 +497,21 @@ func (s *Store) Close() error {
 // Apply implements comlink.StateMachine. Runs on every replica
 // in the same total order. Must be pure / deterministic.
 func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
-	var c command
-	if err := json.Unmarshal(msg.Payload, &c); err != nil {
+	var c kvpb.Command
+	if err := proto.Unmarshal(msg.Payload, &c); err != nil {
 		metricKVApply.WithLabelValues("malformed").Inc()
 		return // malformed command — ignore deterministically.
 	}
+	key := c.GetKey()
+	val := string(c.GetValue())
 	s.mu.Lock()
-	prior, had := s.data[c.K]
-	_ = prior
-	switch c.Op {
-	case opSet:
-		s.data[c.K] = c.V
+	_, had := s.data[key]
+	switch c.GetOp() {
+	case kvpb.Op_OP_SET:
+		s.data[key] = val
 		metricKVApply.WithLabelValues("set").Inc()
-	case opDelete:
-		delete(s.data, c.K)
+	case kvpb.Op_OP_DELETE:
+		delete(s.data, key)
 		metricKVApply.WithLabelValues("del").Inc()
 	default:
 		s.mu.Unlock()
@@ -531,12 +534,12 @@ func (s *Store) Apply(ctx context.Context, msg *comlink.Message) {
 
 	// Fan out to watchers AFTER releasing the data lock so a
 	// slow watcher can't block other Apply calls.
-	switch c.Op {
-	case opSet:
-		s.notify(c.K, Event{Type: EventSet, Key: c.K, Value: c.V, PriorExists: had})
-	case opDelete:
+	switch c.GetOp() {
+	case kvpb.Op_OP_SET:
+		s.notify(key, Event{Type: EventSet, Key: key, Value: val, PriorExists: had})
+	case kvpb.Op_OP_DELETE:
 		if had {
-			s.notify(c.K, Event{Type: EventDelete, Key: c.K, PriorExists: true})
+			s.notify(key, Event{Type: EventDelete, Key: key, PriorExists: true})
 		}
 	}
 }
@@ -562,7 +565,11 @@ func (s *Store) Get(key string) (string, bool) {
 // the global order). Peers will see it shortly after via the
 // substrate.
 func (s *Store) Set(ctx context.Context, key, value string) error {
-	bs, err := json.Marshal(command{Op: opSet, K: key, V: value})
+	bs, err := proto.Marshal(&kvpb.Command{
+		Op:    kvpb.Op_OP_SET,
+		Key:   key,
+		Value: []byte(value),
+	})
 	if err != nil {
 		return fmt.Errorf("kvstore: marshal Set: %w", err)
 	}
@@ -573,7 +580,10 @@ func (s *Store) Set(ctx context.Context, key, value string) error {
 // Delete issues a "delete k" command. Returns when Apply'd
 // locally. No-op (still ordered) if the key is absent.
 func (s *Store) Delete(ctx context.Context, key string) error {
-	bs, err := json.Marshal(command{Op: opDelete, K: key})
+	bs, err := proto.Marshal(&kvpb.Command{
+		Op:  kvpb.Op_OP_DELETE,
+		Key: key,
+	})
 	if err != nil {
 		return fmt.Errorf("kvstore: marshal Delete: %w", err)
 	}

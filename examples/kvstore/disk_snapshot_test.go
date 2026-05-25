@@ -109,7 +109,7 @@ func TestKVStoreDiskSnapshotRecovery(t *testing.T) {
 	// Wait until the snapshot loop has written at least one
 	// snapshot covering all 20 writes. The loop fires every
 	// 50ms and only writes when maxOff has advanced.
-	snapPath := filepath.Join(snapDir, "state.snap")
+	snapPath := filepath.Join(snapDir, "state.snap.pb")
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		if _, err := os.Stat(snapPath); err == nil {

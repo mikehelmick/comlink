@@ -1,0 +1,63 @@
+// Copyright 2026 the comlink authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package kvstore.v1;
+
+option go_package = "github.com/mikehelmick/comlink/internal/pb/kvstore/v1;kvstorepb";
+
+// Op identifies the kind of mutation a Command represents.
+enum Op {
+  OP_UNSPECIFIED = 0;
+  OP_SET = 1;
+  OP_DELETE = 2;
+}
+
+// Command is the per-write payload submitted via the substrate.
+// Encodes either Op_SET (key, value) or Op_DELETE (key).
+//
+// On the wire this replaces the prior JSON shape
+// `{"op":"set","k":"...","v":"..."}` — protobuf is ~3-5x faster
+// to encode/decode and the wire format is smaller (no field
+// names, varint integers, length-delimited bytes).
+message Command {
+  Op op = 1;
+  string key = 2;
+  // Value is bytes (not string) so binary payloads roundtrip
+  // cleanly. The public Store API keeps strings for backward
+  // compatibility; the conversion to bytes happens at the
+  // Set/Apply boundary.
+  bytes value = 3;
+}
+
+// Snapshot is the on-disk + over-wire format for the full
+// state. Written by Store.writeSnapshot to state.snap.pb and
+// streamed to joiners via the substrate's StreamSnapshot RPC.
+//
+// Versioning: increment the package (kvstore.v2) when the
+// shape changes incompatibly. Restore checks the magic+version
+// header below.
+message Snapshot {
+  // Highest log offset whose Apply is reflected in `entries`.
+  uint64 through_offset = 1;
+  // Full key→value map serialized as a repeated message. Order
+  // is unspecified on the wire; readers reconstruct the map.
+  repeated SnapshotEntry entries = 2;
+}
+
+message SnapshotEntry {
+  string key = 1;
+  bytes value = 2;
+}
