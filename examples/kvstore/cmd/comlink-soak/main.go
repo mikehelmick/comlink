@@ -96,22 +96,68 @@ type stats struct {
 	restarts    atomic.Uint64
 	bytesWrite  atomic.Uint64 // total bytes of value payloads successfully PUT
 	bytesReadOK atomic.Uint64 // total bytes successfully GET (200s)
+
+	// Per-cause write-failure counters. Split out to separate
+	// server-side failures (timeouts, 5xx) from client-side
+	// failures (socket exhaustion, EOF). The previous "writes
+	// FAIL" lump conflated both, leading to wrong conclusions
+	// about substrate behavior.
+	failTimeout       atomic.Uint64 // ctx deadline exceeded
+	failSockExhausted atomic.Uint64 // can't assign requested address
+	failConnRefused   atomic.Uint64 // connect: connection refused
+	failConnReset     atomic.Uint64 // EOF / RST after handshake
+	failStatus5xx     atomic.Uint64 // server-side error response
+	failOther         atomic.Uint64 // anything else
 }
 
 type statsSnap struct {
-	wo, wf, ro, rf, rm, rs, bw, br uint64
+	wo, wf, ro, rf, rm, rs, bw, br             uint64
+	ftTimeout, ftSock, ftRefused, ftReset, ft5 uint64
+	ftOther                                    uint64
 }
 
 func (s *stats) snapshot() statsSnap {
 	return statsSnap{
-		wo: s.writesOK.Load(),
-		wf: s.writesFail.Load(),
-		ro: s.readsOK.Load(),
-		rf: s.readsFail.Load(),
-		rm: s.readsMiss.Load(),
-		rs: s.restarts.Load(),
-		bw: s.bytesWrite.Load(),
-		br: s.bytesReadOK.Load(),
+		wo: s.writesOK.Load(), wf: s.writesFail.Load(),
+		ro: s.readsOK.Load(), rf: s.readsFail.Load(),
+		rm: s.readsMiss.Load(), rs: s.restarts.Load(),
+		bw: s.bytesWrite.Load(), br: s.bytesReadOK.Load(),
+		ftTimeout: s.failTimeout.Load(),
+		ftSock:    s.failSockExhausted.Load(),
+		ftRefused: s.failConnRefused.Load(),
+		ftReset:   s.failConnReset.Load(),
+		ft5:       s.failStatus5xx.Load(),
+		ftOther:   s.failOther.Load(),
+	}
+}
+
+// recordWriteFailure classifies an error into one of the
+// failure-cause buckets. The strings come from Go's net/http
+// + net stack wrapped error chains.
+func (s *stats) recordWriteFailure(err error) {
+	s.writesFail.Add(1)
+	if err == nil {
+		s.failOther.Add(1)
+		return
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "context deadline exceeded"),
+		strings.Contains(msg, "Client.Timeout exceeded"):
+		s.failTimeout.Add(1)
+	case strings.Contains(msg, "can't assign requested address"),
+		strings.Contains(msg, "cannot assign requested address"):
+		s.failSockExhausted.Add(1)
+	case strings.Contains(msg, "connection refused"):
+		s.failConnRefused.Add(1)
+	case strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "EOF"),
+		strings.Contains(msg, "broken pipe"):
+		s.failConnReset.Add(1)
+	case strings.Contains(msg, "PUT status 5"):
+		s.failStatus5xx.Add(1)
+	default:
+		s.failOther.Add(1)
 	}
 }
 
@@ -198,6 +244,14 @@ func main() {
 	fmt.Printf("  pod restarts  : %d\n", snap.rs)
 	fmt.Printf("  bytes written : %s\n", humanBytes(snap.bw))
 	fmt.Printf("  bytes read    : %s\n", humanBytes(snap.br))
+	fmt.Println()
+	fmt.Println("  write-failure breakdown:")
+	fmt.Printf("    timeout (ctx)            : %d\n", snap.ftTimeout)
+	fmt.Printf("    socket exhausted (client): %d\n", snap.ftSock)
+	fmt.Printf("    connection refused       : %d\n", snap.ftRefused)
+	fmt.Printf("    connection reset / EOF   : %d\n", snap.ftReset)
+	fmt.Printf("    HTTP 5xx (server-side)   : %d\n", snap.ft5)
+	fmt.Printf("    other                    : %d\n", snap.ftOther)
 	if snap.wo+snap.ro == 0 {
 		fmt.Fprintln(os.Stderr, "no successful operations — something is wrong")
 		os.Exit(1)
@@ -218,9 +272,32 @@ func main() {
 
 // ─── load generators ─────────────────────────────────────────────
 
+// sharedTransport is a single http.Transport reused across all
+// writer + reader goroutines. The default per-host idle-conn
+// cap of 2 isn't enough for our concurrency — once exceeded,
+// connections get closed and ephemeral source ports go to
+// TIME_WAIT, and we run out of source ports in seconds. With
+// a large idle-conn cap and keep-alive enabled, every goroutine
+// reuses a small pool of long-lived connections.
+var sharedTransport = &http.Transport{
+	MaxIdleConns:        512,
+	MaxIdleConnsPerHost: 256,
+	MaxConnsPerHost:     256,
+	IdleConnTimeout:     120 * time.Second,
+	DisableKeepAlives:   false,
+	ForceAttemptHTTP2:   false,
+}
+
+func newSoakClient() *http.Client {
+	return &http.Client{
+		Transport: sharedTransport,
+		Timeout:   *flagOpTimeout,
+	}
+}
+
 func writer(ctx context.Context, wg *sync.WaitGroup, s *stats, id int) {
 	defer wg.Done()
-	client := &http.Client{Timeout: *flagOpTimeout}
+	client := newSoakClient()
 	// Pre-allocate a payload buffer when in bulk mode. We refresh
 	// the first 8 bytes each iteration with a unique stamp so the
 	// payload isn't byte-identical run to run (helps catch any
@@ -254,7 +331,7 @@ func writer(ctx context.Context, wg *sync.WaitGroup, s *stats, id int) {
 			size = len(val)
 		}
 		if err := doPutBody(ctx, client, key, body); err != nil {
-			s.writesFail.Add(1)
+			s.recordWriteFailure(err)
 		} else {
 			s.writesOK.Add(1)
 			s.bytesWrite.Add(uint64(size))
@@ -269,7 +346,7 @@ func writer(ctx context.Context, wg *sync.WaitGroup, s *stats, id int) {
 func reader(ctx context.Context, wg *sync.WaitGroup, s *stats, id int) {
 	defer wg.Done()
 	_ = id
-	client := &http.Client{Timeout: *flagOpTimeout}
+	client := newSoakClient()
 	for {
 		select {
 		case <-ctx.Done():

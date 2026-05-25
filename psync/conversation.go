@@ -630,17 +630,44 @@ func (s *serverImpl) handleSend(st *state, payload []byte) (*pb.MessageID, error
 	if err != nil {
 		return nil, err
 	}
-	for _, peer := range s.membership.Replicas() {
+	// Snapshot the peer list while we still hold the genserver
+	// goroutine so the broadcast goroutine sees a consistent
+	// membership view at SEND time. The actual network.Send
+	// calls happen OFF the genserver — they're independent of
+	// the conversation's protected state, so serializing them
+	// here would just throttle Submit throughput.
+	peers := s.membership.Replicas()
+	go s.broadcastEnvelope(peers, wireBytes)
+	return id, nil
+}
+
+// broadcastEnvelope is the fire-and-forget peer fan-out for a
+// Send. Runs OUTSIDE the genserver goroutine (the caller spawns
+// it) so concurrent Submits don't serialize behind network I/O.
+//
+// Each peer Send runs in its own goroutine so a slow peer
+// doesn't delay sends to faster ones. Failures are logged and
+// dropped; recovery is the peer's job via the lost-message
+// protocol (peer detects the gap on its next inbound message
+// and requests the missing entry).
+//
+// Ordering note: with broadcast off the genserver, two Submits
+// S1 → S2 may arrive at a peer in either order. psync already
+// handles out-of-order arrival via vector-clock gap detection +
+// deferral, so this doesn't violate the protocol's guarantees.
+func (s *serverImpl) broadcastEnvelope(peers []*pb.ReplicaID, wireBytes []byte) {
+	for _, peer := range peers {
 		if bytes.Equal(peer.GetValue(), s.self.GetValue()) {
 			continue
 		}
-		if err := s.network.Send(context.Background(), peer, wireBytes); err != nil {
-			s.logger.Warn("psync: send to peer failed",
-				"peer", fmt.Sprintf("%x", peer.GetValue()),
-				"err", err)
-		}
+		go func(p *pb.ReplicaID) {
+			if err := s.network.Send(context.Background(), p, wireBytes); err != nil {
+				s.logger.Warn("psync: send to peer failed",
+					"peer", fmt.Sprintf("%x", p.GetValue()),
+					"err", err)
+			}
+		}(peer)
 	}
-	return id, nil
 }
 
 func (s *serverImpl) handleIncoming(st *state, from *pb.ReplicaID, data []byte) {

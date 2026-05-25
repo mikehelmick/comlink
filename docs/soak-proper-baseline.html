@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>comlink soak — proper baseline</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1419;
+    --surface: #1a1f2e;
+    --surface-2: #232a3d;
+    --text: #e6e8eb;
+    --text-dim: #9aa3b2;
+    --accent: #6cc1ff;
+    --good: #6dd17e;
+    --bad: #ff7575;
+    --warn: #ffce6d;
+    --border: #2a3145;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+  }
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+  }
+  header h1 {
+    margin: 0 0 4px;
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  header .subtitle {
+    color: var(--text-dim);
+    font-size: 14px;
+    margin-bottom: 24px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px 20px;
+  }
+  .card.kpi {
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .kpi .label {
+    color: var(--text-dim);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .kpi .value {
+    font-size: 24px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .kpi .value.good { color: var(--good); }
+  .kpi .value.bad { color: var(--bad); }
+  .kpi .value.warn { color: var(--warn); }
+  .card.chart {
+    padding: 16px 18px 12px;
+  }
+  .card.chart h2 {
+    margin: 0 0 12px;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .card.chart h2 .hint {
+    font-weight: 400;
+    color: var(--text-dim);
+    font-size: 12px;
+    margin-left: 8px;
+  }
+  .chart-wrap {
+    position: relative;
+    height: 240px;
+  }
+  .chart-wrap.tall {
+    height: 320px;
+  }
+  table.summary {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+  table.summary td {
+    padding: 8px 12px;
+    border-top: 1px solid var(--border);
+  }
+  table.summary td:first-child {
+    color: var(--text-dim);
+    width: 50%;
+  }
+  table.summary td:last-child {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .narrative {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 16px 22px;
+    margin: 24px 0;
+  }
+  .narrative h2 {
+    margin: 0 0 8px;
+    font-size: 16px;
+  }
+  .narrative p {
+    margin: 0 0 8px;
+    color: var(--text-dim);
+    font-size: 14px;
+  }
+  .narrative p:last-child { margin-bottom: 0; }
+  .annotations-list {
+    list-style: none;
+    padding: 0; margin: 0;
+  }
+  .annotations-list li {
+    padding: 8px 0;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .annotations-list li:first-child { border-top: none; }
+  .annotations-list .tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    background: var(--surface-2);
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+    margin-right: 8px;
+    font-variant-numeric: tabular-nums;
+  }
+  footer {
+    margin-top: 32px;
+    color: var(--text-dim);
+    font-size: 12px;
+    text-align: center;
+  }
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 800px) {
+    .two-col { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>comlink soak — proper baseline</h1>
+    <div class="subtitle">Same params &#43; protobuf &#43; lockfix &#43; broadcast-off-genserver &#43; shared http.Transport. 300 MiB in 120s, 99.83% write success rate. Substrate is healthy; earlier failures were a soak-driver bug.</div>
+    <div class="subtitle">Generated Sun, 24 May 2026 21:58:21 PDT · Run window Mon, 25 May 2026 04:35:55 UTC → Mon, 25 May 2026 04:37:55 UTC (2m0s)</div>
+  </header>
+
+  <section class="grid">
+    <div class="card kpi"><span class="label">Bytes written</span><span class="value good">292.94 MiB</span></div>
+    <div class="card kpi"><span class="label">Bytes read</span><span class="value">74.53 GiB</span></div>
+    <div class="card kpi"><span class="label">Write success</span><span class="value">100.0%</span></div>
+    <div class="card kpi"><span class="label">Peak write throughput</span><span class="value">2.54 MiB/s</span></div>
+    <div class="card kpi"><span class="label">Peak read throughput</span><span class="value">935.86 MiB/s</span></div>
+  </section>
+
+  <div class="card chart" style="margin-bottom: 16px;">
+    <h2>Throughput over time <span class="hint">MiB/sec, write + read</span></h2>
+    <div class="chart-wrap tall"><canvas id="chartThroughput"></canvas></div>
+  </div>
+
+  <div class="two-col">
+    <div class="card chart">
+      <h2>Operations per second <span class="hint">writes vs. reads</span></h2>
+      <div class="chart-wrap"><canvas id="chartOps"></canvas></div>
+    </div>
+    <div class="card chart">
+      <h2>Write success rate <span class="hint">% of attempts in interval</span></h2>
+      <div class="chart-wrap"><canvas id="chartSuccess"></canvas></div>
+    </div>
+  </div>
+
+  <div class="card chart" style="margin-top: 16px;">
+    <h2>Cumulative bytes <span class="hint">total written + read since start</span></h2>
+    <div class="chart-wrap"><canvas id="chartCumBytes"></canvas></div>
+  </div>
+
+  <div class="two-col" style="margin-top: 24px;">
+    <div class="card">
+      <h2 style="margin-top: 0; font-size: 16px;">Run summary</h2>
+      <table class="summary">
+        <tr><td>Total writes OK</td><td>4687</td></tr>
+        <tr><td>Total writes FAIL</td><td>0</td></tr>
+        <tr><td>Total reads OK</td><td>1221086</td></tr>
+        <tr><td>Total reads MISS (404)</td><td>2059386</td></tr>
+        <tr><td>Total reads FAIL</td><td>0</td></tr>
+        <tr><td>Bytes written</td><td>292.94 MiB</td></tr>
+        <tr><td>Bytes read</td><td>74.53 GiB</td></tr>
+        <tr><td>Write success rate</td><td>100.0%</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h2 style="margin-top: 0; font-size: 16px;">Timeline annotations</h2>
+      
+      <p style="color: var(--text-dim); margin: 0;">No annotations recorded for this run.</p>
+      
+    </div>
+  </div>
+
+  <footer>
+    Generated by <code>comlink/examples/kvstore/cmd/render-soak</code>.
+    Charts powered by Chart.js. Source JSONL: <code>2m0s</code> window, 25 ticks.
+  </footer>
+</div>
+
+<script>
+const labels = ["00:00","00:05","00:10","00:15","00:20","00:25","00:29","00:34","00:40","00:45","00:50","00:54","01:00","01:04","01:10","01:14","01:20","01:25","01:30","01:34","01:40","01:45","01:49","01:55","02:00"];
+const writesPerSec = [36.4,40.2,36.8,40.6,35.2,39.6,36.2,39.2,36.6,39.2,36.4,39.2,36.6,39.2,36.4,39.2,34.6,39.2,35.2,39.2,35.4,39.2,34,39.6,34];
+const readsPerSec  = [680.2,2503.8,3509.6,5660.8,5712.4,7735.2,7065,9607.8,8691.6,10615.2,9523.2,12172.4,10087,12811.2,10439.6,12900.6,10676.8,12618.4,11689,13551.6,12453.6,14973.8,12124.4,14267,12147];
+const bytesWMiBs   = [2.275,2.5125,2.3,2.5375,2.2,2.475,2.2625,2.45,2.2875,2.45,2.275,2.45,2.2875,2.45,2.275,2.45,2.1625,2.45,2.2,2.45,2.2125,2.45,2.125,2.475,2.125];
+const bytesRMiBs   = [42.5125,156.4875,219.35,353.8,357.025,483.45,441.5625,600.4875,543.225,663.45,595.2,760.775,630.4375,800.7,652.475,806.2875,667.3,788.65,730.5625,846.975,778.35,935.8625,757.775,891.6875,759.1875];
+const cumBytesW    = [11927552,25100288,37158912,50462720,61997056,74973184,86835200,99680256,111673344,124518400,136445952,149291008,161284096,174129152,186056704,198901760,210239488,223084544,234618880,247463936,259063808,271908864,283049984,296026112,307167232];
+const cumBytesR    = [222887936,1043333120,2193358848,4048289792,5920129024,8454799360,10769858560,13918142464,16766205952,20244594688,23365156864,27353808896,30659117056,34857091072,38277939200,42505207808,46003781632,50138578944,53968830464,58409418752,62490214400,67396829184,71369752576,76044763136,80025092096];
+const successPct   = [100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100];
+const annotations  = null;
+
+
+
+const annotationPlugin = {
+  id: 'annotationLines',
+  afterDraw(chart) {
+    const {ctx, chartArea: {top, bottom}, scales: {x}} = chart;
+    if (!x || !annotations || annotations.length === 0) return;
+    ctx.save();
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    annotations.forEach((a, i) => {
+      const idx = Math.min(a.index, labels.length - 1);
+      const xPos = x.getPixelForValue(idx);
+      const color = a.label.includes('migrate') ? '#ffce6d' : '#6cc1ff';
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(xPos, top);
+      ctx.lineTo(xPos, bottom);
+      ctx.stroke();
+      
+      
+      if (chart.canvas.id === 'chartThroughput') {
+        ctx.setLineDash([]);
+        ctx.fillStyle = color;
+        ctx.font = 'bold 11px sans-serif';
+        const labelText = a.label;
+        const textW = ctx.measureText(labelText).width;
+        const boxX = xPos + 4;
+        const boxY = top + 8 + (i * 18);
+        ctx.fillRect(boxX, boxY, textW + 8, 16);
+        ctx.fillStyle = '#0f1419';
+        ctx.fillText(labelText, boxX + 4, boxY + 12);
+      }
+    });
+    ctx.restore();
+  }
+};
+
+const baseOpts = {
+  responsive: true,
+  maintainAspectRatio: false,
+  interaction: { mode: 'index', intersect: false },
+  scales: {
+    x: {
+      ticks: { color: '#9aa3b2', maxRotation: 0, autoSkipPadding: 24 },
+      grid: { color: 'rgba(154,163,178,0.08)' },
+    },
+    y: {
+      ticks: { color: '#9aa3b2' },
+      grid: { color: 'rgba(154,163,178,0.08)' },
+      beginAtZero: true,
+    },
+  },
+  plugins: {
+    legend: { labels: { color: '#e6e8eb', boxWidth: 14 } },
+    tooltip: {
+      backgroundColor: '#0f1419',
+      borderColor: '#2a3145',
+      borderWidth: 1,
+      titleColor: '#e6e8eb',
+      bodyColor: '#e6e8eb',
+    },
+  },
+};
+
+new Chart(document.getElementById('chartThroughput'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [
+      { label: 'Write MiB/s', data: bytesWMiBs, borderColor: '#6dd17e',
+        backgroundColor: 'rgba(109,209,126,0.15)', fill: true, tension: 0.25, pointRadius: 0 },
+      { label: 'Read MiB/s',  data: bytesRMiBs, borderColor: '#6cc1ff',
+        backgroundColor: 'rgba(108,193,255,0.10)', fill: true, tension: 0.25, pointRadius: 0 },
+    ],
+  },
+  options: baseOpts,
+  plugins: [annotationPlugin],
+});
+
+new Chart(document.getElementById('chartOps'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [
+      { label: 'Writes/s', data: writesPerSec, borderColor: '#6dd17e', tension: 0.2, pointRadius: 0, fill: false },
+      { label: 'Reads/s',  data: readsPerSec,  borderColor: '#6cc1ff', tension: 0.2, pointRadius: 0, fill: false, yAxisID: 'y2' },
+    ],
+  },
+  options: {
+    ...baseOpts,
+    scales: {
+      x: baseOpts.scales.x,
+      y:  { ...baseOpts.scales.y, position: 'left', title: { display: true, text: 'writes/s', color: '#6dd17e' } },
+      y2: { ...baseOpts.scales.y, position: 'right', title: { display: true, text: 'reads/s', color: '#6cc1ff' }, grid: { drawOnChartArea: false } },
+    },
+  },
+  plugins: [annotationPlugin],
+});
+
+new Chart(document.getElementById('chartSuccess'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [
+      { label: '% writes succeeded', data: successPct, borderColor: '#ffce6d',
+        backgroundColor: 'rgba(255,206,109,0.15)', fill: true, tension: 0.2, pointRadius: 0 },
+    ],
+  },
+  options: {
+    ...baseOpts,
+    scales: {
+      x: baseOpts.scales.x,
+      y: { ...baseOpts.scales.y, suggestedMin: 0, suggestedMax: 100, ticks: { ...baseOpts.scales.y.ticks, callback: v => v + '%' } },
+    },
+  },
+  plugins: [annotationPlugin],
+});
+
+new Chart(document.getElementById('chartCumBytes'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [
+      { label: 'Cumulative MiB written',
+        data: cumBytesW.map(v => v / (1024*1024)),
+        borderColor: '#6dd17e', backgroundColor: 'rgba(109,209,126,0.15)',
+        fill: true, tension: 0.1, pointRadius: 0 },
+      { label: 'Cumulative MiB read',
+        data: cumBytesR.map(v => v / (1024*1024)),
+        borderColor: '#6cc1ff', backgroundColor: 'rgba(108,193,255,0.10)',
+        fill: true, tension: 0.1, pointRadius: 0,
+        yAxisID: 'y2' },
+    ],
+  },
+  options: {
+    ...baseOpts,
+    scales: {
+      x: baseOpts.scales.x,
+      y:  { ...baseOpts.scales.y, position: 'left', title: { display: true, text: 'MiB written', color: '#6dd17e' } },
+      y2: { ...baseOpts.scales.y, position: 'right', title: { display: true, text: 'MiB read', color: '#6cc1ff' }, grid: { drawOnChartArea: false } },
+    },
+  },
+  plugins: [annotationPlugin],
+});
+</script>
+</body>
+</html>
