@@ -55,7 +55,7 @@ import (
 // ─── flags ───────────────────────────────────────────────────────
 
 var (
-	flagTargetURL    = flag.String("target", "http://127.0.0.1:30080", "kvd HTTP NodePort URL")
+	flagTargetURL    = flag.String("target", "http://127.0.0.1:30080", "kvd HTTP target URL(s). Comma-separated list round-robins each request across the listed front-ends (e.g. 'http://127.0.0.1:8100,http://127.0.0.1:8101,http://127.0.0.1:8102').")
 	flagNamespace    = flag.String("namespace", "comlink", "Kubernetes namespace")
 	flagStsName      = flag.String("sts", "comlink-kvd", "StatefulSet name")
 	flagReplicas     = flag.Int("replicas", 3, "expected number of replicas")
@@ -165,21 +165,24 @@ func (s *stats) recordWriteFailure(err error) {
 
 func main() {
 	flag.Parse()
+	initTargets()
 
-	fmt.Printf("comlink-soak: target=%s duration=%s restart-every=%s writers=%d readers=%d keyspace=%d\n",
-		*flagTargetURL, *flagDuration, *flagRestartEvery, *flagWriters, *flagReaders, *flagKeyspace)
+	fmt.Printf("comlink-soak: targets=%v duration=%s restart-every=%s writers=%d readers=%d keyspace=%d\n",
+		targetURLs, *flagDuration, *flagRestartEvery, *flagWriters, *flagReaders, *flagKeyspace)
 	if *flagValueBytes > 0 {
 		fmt.Printf("comlink-soak: bulk mode — value-bytes=%d (%.1f KiB), pace-write=%s, pace-read=%s, target-mb=%d\n",
 			*flagValueBytes, float64(*flagValueBytes)/1024.0,
 			*flagPaceWrite, *flagPaceRead, *flagTargetMB)
 	}
 
-	// Sanity-check the cluster is reachable BEFORE we go.
-	if err := pingCluster(*flagTargetURL, *flagReplicas); err != nil {
-		fmt.Fprintf(os.Stderr, "pre-flight cluster check failed: %v\n", err)
-		os.Exit(1)
+	// Sanity-check each target is reachable BEFORE we go.
+	for _, t := range targetURLs {
+		if err := pingCluster(t, *flagReplicas); err != nil {
+			fmt.Fprintf(os.Stderr, "pre-flight cluster check failed for %s: %v\n", t, err)
+			os.Exit(1)
+		}
 	}
-	fmt.Println("pre-flight: cluster reachable with expected replica count")
+	fmt.Println("pre-flight: every target reachable with expected replica count")
 
 	ctx, cancel := context.WithTimeout(context.Background(), *flagDuration)
 	defer cancel()
@@ -271,6 +274,42 @@ func main() {
 }
 
 // ─── load generators ─────────────────────────────────────────────
+
+// targetURLs is the parsed list of -target values. Per-call
+// round-robin via targetCounter.Add+modulo. With a single
+// value the rotation is a no-op.
+var (
+	targetURLs    []string
+	targetCounter atomic.Uint64
+)
+
+func initTargets() {
+	parts := strings.Split(*flagTargetURL, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		out = []string{*flagTargetURL}
+	}
+	targetURLs = out
+}
+
+// nextTarget returns the next target URL in round-robin order.
+// Safe for concurrent use; ordering across writers is not
+// strictly preserved (and doesn't need to be — what matters
+// for the substrate is that requests are distributed across
+// replicas, not the precise interleaving).
+func nextTarget() string {
+	if len(targetURLs) == 1 {
+		return targetURLs[0]
+	}
+	i := targetCounter.Add(1) - 1
+	return targetURLs[int(i%uint64(len(targetURLs)))]
+}
 
 // sharedTransport is a single http.Transport reused across all
 // writer + reader goroutines. The default per-host idle-conn
@@ -380,7 +419,7 @@ func doPut(ctx context.Context, client *http.Client, key, val string) error {
 
 func doPutBody(ctx context.Context, client *http.Client, key string, body io.Reader) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
-		fmt.Sprintf("%s/kv/%s", *flagTargetURL, key),
+		fmt.Sprintf("%s/kv/%s", nextTarget(), key),
 		body)
 	if err != nil {
 		return err
@@ -399,7 +438,7 @@ func doPutBody(ctx context.Context, client *http.Client, key string, body io.Rea
 
 func doGetWithLen(ctx context.Context, client *http.Client, key string) (int, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		fmt.Sprintf("%s/kv/%s", *flagTargetURL, key), nil)
+		fmt.Sprintf("%s/kv/%s", nextTarget(), key), nil)
 	if err != nil {
 		return 0, 0, err
 	}
