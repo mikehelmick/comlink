@@ -2,9 +2,11 @@
 #
 # Layout:
 #   1 control-plane node (kube-apiserver, scheduler, etcd, etc.)
-#   3 worker nodes — the StatefulSet has 3 replicas with
-#     podAntiAffinity, so we need at least 3 workers for each
-#     pod to land on its own node.
+#   4 worker nodes — the StatefulSet has 3 replicas with
+#     podAntiAffinity, so we provision ONE EXTRA worker to give
+#     `kubectl cordon` + `kubectl delete pod` a healthy destination
+#     to reschedule onto. The 4th node sits idle until a
+#     migration demo moves a pod onto it.
 #
 # Port-map: the host's 30080 (NodePort range) maps to the kind
 # control plane's 30080 so a developer can curl the kvd HTTP
@@ -28,6 +30,7 @@ nodes:
       - containerPort: 30030
         hostPort: 30030
         protocol: TCP
+  - role: worker
   - role: worker
   - role: worker
   - role: worker

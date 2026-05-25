@@ -13,7 +13,7 @@ IMAGE="${IMAGE:-comlink-kvd:dev}"
 if kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then
     echo "kind cluster '$CLUSTER_NAME' already exists"
 else
-    echo "creating kind cluster '$CLUSTER_NAME' (1 control plane + 3 workers)..."
+    echo "creating kind cluster '$CLUSTER_NAME' (1 control plane + 4 workers)..."
     kind create cluster \
         --name "$CLUSTER_NAME" \
         --config "$SCRIPT_DIR/kind-config.yaml" \

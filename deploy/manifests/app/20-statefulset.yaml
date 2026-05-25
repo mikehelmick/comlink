@@ -83,15 +83,19 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/comlink
-          # Resource requests deliberately modest for the local
-          # kind cluster.
+          # Sized for the scale demo: 2 vCPU + 2 GiB per pod.
+          # 50 KiB values × hundreds of thousands of keys
+          # comfortably fits in RAM; the request floor is set
+          # high enough that the scheduler will refuse to pack
+          # two replicas on a kind worker that's already hosting
+          # one (defense-in-depth alongside the podAntiAffinity).
           resources:
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: "2"
+              memory: 2Gi
             limits:
-              cpu: 500m
-              memory: 256Mi
+              cpu: "2"
+              memory: 2Gi
   volumeClaimTemplates:
     - metadata:
         name: data
