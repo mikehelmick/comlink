@@ -22,7 +22,11 @@ bootstrap, gRPC ClusterID handshake interceptor with dynamic routing,
 env-var config. Phase 6 (snapshots) is next.
 
 See [`PLAN.md`](PLAN.md) for the multi-session plan and per-phase exit
-criteria.
+criteria. For application developers, [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md)
+explains the mental model (Cluster / Conversation / Substrate /
+StateMachine), how to assign conversations to members, how to use
+the cluster-scoped conv for application metadata, snapshot recovery,
+failure handling, and observability.
 
 ## Quickstart — a replicated KV store
 
