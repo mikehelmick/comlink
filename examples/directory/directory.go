@@ -183,7 +183,7 @@ func (d *Directory) Insert(ctx context.Context, name, value string) error {
 	if err != nil {
 		return fmt.Errorf("directory: marshal Insert: %w", err)
 	}
-	return d.sub.Submit(ctx, bs)
+	_, err = d.sub.Submit(ctx, bs); return err
 }
 
 // Update overwrites (name, value) iff the name is present.
@@ -193,7 +193,7 @@ func (d *Directory) Update(ctx context.Context, name, value string) error {
 	if err != nil {
 		return fmt.Errorf("directory: marshal Update: %w", err)
 	}
-	return d.sub.Submit(ctx, bs)
+	_, err = d.sub.Submit(ctx, bs); return err
 }
 
 // Delete removes the entry. No-op if absent.
@@ -202,7 +202,7 @@ func (d *Directory) Delete(ctx context.Context, name string) error {
 	if err != nil {
 		return fmt.Errorf("directory: marshal Delete: %w", err)
 	}
-	return d.sub.Submit(ctx, bs)
+	_, err = d.sub.Submit(ctx, bs); return err
 }
 
 // Lookup returns the value associated with name (and whether

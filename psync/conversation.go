@@ -189,6 +189,14 @@ type stableMessageIDsRequest struct{}
 type freezeMemberRequest struct{ replica *pb.ReplicaID }
 type membershipRequest struct{}
 type addMemberRequest struct{ replica *pb.ReplicaID }
+type hasSeenRequest struct {
+	sender *pb.ReplicaID
+	slot   uint64
+}
+type requestMissingRequest struct {
+	sender *pb.ReplicaID
+	slot   uint64
+}
 
 func (sendRequest) isRequest()             {}
 func (incomingRequest) isRequest()         {}
@@ -200,6 +208,8 @@ func (stableMessageIDsRequest) isRequest() {}
 func (freezeMemberRequest) isRequest()     {}
 func (membershipRequest) isRequest()       {}
 func (addMemberRequest) isRequest()        {}
+func (hasSeenRequest) isRequest()          {}
+func (requestMissingRequest) isRequest()   {}
 
 type response interface{ isResponse() }
 
@@ -234,6 +244,8 @@ type addMemberResponse struct {
 	slot int
 	err  error
 }
+type hasSeenResponse struct{ seen bool }
+type requestMissingResponse struct{ err error }
 type emptyResponse struct{}
 
 func (sendResponse) isResponse()             {}
@@ -245,6 +257,8 @@ func (stableMessageIDsResponse) isResponse() {}
 func (freezeMemberResponse) isResponse()     {}
 func (membershipResponse) isResponse()       {}
 func (addMemberResponse) isResponse()        {}
+func (hasSeenResponse) isResponse()          {}
+func (requestMissingResponse) isResponse()   {}
 func (emptyResponse) isResponse()            {}
 
 // serverImpl is the immutable handler that implements
@@ -334,9 +348,40 @@ func (s *serverImpl) HandleCall(req request, st *state) (response, *state) {
 	case addMemberRequest:
 		slot, err := s.membership.Add(r.replica)
 		return addMemberResponse{slot: slot, err: err}, st
+	case hasSeenRequest:
+		return hasSeenResponse{
+			seen: st.graph.Has(r.sender.GetValue(), r.slot),
+		}, st
+	case requestMissingRequest:
+		// Issue a LostMessageRequest. Ask the sender directly
+		// — they're guaranteed to have their own message. If
+		// sender == self (shouldn't happen — self-sent messages
+		// are in our log by construction), fall back to a
+		// broadcast across all peers.
+		err := s.handleRequestMissing(r.sender, r.slot)
+		return requestMissingResponse{err: err}, st
 	default:
 		return emptyResponse{}, st
 	}
+}
+
+// handleRequestMissing issues a LostMessageRequest targeting
+// the sender of the missing message (they're its originator
+// and always have it). Defensive fallback: if `sender` is the
+// local replica (shouldn't happen — our own messages are in
+// our log), broadcast to every peer instead.
+func (s *serverImpl) handleRequestMissing(sender *pb.ReplicaID, slot uint64) error {
+	if bytes.Equal(sender.GetValue(), s.self.GetValue()) {
+		for _, peer := range s.membership.Replicas() {
+			if bytes.Equal(peer.GetValue(), s.self.GetValue()) {
+				continue
+			}
+			s.sendLostMessageRequest(sender, slot, peer)
+		}
+		return nil
+	}
+	s.sendLostMessageRequest(sender, slot, sender)
+	return nil
 }
 
 // HandleCast processes asynchronous notifications.
@@ -595,6 +640,35 @@ func (c *Conversation) StableMessageIDs() []*pb.MessageID {
 func (c *Conversation) FreezeMember(replica *pb.ReplicaID) error {
 	resp := c.srv.Call(freezeMemberRequest{replica: replica})
 	return resp.(freezeMemberResponse).err
+}
+
+// HasSeen reports whether the local graph already contains
+// the envelope (sender, slot). Useful for read-consistency
+// gates (CausalityToken): a token can be satisfied without
+// waiting if the local graph is already past the token's
+// position.
+//
+// Note this checks GRAPH state (received + accepted by
+// psync) — it does NOT prove the message has already been
+// delivered to the substrate's apply pump and run through
+// SM.Apply. Substrate-level waiters need a separate signal
+// from the apply pump for that.
+func (c *Conversation) HasSeen(sender *pb.ReplicaID, slot uint64) bool {
+	resp := c.srv.Call(hasSeenRequest{sender: sender, slot: slot})
+	return resp.(hasSeenResponse).seen
+}
+
+// RequestMissing proactively issues a LostMessageRequest to
+// the originator of (sender, slot). Used by the substrate's
+// WaitForCausality to actively pull a missing message
+// instead of waiting for it to arrive via normal replication.
+//
+// The request is fire-and-forget; the response (the missing
+// envelope) flows back through the regular receive path and
+// the caller learns of it via subsequent HasSeen checks.
+func (c *Conversation) RequestMissing(sender *pb.ReplicaID, slot uint64) error {
+	resp := c.srv.Call(requestMissingRequest{sender: sender, slot: slot})
+	return resp.(requestMissingResponse).err
 }
 
 // AddMember appends replica to the underlying Membership at a

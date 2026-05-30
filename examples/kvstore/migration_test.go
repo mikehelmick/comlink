@@ -195,7 +195,7 @@ func TestKVStoreReplicaMigrationToNewNode(t *testing.T) {
 		// senders' wave participation.
 		writer := []*migrationNode{alice, bob, carol}[i%3]
 		wctx, cancelW := context.WithTimeout(ctx, 10*time.Second)
-		if err := writer.store.Set(wctx, k, v); err != nil {
+		if _, err := writer.store.Set(wctx, k, v); err != nil {
 			cancelW()
 			t.Fatalf("Set %s on %s: %v", k, writer.name, err)
 		}
@@ -293,7 +293,7 @@ func TestKVStoreReplicaMigrationToNewNode(t *testing.T) {
 	postKey := "post-migration-key"
 	postVal := "post-migration-value"
 	pctx, cancelPost := context.WithTimeout(ctx, 15*time.Second)
-	if err := alice.store.Set(pctx, postKey, postVal); err != nil {
+	if _, err := alice.store.Set(pctx, postKey, postVal); err != nil {
 		cancelPost()
 		t.Logf("[soft-check] post-migration Set on alice failed: %v", err)
 	} else {
@@ -482,7 +482,7 @@ func TestKVStoreLargePayloadConvergence(t *testing.T) {
 		k := fmt.Sprintf("big-%d", i)
 		want[k] = val
 		wctx, cancelW := context.WithTimeout(ctx, 15*time.Second)
-		if err := nodes[i%len(nodes)].store.Set(wctx, k, val); err != nil {
+		if _, err := nodes[i%len(nodes)].store.Set(wctx, k, val); err != nil {
 			cancelW()
 			t.Fatalf("Set %s: %v", k, err)
 		}

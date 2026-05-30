@@ -250,9 +250,49 @@ func convIDFromEnv() (comlink.ConversationID, error) {
 func newRouter(cluster *comlink.Cluster, store *kvstore.Store, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 
+	// HTTP headers for read-consistency:
+	//   PUT/DELETE response: X-Comlink-Token: <token>
+	//   GET request : X-Comlink-Read-At: <token>     — switches to GetAt
+	//                 X-Comlink-Read-Timeout: 1s     — optional, defaults to 1s
+	const (
+		hdrToken       = "X-Comlink-Token"
+		hdrReadAt      = "X-Comlink-Read-At"
+		hdrReadTimeout = "X-Comlink-Read-Timeout"
+	)
+
 	mux.HandleFunc("GET /kv/{key}", func(w http.ResponseWriter, r *http.Request) {
 		key := r.PathValue("key")
-		v, ok := store.Get(key)
+		tokenHdr := r.Header.Get(hdrReadAt)
+		if tokenHdr == "" {
+			v, ok := store.Get(key)
+			if !ok {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			_, _ = io.WriteString(w, v)
+			return
+		}
+		// Consistency read.
+		timeout := time.Second
+		if raw := r.Header.Get(hdrReadTimeout); raw != "" {
+			if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+				timeout = d
+			}
+		}
+		v, ok, err := store.GetAt(key, kvstore.Token(tokenHdr), timeout)
+		switch {
+		case errors.Is(err, comlink.ErrReadConsistencyTimeout):
+			w.Header().Set("Retry-After", "0")
+			http.Error(w, `{"error":"read_consistency_timeout"}`, http.StatusServiceUnavailable)
+			return
+		case errors.Is(err, comlink.ErrInvalidToken),
+			errors.Is(err, comlink.ErrTokenWrongConversation):
+			http.Error(w, `{"error":"invalid_token"}`, http.StatusBadRequest)
+			return
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		if !ok {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
@@ -276,10 +316,12 @@ func newRouter(cluster *comlink.Cluster, store *kvstore.Store, logger *slog.Logg
 		// is processing a recent snapshot trim.
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
-		if err := store.Set(ctx, key, string(body)); err != nil {
+		token, err := store.Set(ctx, key, string(body))
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		w.Header().Set(hdrToken, string(token))
 		w.WriteHeader(http.StatusNoContent)
 	})
 
@@ -287,10 +329,12 @@ func newRouter(cluster *comlink.Cluster, store *kvstore.Store, logger *slog.Logg
 		key := r.PathValue("key")
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		if err := store.Delete(ctx, key); err != nil {
+		token, err := store.Delete(ctx, key)
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		w.Header().Set(hdrToken, string(token))
 		w.WriteHeader(http.StatusNoContent)
 	})
 

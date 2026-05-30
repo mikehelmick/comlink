@@ -206,7 +206,7 @@ func TestKVStoreThreeReplicaGRPC(t *testing.T) {
 			defer wg.Done()
 			k := fmt.Sprintf("k-%d", idx)
 			v := fmt.Sprintf("v-%d", idx)
-			if err := n.store.Set(ctx, k, v); err != nil {
+			if _, err := n.store.Set(ctx, k, v); err != nil {
 				t.Errorf("replica %d Set: %v", idx, err)
 			}
 		}(i, n)
@@ -238,7 +238,7 @@ func TestKVStoreGRPCWatchAcrossReplicas(t *testing.T) {
 	ch, cancelWatch := nodes[2].store.Watch("watched")
 	defer cancelWatch()
 
-	if err := nodes[0].store.Set(ctx, "watched", "by-alice"); err != nil {
+	if _, err := nodes[0].store.Set(ctx, "watched", "by-alice"); err != nil {
 		t.Fatal(err)
 	}
 	select {

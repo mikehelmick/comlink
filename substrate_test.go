@@ -71,7 +71,7 @@ func TestSubstrateSingleReplicaSubmitApplies(t *testing.T) {
 
 	subCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	if err := sub.Submit(subCtx, []byte("inc")); err != nil {
+	if _, err := sub.Submit(subCtx, []byte("inc")); err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
 	if got := sm.Count(); got != 1 {
@@ -161,7 +161,7 @@ func TestSubstrateMultiReplicaConverges(t *testing.T) {
 			defer wg.Done()
 			for round := 0; round < totalRounds; round++ {
 				subCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-				if err := n.sub.Submit(subCtx, []byte{byte(idx), byte(round)}); err != nil {
+				if _, err := n.sub.Submit(subCtx, []byte{byte(idx), byte(round)}); err != nil {
 					t.Errorf("replica %d round %d Submit: %v", idx, round, err)
 					cancel()
 					return

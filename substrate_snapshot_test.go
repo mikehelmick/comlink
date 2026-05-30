@@ -175,7 +175,7 @@ func TestSubstrateRestoreFromInitialSnapshot(t *testing.T) {
 	// here, but that doesn't matter for the suppression test:
 	// what matters is that BUT a Submit succeeds end-to-end).
 	op, _ := json.Marshal(snapshotterOp{K: "c", V: "3"})
-	if err := sub.Submit(ctx, op); err != nil {
+	if _, err := sub.Submit(ctx, op); err != nil {
 		t.Fatalf("post-restore Submit: %v", err)
 	}
 	got, _ = sm.Snapshot4Test()

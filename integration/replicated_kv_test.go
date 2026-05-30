@@ -86,7 +86,8 @@ func (s *kvStore) Snapshot() map[string]string {
 // have a working replicated key-value store on top of comlink.
 func kvSet(ctx context.Context, sub *comlink.Substrate, k, v string) error {
 	bs, _ := json.Marshal(kvOp{Op: "set", K: k, V: v})
-	return sub.Submit(ctx, bs)
+	_, err := sub.Submit(ctx, bs)
+	return err
 }
 
 // ─── the test ────────────────────────────────────────────────────

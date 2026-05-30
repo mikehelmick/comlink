@@ -99,7 +99,7 @@ func TestKVStoreDiskSnapshotRecovery(t *testing.T) {
 		v := fmt.Sprintf("v%02d", i)
 		want[k] = v
 		wctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		if err := store.Set(wctx, k, v); err != nil {
+		if _, err := store.Set(wctx, k, v); err != nil {
 			cancel()
 			t.Fatalf("Set %d: %v", i, err)
 		}

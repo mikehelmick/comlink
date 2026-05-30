@@ -66,7 +66,7 @@ func TestKVStoreFiveReplicaSurvivesNodeLoss(t *testing.T) {
 	defer cancel()
 
 	// Phase 1 — full-cluster write.
-	if err := nodes[0].store.Set(ctx, "before", "value-before"); err != nil {
+	if _, err := nodes[0].store.Set(ctx, "before", "value-before"); err != nil {
 		t.Fatalf("Set 'before' on r0: %v", err)
 	}
 	waitConvergeStores(t, nodes, map[string]string{
@@ -115,7 +115,7 @@ func TestKVStoreFiveReplicaSurvivesNodeLoss(t *testing.T) {
 
 	// Phase 4 — write after the eviction; survivors converge on
 	// the full {before, after} map.
-	if err := survivors[1].store.Set(ctx, "after", "value-after"); err != nil {
+	if _, err := survivors[1].store.Set(ctx, "after", "value-after"); err != nil {
 		t.Fatalf("Set 'after' on r1: %v", err)
 	}
 	waitConvergeStores(t, survivors, map[string]string{
@@ -155,7 +155,7 @@ func TestKVStoreFiveReplicaConcurrentWrites(t *testing.T) {
 	results := make(chan result, len(nodes))
 	for i, n := range nodes {
 		go func(idx int, n *kvstore.Store) {
-			err := n.Set(ctx, fmt.Sprintf("k-%d", idx), fmt.Sprintf("v-%d", idx))
+			_, err := n.Set(ctx, fmt.Sprintf("k-%d", idx), fmt.Sprintf("v-%d", idx))
 			results <- result{idx: idx, err: err}
 		}(i, n.store)
 	}

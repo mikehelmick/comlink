@@ -59,7 +59,7 @@ func TestKVStoreReplicaRestartRecoversSMState(t *testing.T) {
 		wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		key := []string{"from-r0", "from-r1", "from-r2"}[i]
 		val := want[key]
-		if err := n.store.Set(wctx, key, val); err != nil {
+		if _, err := n.store.Set(wctx, key, val); err != nil {
 			cancel()
 			t.Fatalf("pre-crash Set on r%d: %v", i, err)
 		}
@@ -172,7 +172,7 @@ func TestKVStoreReplicaRestartRejoinsCluster(t *testing.T) {
 	r2Self := clusters[2].Self()
 
 	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	if err := nodes[0].store.Set(wctx, "from-r0", "pre"); err != nil {
+	if _, err := nodes[0].store.Set(wctx, "from-r0", "pre"); err != nil {
 		t.Fatalf("pre-crash Set: %v", err)
 	}
 	cancel()
@@ -250,7 +250,7 @@ func TestKVStoreReplicaRestartRejoinsCluster(t *testing.T) {
 	// r0 writes a NEW key. The restarted r2 must observe it.
 	postCtx, postCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer postCancel()
-	if err := nodes[0].store.Set(postCtx, "from-r0", "post"); err != nil {
+	if _, err := nodes[0].store.Set(postCtx, "from-r0", "post"); err != nil {
 		t.Fatalf("post-restart Set: %v", err)
 	}
 

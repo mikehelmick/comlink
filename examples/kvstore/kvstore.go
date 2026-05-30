@@ -273,12 +273,15 @@ type Store struct {
 
 // batchEntry is one queued mutation waiting for the batch loop
 // to flush. done is closed (with err set) when the batch this
-// entry was bundled into has finished its Submit call.
+// entry was bundled into has finished its Submit call. All
+// entries in the same batch get the SAME token — they share
+// one substrate envelope.
 type batchEntry struct {
-	cmd  *kvpb.Command
+	cmd   *kvpb.Command
 	bytes int // approx wire size for byte-trigger accounting
-	done chan struct{}
-	err  error
+	done  chan struct{}
+	err   error
+	token comlink.CausalityToken
 }
 
 // batcher owns the per-Store flush loop. One per Store.
@@ -322,8 +325,10 @@ func newBatcher(sub *comlink.Substrate, cfg BatchingConfig) *batcher {
 }
 
 // submit enqueues a Command, waits for the batch to flush, and
-// returns the per-batch Submit error.
-func (b *batcher) submit(ctx context.Context, c *kvpb.Command, approxBytes int) error {
+// returns the resulting token + per-batch Submit error. All
+// callers whose entries land in the same batch get the SAME
+// token (the underlying substrate envelope is shared).
+func (b *batcher) submit(ctx context.Context, c *kvpb.Command, approxBytes int) (comlink.CausalityToken, error) {
 	e := &batchEntry{
 		cmd:   c,
 		bytes: approxBytes,
@@ -332,19 +337,19 @@ func (b *batcher) submit(ctx context.Context, c *kvpb.Command, approxBytes int) 
 	select {
 	case b.in <- e:
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	case <-b.stop:
-		return errors.New("kvstore: batcher closed")
+		return nil, errors.New("kvstore: batcher closed")
 	}
 	select {
 	case <-e.done:
-		return e.err
+		return e.token, e.err
 	case <-ctx.Done():
 		// Note: even if ctx fires, the entry may still get
 		// flushed (we don't / can't pull it back out of the
 		// queue). The caller-visible result honors the ctx
 		// deadline; the batch may still Submit.
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 }
 
@@ -404,13 +409,15 @@ func (b *batcher) loop() {
 			commands[i] = e.cmd
 		}
 		payload, err := proto.Marshal(&kvpb.CommandBatch{Commands: commands})
+		var token comlink.CausalityToken
 		if err == nil {
-			err = b.sub.Submit(submitCtx, payload)
+			token, err = b.sub.Submit(submitCtx, payload)
 			metricKVBatchFlushOps.Observe(float64(len(commands)))
 			metricKVBatchFlushBytes.Observe(float64(len(payload)))
 		}
 		for _, e := range pending {
 			e.err = err
+			e.token = token
 			close(e.done)
 		}
 		resetBatch()
@@ -541,7 +548,7 @@ func (a *ackController) loop() {
 			// ctx cancelled), we don't retry — the next peer
 			// message will set pending again and we'll try
 			// then.
-			_ = a.sub.Submit(ctx, ackBytes)
+			_, _ = a.sub.Submit(ctx, ackBytes)
 			metricKVAckSubmitted.Inc()
 		}
 	}
@@ -1322,16 +1329,28 @@ func (s *Store) Get(key string) (string, bool) {
 	return e.value, true
 }
 
+// Token is the opaque read-consistency handle returned by Set
+// and Delete. Pass it to GetAt to wait for any replica to
+// catch up to (at least) the write that produced this token
+// before serving the read.
+type Token = comlink.CausalityToken
+
 // Set issues a "set k=v" command. Returns when the command has
 // been Apply'd locally (and is therefore guaranteed to be in
 // the global order). Peers will see it shortly after via the
 // substrate.
 //
+// Returns a Token positioned at the resulting write. Discard
+// it if you don't need read-your-writes semantics.
+//
 // Internally: routes through the batcher (unless disabled).
 // The batcher coalesces concurrent Set/Delete calls into one
 // substrate Submit; the caller's blocking-until-Apply'd
-// contract is preserved.
-func (s *Store) Set(ctx context.Context, key, value string) error {
+// contract is preserved. All callers whose entries land in
+// the same batch receive the SAME token (they share one
+// substrate envelope) — which is correct: a wait for that
+// token unblocks once any of those writes is visible.
+func (s *Store) Set(ctx context.Context, key, value string) (Token, error) {
 	cmd := &kvpb.Command{
 		Op:    kvpb.Op_OP_SET,
 		Key:   key,
@@ -1343,7 +1362,8 @@ func (s *Store) Set(ctx context.Context, key, value string) error {
 
 // Delete issues a "delete k" command. Returns when Apply'd
 // locally. No-op (still ordered) if the key is absent.
-func (s *Store) Delete(ctx context.Context, key string) error {
+// Returns a Token positioned at the tombstone write.
+func (s *Store) Delete(ctx context.Context, key string) (Token, error) {
 	cmd := &kvpb.Command{
 		Op:  kvpb.Op_OP_DELETE,
 		Key: key,
@@ -1352,17 +1372,43 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 	return s.submitCommand(ctx, cmd, len(key)+8)
 }
 
+// GetAt blocks (up to `timeout`) until this replica's apply
+// pump has seen the position encoded in `token` (or any write
+// causally after it), then returns the local Get for `key`.
+//
+// timeout == 0 picks the default (1 second).
+//
+// Errors:
+//   - comlink.ErrReadConsistencyTimeout — timeout elapsed
+//     before the position was reached. RETRYABLE.
+//   - comlink.ErrInvalidToken — token is malformed.
+//   - comlink.ErrTokenWrongConversation — token addresses
+//     a different conversation than this Store's substrate.
+//
+// On success the returned (value, ok) follows the same
+// semantics as Get: ok==false for missing or tombstoned keys.
+func (s *Store) GetAt(key string, token Token, timeout time.Duration) (string, bool, error) {
+	if timeout <= 0 {
+		timeout = 1 * time.Second
+	}
+	if err := s.sub.WaitForCausality(token, timeout); err != nil {
+		return "", false, err
+	}
+	v, ok := s.Get(key)
+	return v, ok, nil
+}
+
 // submitCommand sends one Command to the substrate, either via
 // the batcher (if enabled) or as a one-element batch directly.
 // Both code paths produce kvpb.CommandBatch payloads on the
 // wire so the Apply path is uniform.
-func (s *Store) submitCommand(ctx context.Context, c *kvpb.Command, approxBytes int) error {
+func (s *Store) submitCommand(ctx context.Context, c *kvpb.Command, approxBytes int) (Token, error) {
 	if s.batcher != nil {
 		return s.batcher.submit(ctx, c, approxBytes)
 	}
 	bs, err := proto.Marshal(&kvpb.CommandBatch{Commands: []*kvpb.Command{c}})
 	if err != nil {
-		return fmt.Errorf("kvstore: marshal CommandBatch: %w", err)
+		return nil, fmt.Errorf("kvstore: marshal CommandBatch: %w", err)
 	}
 	return s.sub.Submit(ctx, bs)
 }

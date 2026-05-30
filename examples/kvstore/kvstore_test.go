@@ -154,7 +154,7 @@ func TestSetReplicates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := nodes[0].store.Set(ctx, "hello", "world"); err != nil {
+	if _, err := nodes[0].store.Set(ctx, "hello", "world"); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 	waitConverge(t, nodes, map[string]string{"hello": "world"}, 3*time.Second)
@@ -168,12 +168,12 @@ func TestDeleteReplicates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := nodes[0].store.Set(ctx, "k", "v"); err != nil {
+	if _, err := nodes[0].store.Set(ctx, "k", "v"); err != nil {
 		t.Fatal(err)
 	}
 	waitConverge(t, nodes, map[string]string{"k": "v"}, 3*time.Second)
 
-	if err := nodes[1].store.Delete(ctx, "k"); err != nil {
+	if _, err := nodes[1].store.Delete(ctx, "k"); err != nil {
 		t.Fatal(err)
 	}
 	waitConverge(t, nodes, map[string]string{}, 3*time.Second)
@@ -195,7 +195,7 @@ func TestConcurrentSetsConverge(t *testing.T) {
 			defer wg.Done()
 			k := fmt.Sprintf("k-%d", idx)
 			v := fmt.Sprintf("v-%d", idx)
-			if err := n.store.Set(ctx, k, v); err != nil {
+			if _, err := n.store.Set(ctx, k, v); err != nil {
 				t.Errorf("replica %d Set: %v", idx, err)
 			}
 		}(i, n)
@@ -224,11 +224,11 @@ func TestSameKeyConflictResolvesDeterministically(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_ = nodes[0].store.Set(ctx, "k", "from-alice")
+		_, _ = nodes[0].store.Set(ctx, "k", "from-alice")
 	}()
 	go func() {
 		defer wg.Done()
-		_ = nodes[1].store.Set(ctx, "k", "from-bob")
+		_, _ = nodes[1].store.Set(ctx, "k", "from-bob")
 	}()
 	wg.Wait()
 
@@ -272,7 +272,7 @@ func TestWatchFiresOnSetAndDelete(t *testing.T) {
 	ch, cancelWatch := nodes[2].store.Watch("hello")
 	defer cancelWatch()
 
-	if err := nodes[0].store.Set(ctx, "hello", "world"); err != nil {
+	if _, err := nodes[0].store.Set(ctx, "hello", "world"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -287,7 +287,7 @@ func TestWatchFiresOnSetAndDelete(t *testing.T) {
 		t.Fatal("did not receive Set event")
 	}
 
-	if err := nodes[1].store.Delete(ctx, "hello"); err != nil {
+	if _, err := nodes[1].store.Delete(ctx, "hello"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -319,7 +319,7 @@ func TestWatchCancelClosesChannel(t *testing.T) {
 	// Another Set should not panic — i.e. notify is a no-op.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := nodes[1].store.Set(ctx, "k", "v"); err != nil {
+	if _, err := nodes[1].store.Set(ctx, "k", "v"); err != nil {
 		t.Fatalf("Set after Watch cancel: %v", err)
 	}
 }

@@ -120,7 +120,7 @@ func TestSubstrateAutoEvictUnblocksWavesAfterPeerDeath(t *testing.T) {
 	// completion works end-to-end.
 	for i, n := range nodes {
 		ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
-		if err := n.sub.Submit(ctx2, []byte{byte(i), 'a'}); err != nil {
+		if _, err := n.sub.Submit(ctx2, []byte{byte(i), 'a'}); err != nil {
 			cancel()
 			t.Fatalf("phase-1 Submit on replica %d: %v", i, err)
 		}
@@ -172,7 +172,7 @@ func TestSubstrateAutoEvictUnblocksWavesAfterPeerDeath(t *testing.T) {
 	// carol's slot is frozen.
 	for i := 0; i < 2; i++ {
 		ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
-		if err := nodes[i].sub.Submit(ctx2, []byte{byte(i), 'b'}); err != nil {
+		if _, err := nodes[i].sub.Submit(ctx2, []byte{byte(i), 'b'}); err != nil {
 			cancel()
 			t.Fatalf("phase-3 Submit on survivor %d after auto-evict: %v", i, err)
 		}

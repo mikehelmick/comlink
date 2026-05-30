@@ -254,6 +254,30 @@ type Substrate struct {
 	pendingApplies map[indexKey]chan struct{}
 	appliedSelf    map[indexKey]struct{}
 	closed         bool
+
+	// Read-consistency waiter machinery (CausalityToken /
+	// WaitForCausality). senderSeen[sender_bytes] = max
+	// sender_seq we've seen come out of the apply pump for
+	// that sender. waiters is the set of WaitForCausality
+	// calls currently blocked; on each new apply, any waiter
+	// whose (sender, slot) is satisfied has its done channel
+	// closed and is removed.
+	//
+	// Protected by waitMu (separate from mu so a waiter
+	// register/unregister doesn't contend with Submit's
+	// pendingApplies bookkeeping).
+	waitMu     sync.Mutex
+	senderSeen map[string]uint64
+	waiters    map[*causalWaiter]struct{}
+}
+
+// causalWaiter is one outstanding WaitForCausality call.
+// done is closed when the substrate's apply pump fires for
+// (senderKey, slot') where slot' >= waiter.slot.
+type causalWaiter struct {
+	senderKey string
+	slot      uint64
+	done      chan struct{}
 }
 
 type indexKey struct {
@@ -346,6 +370,8 @@ func (c *Cluster) NewSubstrate(ctx context.Context, cfg SubstrateConfig) (*Subst
 		pumpDone:       make(chan struct{}),
 		pendingApplies: make(map[indexKey]chan struct{}),
 		appliedSelf:    make(map[indexKey]struct{}),
+		senderSeen:     make(map[string]uint64),
+		waiters:        make(map[*causalWaiter]struct{}),
 	}
 	if initialSnap != nil {
 		s.snapshotThrough = initialSnap.ThroughOffset
@@ -580,12 +606,16 @@ func buildOrder(conv *psync.Conversation, cfg SubstrateConfig) (order.Order, err
 
 // Submit submits payload to the substrate. Blocks until this
 // replica has applied the command via StateMachine.Apply (or
-// ctx is done). Returns the Apply's effective error if any
-// (currently always nil since StateMachine.Apply is infallible).
+// ctx is done). Returns a CausalityToken positioned at the
+// resulting write — pass it to WaitForCausality on any
+// replica to do read-your-writes.
 //
 // The same payload will be applied at every replica in the
 // substrate's chosen ordering — all replicas converge.
-func (s *Substrate) Submit(ctx context.Context, payload []byte) error {
+//
+// Callers that don't need a token can simply discard the
+// first return value (`_, err := sub.Submit(ctx, payload)`).
+func (s *Substrate) Submit(ctx context.Context, payload []byte) (CausalityToken, error) {
 	submitStart := time.Now()
 	convLabel := shortConvID(s.cfg.ConversationID)
 	defer func() {
@@ -593,11 +623,11 @@ func (s *Substrate) Submit(ctx context.Context, payload []byte) error {
 	}()
 	wrapped, err := frame.MarshalApp(payload)
 	if err != nil {
-		return fmt.Errorf("comlink: Submit: wrap: %w", err)
+		return nil, fmt.Errorf("comlink: Submit: wrap: %w", err)
 	}
 	id, err := s.conv.Send(wrapped)
 	if err != nil {
-		return fmt.Errorf("comlink: Submit: send: %w", err)
+		return nil, fmt.Errorf("comlink: Submit: send: %w", err)
 	}
 	sendDone := time.Now()
 	metricSubstrateSubmitted.WithLabelValues(convLabel).Inc()
@@ -612,20 +642,23 @@ func (s *Substrate) Submit(ctx context.Context, payload []byte) error {
 		}
 	}
 	if selfSlot < 0 {
-		return errors.New("comlink: Submit: self not in substrate members (config bug)")
+		return nil, errors.New("comlink: Submit: self not in substrate members (config bug)")
 	}
 	vc := id.GetVectorClock()
 	if selfSlot >= len(vc) {
-		return errors.New("comlink: Submit: assigned vector clock too short for self slot")
+		return nil, errors.New("comlink: Submit: assigned vector clock too short for self slot")
 	}
 	senderSeq := vc[selfSlot]
+	// Token captures (conv_id, sender, sender_seq) — opaque
+	// to the caller, decoded only by Substrate.WaitForCausality.
+	token := newCausalityToken(s.cfg.ConversationID, s.cluster.Self(), senderSeq)
 
 	wait := make(chan struct{})
 	key := indexKey{sender: string(s.cluster.Self()), seq: senderSeq}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return errors.New("comlink: Submit: substrate closed")
+		return nil, errors.New("comlink: Submit: substrate closed")
 	}
 	if _, alreadyApplied := s.appliedSelf[key]; alreadyApplied {
 		// The apply pump fired for this sender_seq before we got
@@ -633,7 +666,7 @@ func (s *Substrate) Submit(ctx context.Context, payload []byte) error {
 		// Consume the marker and return.
 		delete(s.appliedSelf, key)
 		s.mu.Unlock()
-		return nil
+		return token, nil
 	}
 	s.pendingApplies[key] = wait
 	s.mu.Unlock()
@@ -641,14 +674,14 @@ func (s *Substrate) Submit(ctx context.Context, payload []byte) error {
 	select {
 	case <-wait:
 		metricSubstrateSubmitWait.WithLabelValues(convLabel).Observe(time.Since(sendDone).Seconds())
-		return nil
+		return token, nil
 	case <-ctx.Done():
 		s.mu.Lock()
 		delete(s.pendingApplies, key)
 		s.mu.Unlock()
-		return ctx.Err()
+		return nil, ctx.Err()
 	case <-s.stopped:
-		return errors.New("comlink: Submit: substrate closed")
+		return nil, errors.New("comlink: Submit: substrate closed")
 	}
 }
 
@@ -806,6 +839,122 @@ func (s *Substrate) FreezeMember(replica ReplicaID) error {
 // ConversationID returns this substrate's conversation id.
 func (s *Substrate) ConversationID() ConversationID { return s.cfg.ConversationID }
 
+// noteAppliedForCausality records that the apply pump has
+// just finished applying (sender, slot), and signals any
+// outstanding WaitForCausality calls that the position is
+// now reached. Called from handleApplied AFTER SM.Apply
+// returns, so subsequent reads on this replica will see the
+// effect.
+//
+// Skips the bookkeeping for ack-only / heartbeat envelopes
+// is the substrate's call — we still note the position
+// because waiters track substrate-level VC, not app-level
+// state. (A waiter for (alice, 5) is satisfied by alice's
+// 5th send of any kind.)
+func (s *Substrate) noteAppliedForCausality(senderKey string, slot uint64) {
+	s.waitMu.Lock()
+	if cur := s.senderSeen[senderKey]; slot > cur {
+		s.senderSeen[senderKey] = slot
+	}
+	// Close any waiter whose position is now satisfied.
+	for w := range s.waiters {
+		if w.senderKey == senderKey && slot >= w.slot {
+			close(w.done)
+			delete(s.waiters, w)
+		}
+	}
+	s.waitMu.Unlock()
+}
+
+// hasAppliedForCausality is the fast-path read used by
+// WaitForCausality before registering a waiter.
+func (s *Substrate) hasAppliedForCausality(senderKey string, slot uint64) bool {
+	s.waitMu.Lock()
+	defer s.waitMu.Unlock()
+	return s.senderSeen[senderKey] >= slot
+}
+
+// WaitForCausality blocks until this replica's apply pump
+// has run StateMachine.Apply for the position encoded in
+// `token`, or until `timeout` elapses (whichever first).
+//
+// On success: returns nil. A subsequent Get on the
+// application is guaranteed to see the effects of the write
+// the token came from (or any write causally after it).
+//
+// On timeout: returns ErrReadConsistencyTimeout. The
+// position may arrive shortly thereafter; the error is
+// retryable.
+//
+// On a malformed token: returns ErrInvalidToken.
+// On a token from a different conversation: returns
+// ErrTokenWrongConversation.
+//
+// If the token's position isn't yet observed, WaitForCausality
+// also proactively issues a LostMessageRequest to the
+// token's sender, asking for the missing envelope directly
+// (the sender is guaranteed to have it). This shaves the
+// wait from "whatever heartbeat / replication eventually
+// drives it" down to one network roundtrip.
+//
+// Zero timeout means "no wait beyond the fast-path check."
+// Callers who want unbounded waiting should pass a large
+// timeout (the API is "block up to T," not "block forever").
+func (s *Substrate) WaitForCausality(token CausalityToken, timeout time.Duration) error {
+	parsed, err := parseCausalityToken(token)
+	if err != nil {
+		return err
+	}
+	if !s.cfg.ConversationID.Equal(parsed.conv) {
+		return ErrTokenWrongConversation
+	}
+	senderKey := string(parsed.sender)
+
+	// Fast path: already applied.
+	if s.hasAppliedForCausality(senderKey, parsed.slot) {
+		return nil
+	}
+	if timeout <= 0 {
+		return ErrReadConsistencyTimeout
+	}
+
+	// Kick a proactive lost-message request to the sender.
+	// Fire-and-forget; the response flows back through the
+	// regular receive path and will close any waiter that
+	// matches when handleApplied fires.
+	_ = s.conv.RequestMissing(parsed.sender.toPB(), parsed.slot)
+
+	// Register waiter under the lock; re-check inside the
+	// lock to close the read-then-register race.
+	w := &causalWaiter{
+		senderKey: senderKey,
+		slot:      parsed.slot,
+		done:      make(chan struct{}),
+	}
+	s.waitMu.Lock()
+	if cur := s.senderSeen[senderKey]; cur >= parsed.slot {
+		s.waitMu.Unlock()
+		return nil
+	}
+	s.waiters[w] = struct{}{}
+	s.waitMu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-w.done:
+		return nil
+	case <-timer.C:
+		// Deregister; don't leak the waiter set.
+		s.waitMu.Lock()
+		delete(s.waiters, w)
+		s.waitMu.Unlock()
+		return ErrReadConsistencyTimeout
+	case <-s.stopped:
+		return errors.New("comlink: WaitForCausality: substrate closed")
+	}
+}
+
 // Close stops the apply pump and releases per-substrate
 // resources. Idempotent.
 func (s *Substrate) Close() error {
@@ -933,6 +1082,12 @@ func (s *Substrate) handleApplied(ctx context.Context, applied order.Applied) {
 			}
 		}
 	}
+
+	// Signal read-consistency waiters AFTER SM.Apply has
+	// returned. This is the moment a subsequent Get would
+	// actually see the value, so WaitForCausality returning
+	// before this would let callers race their own reads.
+	s.noteAppliedForCausality(string(sender.GetValue()), senderSeq)
 
 	// Signal any matching Submit waiter, OR record that this
 	// sender_seq has been applied so a soon-to-register Submit

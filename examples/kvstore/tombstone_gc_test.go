@@ -79,10 +79,10 @@ func TestTombstoneGCSweepDropsAndRetains(t *testing.T) {
 	// wave=2 (because Apply fires for every replica's sends).
 	for i, st := range stores {
 		k := fmt.Sprintf("k-%s", replicas[i])
-		if err := st.Set(ctx, k, "v"); err != nil {
+		if _, err := st.Set(ctx, k, "v"); err != nil {
 			t.Fatalf("Set on %s: %v", replicas[i], err)
 		}
-		if err := st.Delete(ctx, k); err != nil {
+		if _, err := st.Delete(ctx, k); err != nil {
 			t.Fatalf("Delete on %s: %v", replicas[i], err)
 		}
 	}
@@ -96,7 +96,7 @@ func TestTombstoneGCSweepDropsAndRetains(t *testing.T) {
 	for round := 0; round < 3; round++ {
 		for i, st := range stores {
 			k := fmt.Sprintf("post-%s-%d", replicas[i], round)
-			if err := st.Set(ctx, k, "v"); err != nil {
+			if _, err := st.Set(ctx, k, "v"); err != nil {
 				t.Errorf("Set %s: %v", k, err)
 			}
 		}

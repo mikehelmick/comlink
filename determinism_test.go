@@ -197,7 +197,7 @@ func runDeterminismScenario(t *testing.T, factory func() snapshottableSM) [][]by
 			defer wg.Done()
 			for round := 0; round < realRounds+settleRounds; round++ {
 				subCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-				if err := n.sub.Submit(subCtx, []byte{byte(idx), byte(round)}); err != nil {
+				if _, err := n.sub.Submit(subCtx, []byte{byte(idx), byte(round)}); err != nil {
 					t.Errorf("replica %d round %d Submit: %v", idx, round, err)
 					cancel()
 					return

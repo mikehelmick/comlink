@@ -76,7 +76,7 @@ func TestPullSnapshotEndToEnd(t *testing.T) {
 		v := fmt.Sprintf("v%02d", i)
 		want[k] = v
 		op, _ := json.Marshal(pullableOp{K: k, V: v})
-		if err := aliceSub.Submit(ctx, op); err != nil {
+		if _, err := aliceSub.Submit(ctx, op); err != nil {
 			t.Fatalf("Submit %d: %v", i, err)
 		}
 	}
@@ -194,7 +194,7 @@ func TestAutoBootstrapFromSponsor(t *testing.T) {
 		v := fmt.Sprintf("v%02d", i)
 		want[k] = v
 		op, _ := json.Marshal(pullableOp{K: k, V: v})
-		if err := aliceSub.Submit(ctx, op); err != nil {
+		if _, err := aliceSub.Submit(ctx, op); err != nil {
 			t.Fatalf("alice Submit %d: %v", i, err)
 		}
 	}
