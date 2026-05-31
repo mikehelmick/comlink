@@ -39,3 +39,8 @@ go.work.sum
 .DS_Store
 
 /comlink-soak
+/comlink-kvd
+/render-soak
+
+# Local Claude Code session state — not for the repo.
+.claude/
